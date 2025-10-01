@@ -21,24 +21,33 @@ export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 
-IN=/home/mnguest12/projects/tools/TotalSegmentator/phantom_01_gt.par_atn_1.bin
-OUT=/home/mnguest12/projects/tools/TotalSegmentator/output
-SCRIPT=/home/mnguest12/projects/tools/TotalSegmentator/totalseg.py
+IN=/home/mnguest12/projects/thesis/TotalSegmentator/phantom_01_gt.par_atn_1.bin
+OUT=/home/mnguest12/projects/thesis/TotalSegmentator/output
+SCRIPT=/home/mnguest12/projects/thesis/TotalSegmentator/totalseg.py
 
 mkdir -p "$OUT"
 
-srun --gpu-bind=closest python "$SCRIPT" \
-  -i "$IN" \
-  -o "$OUT" \
-  --mu_water_mm 0.030 \
-  --clip -1024 1500 \
-  --crop \
-  --bias_amp_hu 12 --bias_fwhm_mm 120 \
-  --psf_fwhm_mm 1.2 \
-  --noise_hu 4.0 \
-  --plot_hist \
-  --nr ${SLURM_CPUS_PER_TASK} \
-  --ns ${SLURM_CPUS_PER_TASK}
-  # Hinweis: --device gpu ist nicht nötig; SLURM setzt CUDA_VISIBLE_DEVICES.
-  # Optional erzwingen:
-  # --device cpu
+# Hinweis zu mu_water:
+# - Dein Script unterstützt entweder --mu_water_mm <float> ODER --auto_mu
+#   Für reproduzierbare Runs hier manuell gesetzt (0.030). Auto-Option unten auskommentiert.
+# - Wenn du Auto willst, ersetze die Zeile mit --mu_water_mm durch: --auto_mu
+
+srun --gpu-bind=closest \
+  python "$SCRIPT" \
+    -i "$IN" \
+    -o "$OUT" \
+    --shape 256 256 651 \
+    --voxel 1.5 1.5 1.5 \
+    --mu_water_mm 0.030 \
+    # --auto_mu \
+    --clip -1024 1500 \
+    --int16_out \
+    --plot_hist \
+    --ts_body_crop \
+    --nr ${SLURM_CPUS_PER_TASK} \
+    --ns ${SLURM_CPUS_PER_TASK} \
+    --device gpu
+    # Optional: nur bestimmte Regionen (Beispiel Lunge-Lappen)
+    # --roi_subset lung_upper_lobe_left lung_upper_lobe_right lung_middle_lobe_right lung_lower_lobe_left lung_lower_lobe_right
+
+# Ende
