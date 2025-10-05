@@ -1,3 +1,8 @@
 *.nii.gz
 *.png
 *.bin
+*.mat
+*.txt
+*.csv
+*.nii
+*.pyc
