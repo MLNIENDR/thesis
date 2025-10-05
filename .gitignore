@@ -6,3 +6,4 @@
 *.csv
 *.nii
 *.pyc
+*.json

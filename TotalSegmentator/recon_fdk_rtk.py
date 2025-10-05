@@ -15,6 +15,10 @@ Eingang:
 WICHTIG:
   - --swap_uv tauscht NUR die Datenachsen (nr<->nc). width_mm/height_mm werden NICHT getauscht.
     So bleibt width_mm weiterhin an nc (Breite), height_mm an nr (Höhe) gebunden.
+
+NEU (nur Ergänzung, keine Verhaltensänderung):
+  - Zusätzliches, kanonisches NIfTI für HU-Weiterverarbeitung: Array=(X,Y,Z), Affine=diag([dx,dy,dz])
+    via --out_ras (Default: <out>_RAS.nii)
 """
 
 import argparse, re, os
@@ -160,6 +164,8 @@ def main():
     ap.add_argument("--mat", default="ct_proj_stack.mat")
     ap.add_argument("--proj", default="proj.txt")
     ap.add_argument("--out", default="ct_recon_rtk.nii")
+    ap.add_argument("--out_ras", default=None,
+                    help="optional: zusätzliches kanonisches NIfTI (X,Y,Z + Affine diag(dx,dy,dz))")
     ap.add_argument("--nx", type=int, default=512)
     ap.add_argument("--ny", type=int, default=512)
     ap.add_argument("--nz", type=int, default=512)
@@ -260,14 +266,25 @@ def main():
     out_img = fdk.GetOutput()
     out_np = itk.array_from_image(out_img).astype(np.float32)  # (z,y,x)
 
+    # --------- Bestehendes Ausgabe-Layout (NICHT verändert) ----------
     # Speichern: (x,z,y) mit Affine diag([dx, dz, dy]) → Koronal vertikal = dz
     vol_xyz = np.transpose(out_np, (2, 0, 1))   # (x,z,y)
     aff = np.diag([dx, dz, dy, 1.0]).astype(np.float32)
-    nii = nib.Nifti1Image(vol_xyz, aff)
-    nii.header.set_xyzt_units('mm')
-    nib.save(nii, args.out)
+    nib.save(nib.Nifti1Image(vol_xyz, aff), args.out)
     print(f"[OK] saved: {args.out}   voxel(mm)=({dx:.4f},{dz:.4f},{dy:.4f})")
 
+    # --------- NEU: Kanonisches RAS-File für HU-Weiterverarbeitung ----------
+    out_ras = args.out_ras
+    if out_ras is None:
+        base, ext = os.path.splitext(args.out)
+        out_ras = base + "_RAS.nii"
+    # Array (X,Y,Z): aus (X,Z,Y) → swap Achsen 1 und 2
+    vol_ras = np.transpose(vol_xyz, (0, 2, 1))     # (x,y,z)
+    aff_ras = np.diag([dx, dy, dz, 1.0]).astype(np.float32)
+    nib.save(nib.Nifti1Image(vol_ras, aff_ras), out_ras)
+    print(f"[OK] saved (canonical RAS for HU): {out_ras}   voxel(mm)=({dx:.4f},{dy:.4f},{dz:.4f})")
+
+    # Optional: Koronal-Preview aus dem bestehenden (x,z,y)-Layout
     if args.quick_ap_png:
         save_preview_png(args.out, args.quick_ap_png, view=args.preview_view, base_h_in=args.base_h_in)
 
