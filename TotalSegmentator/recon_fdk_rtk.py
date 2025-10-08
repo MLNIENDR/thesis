@@ -77,68 +77,76 @@ def load_mu_stack_any(mat_path):
     return mu.astype(np.float32, copy=False), (None if ang is None else ang.astype(np.float32, copy=False))
 
 
-
-# ---------------- Preview (deterministisch in RAS) ----------------
-def save_preview_png(nifti_path, out_png, view="coronal",                     # Parameter: Pfad zur NIfTI-Datei, Dateiname für png-Ausgabe, gewünschte Ansicht, Basishöhe der Abbildung, Titel für das Bild (alles mit = hat default-Werte --> optional)
-                     base_h_in=7.0, title=None):
+# ---------------- Preview (deterministisch in RAS, Mapping gemäß deiner Sichtprüfung) ----------------
+def save_preview_png(nifti_path, out_png, view="coronal",
+                     base_h_in=7.0, title=None, coronal_orient="AP"):
     """
-    Nimmt RAS-kanonisches NIfTI (Array=(X,Y,Z), Affine diag(dx,dy,dz)) und
-    erzeugt .png der gewünschten Ebene mit korrekten mm-Extents.
-
-    Strikte RAS-Definitionen:
-      axial    = vol[:, :, Z//2]  → X (horiz) × Y (vert)
-      coronal  = vol[:, Y//2, :]  → X (horiz) × Z (vert)
-      sagittal = vol[X // 2, :, :]→ Y (horiz) × Z (vert)
+    Erwartet: RAS-kanonisches NIfTI (Array=(X,Y,Z), Affine diag(dx,dy,dz)).
+    Mapping gemäß deiner visuellen Diagnose:
+      - coronal  = fixiere X → Ebene (Y,Z)
+      - axial    = fixiere Y → Ebene (X,Z)
+      - sagittal = fixiere Z → Ebene (X,Y)
     """
+
     os.makedirs(os.path.dirname(out_png) or ".", exist_ok=True)
 
+    # NIfTI laden (sollte bereits RAS sein)
     img = nib.load(nifti_path)
-    img_ras = nib.as_closest_canonical(img)                                  # sollte bereits RAS sein
-    vol = np.asarray(img_ras.dataobj, dtype=np.float32)                      # (X,Y,Z)
-    aff = img_ras.affine                                                     # diag(dx,dy,dz)
+    img_ras = nib.as_closest_canonical(img)
+    vol = np.asarray(img_ras.dataobj, dtype=np.float32)   # (X,Y,Z)
+    aff = img_ras.affine                                   # diag(dx,dy,dz)
     X, Y, Z = vol.shape
+    dx, dy, dz = float(aff[0, 0]), float(aff[1, 1]), float(aff[2, 2])
 
     v = view.lower()
     if v == "coronal":
-        dx = float(aff[0, 0]); dz = float(aff[2, 2])
-        sl = vol[:, Y // 2, :]                                              # (X,Z) bei mittlerem y-Wert
-        img2 = np.flipud(sl.T)                                              # Array transponieren für imshow-Konvention (Z,X) und flippen, damit das Bild nicht auf dem Kopf steht
-        p2, p98 = np.percentile(img2, [2, 98])                              # Fensterung: 2. und 98. Perzentil als untere / obere Intensitätsgrenzen umd Ausreißer auzuschneiden
-        shown = np.clip((img2 - p2) / (p98 - p2 + 1e-6), 0, 1)              # Kontrastnormalisierung: Werte werden linear auf [0,1] skaliert
-        ex = [0, dx * X, 0, dz * Z]                                         # definiert physik. Ausdehnung in mm, die Matplotlib für Achsenbeschriftung nutzt
-        xlabel, ylabel = "X [mm]", "Z [mm]"
-        ttl = title or "Coronal (AP)"
+        dx = float(aff[0,0]); dy = float(aff[1,1]); dz = float(aff[2,2])
+        sl = vol[X // 2, :, :]           # (Y,Z)
+
+        # Bild so lassen wie zuletzt (Z horizontal, Y vertikal)
+        img2 = np.flipud(sl)              # Orientierung wie bei dir "richtig"
+
+        # AP/PA umschalten:
+        # In der Coronal-Ebene verläuft AP entlang Y (vertikal in unserer Darstellung)
+        if coronal_orient == "PA":
+            img2 = np.flipud(img2)  # AP ↔ PA
+
+        ex = [0, dz * sl.shape[1], 0, dy * sl.shape[0]]   # x=Z, y=Y
+        xlabel, ylabel = "Z [mm]", "Y [mm]"
+        ttl = title or f"Coronal ({coronal_orient})"
+
     elif v == "axial":
-        dx = float(aff[0, 0]); dy = float(aff[1, 1])
-        sl = vol[:, :, Z // 2]                                              # (X,Y)
+        # AXIAL: Y fixieren → (X,Z)
+        sl = vol[:, Y // 2, :]                             # (X,Z)
         img2 = np.flipud(sl.T)
-        p2, p98 = np.percentile(img2, [2, 98])
-        shown = np.clip((img2 - p2) / (p98 - p2 + 1e-6), 0, 1)
+        ex = [0, dx * X, 0, dz * Z]
+        xlabel, ylabel = "X [mm]", "Z [mm]"
+        ttl = title or "Axial"
+
+    elif v == "sagittal":
+        # SAGITTAL: Z fixieren → (X,Y)
+        sl = vol[:, :, Z // 2]                             # (X,Y)
+        img2 = np.flipud(sl.T)
         ex = [0, dx * X, 0, dy * Y]
         xlabel, ylabel = "X [mm]", "Y [mm]"
-        ttl = title or "Axial"
-    elif v == "sagittal":
-        dy = float(aff[1, 1]); dz = float(aff[2, 2])
-        sl = vol[X // 2, :, :]                                              # (Y,Z)
-        img2 = np.flipud(sl.T)
-        p2, p98 = np.percentile(img2, [2, 98])
-        shown = np.clip((img2 - p2) / (p98 - p2 + 1e-6), 0, 1)
-        ex = [0, dy * Y, 0, dz * Z]
-        xlabel, ylabel = "Y [mm]", "Z [mm]"
         ttl = title or "Sagittal"
+
     else:
         raise ValueError("view must be coronal|axial|sagittal")
 
-    # Figurgröße so wählen, dass mm-Verhältnis bewahrt bleibt (Matplotlib beruht auf Zoll)
-    width_mm  = ex[1] - ex[0]
-    height_mm = ex[3] - ex[2]
+    # Fensterung (2..98 %) + normiert auf [0,1]
+    p2, p98 = np.percentile(img2, [2, 98])
+    shown = np.clip((img2 - p2) / (p98 - p2 + 1e-6), 0, 1)
+
+    # Bildgröße so wählen, dass das mm-Verhältnis bewahrt bleibt
+    width_mm, height_mm = ex[1] - ex[0], ex[3] - ex[2]
     aspect = height_mm / max(width_mm, 1e-6)
-    h_in = float(base_h_in)                                                 # base_h_in skaliert die Bildgröße, aber nicht das Seitenverhältnis
+    h_in = float(base_h_in)
     w_in = h_in / max(aspect, 1e-6)
 
-    fig = plt.figure(figsize=(w_in, h_in), dpi=150)                         # dpi = dots per inch; beschreibt wie aufgelöst das png abgebildet wird
+    fig = plt.figure(figsize=(w_in, h_in), dpi=150)
     ax = plt.gca()
-    ax.imshow(shown, cmap="gray", origin="lower", extent=ex, aspect="equal")    # zeigt shown (normalisiertes Bild) in Graustufen-Farbkarte, ...
+    ax.imshow(shown, cmap="gray", origin="lower", extent=ex, aspect="equal")
     ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
     ax.set_title(ttl)
     plt.tight_layout()
@@ -156,13 +164,15 @@ def main():
     ap.add_argument("--out", default="ct_recon_rtk.nii")
     ap.add_argument("--out_ras", default=None,
                     help="optional: zusätzliches kanonisches NIfTI (X,Y,Z + Affine diag(dx,dy,dz))")
-    # Zielraster im Volumen (Voxelanzahl und physikalische Fields of View (FOVs) in mm)
-    ap.add_argument("--nx", type=int, default=310)
-    ap.add_argument("--ny", type=int, default=310)
-    ap.add_argument("--nz", type=int, default=512)
+    ap.add_argument("--coronal_orient", choices=["AP","PA"], default="AP",
+                help="Nur für coronal: AP=Anterior→Posterior, PA=Posterior→Anterior")
+    # ---- Standardraster: isotrop 1.5625 mm ----
+    ap.add_argument("--nx", type=int, default=320)      # X (links-rechts)
+    ap.add_argument("--ny", type=int, default=512)      # Y (kraniokaudal)
+    ap.add_argument("--nz", type=int, default=320)      # Z (vorn-hinten)
     ap.add_argument("--sx", type=float, default=500.0)
-    ap.add_argument("--sy", type=float, default=500.0)
-    ap.add_argument("--sz", type=float, default=800.0)
+    ap.add_argument("--sy", type=float, default=800.0)
+    ap.add_argument("--sz", type=float, default=500.0)
     # Optionale Überschreibung der Detektorgröße (falls proj.txt leer oder unvollständig)
     ap.add_argument("--detw", type=float, default=None)
     ap.add_argument("--deth", type=float, default=None)
@@ -282,11 +292,42 @@ def main():
         nib.save(nib.Nifti1Image(vol_ras, aff_ras), out_ras_path)
         print(f"[OK] saved (canonical RAS duplicate): {out_ras_path}")
 
-    # Optional: Preview-PNG aus der kanonischen Datei speichern
+    # Optional: Preview-PNG mit sinnvollem Namen speichern
     if args.quick_ap_png:
         target_for_preview = out_ras_path  # immer die kanonische Datei
-        save_preview_png(target_for_preview, args.quick_ap_png,
-                         view=args.preview_view, base_h_in=args.base_h_in)
+        out_path = args.quick_ap_png
+
+        # Basename der NIfTI-Datei (ohne Extension)
+        base = os.path.splitext(os.path.basename(out_ras_path))[0]
+
+        # Falls nur ein Verzeichnis angegeben wurde (oder ein Pfad mit / am Ende)
+        if out_path.endswith(os.sep) or os.path.isdir(out_path):
+            os.makedirs(out_path, exist_ok=True)
+            # Dateiname je nach Ansicht
+            if args.preview_view == "coronal":
+                fname = f"{base}_coronal_{args.coronal_orient}.png"
+            else:
+                fname = f"{base}_{args.preview_view}.png"
+            out_png = os.path.join(out_path, fname)
+        else:
+            # Wenn eine Datei angegeben wurde → nur Endung & Verzeichnis verwenden
+            d, b = os.path.split(out_path)
+            os.makedirs(d or ".", exist_ok=True)
+            # Einheitliche Benennung basierend auf NIfTI-Namen
+            if args.preview_view == "coronal":
+                out_png = os.path.join(d or ".", f"{base}_coronal_{args.coronal_orient}.png")
+            else:
+                out_png = os.path.join(d or ".", f"{base}_{args.preview_view}.png")
+
+        # Rendern
+        save_preview_png(
+            target_for_preview,
+            out_png,
+            view=args.preview_view,
+            base_h_in=args.base_h_in,
+            coronal_orient=args.coronal_orient,
+        )
+        print(f"[OK] Preview saved: {out_png}")
 
 
 if __name__ == "__main__":
