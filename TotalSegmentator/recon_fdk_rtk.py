@@ -285,12 +285,9 @@ def main():
     # Zielpfade
     out_ras_path = args.out_ras if args.out_ras else os.path.splitext(args.out)[0] + "_RAS.nii"
 
-    # Speichern: beide Dateien (out und out_ras) sind ab jetzt kanonisch identisch
-    nib.save(nib.Nifti1Image(vol_ras, aff_ras), args.out)
-    print(f"[OK] saved (canonical RAS): {args.out}   voxel(mm)=({dx:.4f},{dy:.4f},{dz:.4f})")
-    if out_ras_path != args.out:
-        nib.save(nib.Nifti1Image(vol_ras, aff_ras), out_ras_path)
-        print(f"[OK] saved (canonical RAS duplicate): {out_ras_path}")
+     # --------- SPEICHERN (nur kanonische RAS-Version) ---------
+    nib.save(nib.Nifti1Image(vol_ras, aff_ras), out_ras_path)
+    print(f"[OK] saved (canonical RAS): {out_ras_path}   voxel(mm)=({dx:.4f},{dy:.4f},{dz:.4f})")
 
     # Optional: Preview-PNG mit sinnvollem Namen speichern
     if args.quick_ap_png:
