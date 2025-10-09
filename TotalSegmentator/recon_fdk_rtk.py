@@ -100,20 +100,20 @@ def save_preview_png(nifti_path, out_png, view="coronal",
 
     v = view.lower()
     if v == "coronal":
-        dx = float(aff[0,0]); dy = float(aff[1,1]); dz = float(aff[2,2])
-        sl = vol[X // 2, :, :]           # (Y,Z)
+        # Coronal: X fixieren → Ebene (Y,Z)
+        sl = vol[X // 2, :, :]  # (Y,Z)
 
-        # Bild so lassen wie zuletzt (Z horizontal, Y vertikal)
-        img2 = np.flipud(sl)              # Orientierung wie bei dir "richtig"
+        # Standarddarstellung (PA): Blickrichtung von posterior → anterior
+        img2 = np.flipud(sl)  # Kopf oben behalten, Z horizontal, Y vertikal
 
-        # AP/PA umschalten:
-        # In der Coronal-Ebene verläuft AP entlang Y (vertikal in unserer Darstellung)
-        if coronal_orient == "PA":
-            img2 = np.flipud(img2)  # AP ↔ PA
+        # Für AP-Ansicht: horizontal spiegeln (Y-Achse = anterior↔posterior)
+        if str(coronal_orient).upper() == "AP":
+            img2 = np.fliplr(img2)
 
-        ex = [0, dz * sl.shape[1], 0, dy * sl.shape[0]]   # x=Z, y=Y
+        # Extents: Z horizontal, Y vertikal
+        ex = [0, dz * Z, 0, dy * Y]
         xlabel, ylabel = "Z [mm]", "Y [mm]"
-        ttl = title or f"Coronal ({coronal_orient})"
+        ttl = title or f"Coronal ({str(coronal_orient).upper()})"
 
     elif v == "axial":
         # AXIAL: Y fixieren → (X,Z)
@@ -267,6 +267,13 @@ def main():
 
     # FDK Rekonstruktion (RTK)
     fdk = rtk.FDKConeBeamReconstructionFilter.New()                                                     # erstellt FDK-Filter, um aus Projektionen das 3D-CT zu berechnen
+    # Sanfte Rampenfensterung (typisch 0.6–0.9)
+    if hasattr(fdk, "SetHannCutFrequency"):
+        fdk.SetHannCutFrequency(0.7)
+        print("[INFO] Hann apodization: cut freq = 0.70")
+    # Trunkierungs-Korrektur (falls vorhanden; hilft bei abgeschnittenem FOV)
+    if hasattr(fdk, "SetTruncationCorrection"):
+        fdk.SetTruncationCorrection(True)
     fdk.SetInput(0, vol_img)                                                                            # die RTK schreibt die Rekonstruktion in das vorbereitete vol_img
     fdk.SetInput(1, proj_img)                                                                           # übergibt die 2D-Projektionsbilder (proj_img)
     fdk.SetGeometry(geometry)                                                                           # übergibt die Scanner-Geometrie
