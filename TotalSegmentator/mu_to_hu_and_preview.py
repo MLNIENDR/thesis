@@ -12,19 +12,17 @@ Default-Verzeichnis-Setup (wie bei dir):
 Features
 - Ankerbasierte lineare Kalibrierung: HU = a*µ + b (≥2 Anker; robust via Median in Kugel-ROI)
 - Body-Maske (Schwelle konfigurierbar), Morphologie, größter Komponenten-Filter
+- optional: mildes 3D-Glätten nach der Maske (--smooth_sigma)
 - HU-Clip & int16-Speicherung (qform/sform gesetzt)
+- optional: zusätzliches Resampling auf isotropes Grid (--resample_mm), schreibt *_iso{mm}mm.nii
 - Direktes Rendering: echte HU-Farbleiste, mm-Extents, wahlweise 1 Ansicht oder 3 Ansichten
-
-Beispiele:
-  python mu_to_hu_and_preview.py
-  python mu_to_hu_and_preview.py --body_thresh -300 --preview --view coronal --percentile 2 98 --cmap turbo
-  python mu_to_hu_and_preview.py --tri --cmap gray
 """
 
 import os, re, sys, argparse
 import numpy as np
 import nibabel as nib
-from scipy.ndimage import binary_opening, binary_dilation, label, generate_binary_structure
+from scipy.ndimage import binary_opening, binary_dilation, label, generate_binary_structure, gaussian_filter
+from nibabel.processing import resample_to_output
 
 import matplotlib
 matplotlib.use("Agg")
@@ -68,8 +66,8 @@ def largest_component(mask):
 
 # ------------------------- Calibration (µ -> HU) -------------------------
 
-def calibrate_to_hu(in_path, out_path, anchors, radius_mm=8.0, body_thresh=-400.0,
-                    clip=(-1024, 2000)):
+def calibrate_to_hu(in_path, out_path, anchors, radius_mm=8.0, body_thresh=-300.0,
+                    clip=(-1024, 2000), smooth_sigma=0.0, resample_mm=None):
     print(f"[INFO] Lade: {in_path}")
     img = nib.load(in_path)
     vol = np.asarray(img.dataobj).astype(np.float32)  # (X,Y,Z), RAS
@@ -116,15 +114,39 @@ def calibrate_to_hu(in_path, out_path, anchors, radius_mm=8.0, body_thresh=-400.
     mask = binary_dilation(mask, iterations=2)
     hu[~mask] = -1024.0
 
+    # optional mild glätten (σ in Voxeln)
+    if smooth_sigma and smooth_sigma > 0:
+        hu = gaussian_filter(hu, sigma=float(smooth_sigma))
+
     # Clip & Speichern (int16)
-    hu = np.clip(hu, clip[0], clip[1]).astype(np.int16)
-    out_img = nib.Nifti1Image(hu, aff)
+    hu_min, hu_max = (clip[0], clip[1]) if isinstance(clip, (list, tuple)) and len(clip)==2 else (-1024, 2000)
+    hu_clipped = np.clip(hu, hu_min, hu_max).astype(np.int16)
+    out_img = nib.Nifti1Image(hu_clipped, aff)
     out_img.header.set_qform(aff, code=1)
     out_img.header.set_sform(aff, code=1)
     nib.save(out_img, out_path)
     print(f"[DONE] gespeichert: {out_path}")
 
-    return out_path  # Rückgabe für direkten Preview
+    # optional: isotropes Resampling (z. B. 1.0 mm)
+    resampled_path = None
+    if resample_mm and resample_mm > 0:
+        print(f"[INFO] Resample auf isotrop {resample_mm:.2f} mm …")
+        # für sauberes Resample: float nutzen, linear (order=1)
+        out_float = nib.Nifti1Image(hu_clipped.astype(np.float32), aff)
+        rs = resample_to_output(out_float, voxel_sizes=(resample_mm, resample_mm, resample_mm), order=1)
+        rs_data = np.clip(np.asarray(rs.dataobj), hu_min, hu_max).astype(np.int16)
+        rs_img  = nib.Nifti1Image(rs_data, rs.affine)
+        rs_img.header.set_qform(rs.affine, code=1)
+        rs_img.header.set_sform(rs.affine, code=1)
+        root, ext = os.path.splitext(out_path)
+        if ext.lower()==".gz":
+            root, _ = os.path.splitext(root)  # .nii.gz
+        resampled_path = root + f"_iso{resample_mm:.1f}mm.nii"
+        nib.save(rs_img, resampled_path)
+        print(f"[DONE] resampled: {resampled_path}  | spacing≈({resample_mm},{resample_mm},{resample_mm}) mm")
+
+    # Rückgabe: bevorzugt resampled, sonst original
+    return resampled_path if resampled_path else out_path
 
 
 # ------------------------- Preview (HU farbig + mm-Extents) -------------------------
@@ -237,6 +259,11 @@ def main():
     ap.add_argument("--clip", nargs=2, type=float, default=[-1024, 2000], help="HU-Clip")
     ap.add_argument("--body_thresh", type=float, default=-300.0,
                     help="Schwellwert für Body-Maske (HU), z.B. -300..-450")
+    ap.add_argument("--smooth_sigma", type=float, default=0.0,
+                    help="optional: 3D Gaussian σ in Voxeln nach Maskierung (z.B. 0.6)")
+    ap.add_argument("--resample_mm", type=float, default=None,
+                    help="optional: zusätzlich auf isotropes mm resamplen (z.B. 1.0)")
+
     # preview
     ap.add_argument("--preview", action="store_true", help="nach der Kalibrierung ein PNG rendern")
     ap.add_argument("--view", choices=["coronal","axial","sagittal"], default="coronal")
@@ -249,7 +276,7 @@ def main():
 
     args = ap.parse_args()
 
-    # 1) Kalibrieren & speichern
+    # 1) Kalibrieren & speichern (ggf. resampled Pfad zurück)
     hu_path = calibrate_to_hu(
         in_path=args.infile,
         out_path=args.outfile,
@@ -257,6 +284,8 @@ def main():
         radius_mm=args.radius_mm,
         body_thresh=args.body_thresh,
         clip=tuple(args.clip),
+        smooth_sigma=args.smooth_sigma,
+        resample_mm=args.resample_mm,
     )
 
     # 2) Optional Preview rendern
