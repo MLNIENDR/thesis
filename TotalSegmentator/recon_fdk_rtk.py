@@ -30,15 +30,15 @@ import matplotlib.pyplot as plt
 # ---------------- I/O-Helper ----------------
 def parse_proj_txt(path):
     """proj.txt einlesen und Geometrie-Parameter extrahieren"""
-    txt = open(path, "r", encoding="utf-8", errors="ignore").read()
+    txt = open(path, "r", encoding="utf-8", errors="ignore").read()                                             # Dateitext als string einlesen
 
-    def grab(key):
+    def grab(key):                                                                                              # innere Hilfsfunktion: sucht in txt nach Zeile, die wie <Zahl> : <key> aussieht
         m = re.search(rf'^\s*([+-]?\d+(?:\.\d+)?)\s*:\s*{re.escape(key)}', txt, re.M | re.I)
         return float(m.group(1)) if m else None
 
-    geom = {
-        "width_mm":  grab("width(mms)"),
-        "height_mm": grab("height(mms)"),
+    geom = {                                                                                                    # Dictionary mit allen nötigen Geometrieparametern
+        "width_mm":  grab("width(mms)"),            # Detektorbreite
+        "height_mm": grab("height(mms)"),           # Detektorhöhe
         "nr": int(grab("num_rows") or 0),           # Zeilen HÖHE Detektor
         "nc": int(grab("num_channels") or 0),       # Kanäle BREITE Detektor
         "DSO": grab("distance_to_source(mms)"),
@@ -51,13 +51,13 @@ def parse_proj_txt(path):
 
 def load_mu_stack_any(mat_path):
     """Lädt mu_stack aus .mat (v7/v7.3) und liefert (mu, angles)"""
-    mu = None
+    mu = None                                                                                                   # Initialisierung der Platzhalter
     ang = None
     try:
         from scipy.io import loadmat
-        M = loadmat(mat_path, squeeze_me=True, simplify_cells=True)
+        M = loadmat(mat_path, squeeze_me=True, simplify_cells=True)                                             # Matlab cell arrays werden in Python-Struktur umgewandelt
         mu = np.asarray(M["mu_stack"], np.float32)
-        if "angles_out" in M:
+        if "angles_out" in M:                                                                                   # Winkel einlesen --> NumPy-Array
             ang = np.asarray(M["angles_out"], np.float32)
         elif "angles_deg" in M:
             ang = np.asarray(M["angles_deg"], np.float32)
@@ -72,7 +72,7 @@ def load_mu_stack_any(mat_path):
             elif "angles_deg" in f:
                 ang = np.array(f["angles_deg"], dtype=np.float32).squeeze()
 
-    if mu.ndim != 3:
+    if mu.ndim != 3:                                                                                            # Formvalidierung (muss dreidimensional sein)
         raise ValueError(f"mu_stack hat ndims={mu.ndim}, erwarte 3.")
     return mu.astype(np.float32, copy=False), (None if ang is None else ang.astype(np.float32, copy=False))
 
@@ -92,16 +92,16 @@ def save_preview_png(nifti_path, out_png, view="coronal",
 
     # NIfTI laden (sollte bereits RAS sein)
     img = nib.load(nifti_path)
-    img_ras = nib.as_closest_canonical(img)
-    vol = np.asarray(img_ras.dataobj, dtype=np.float32)   # (X,Y,Z)
-    aff = img_ras.affine                                   # diag(dx,dy,dz)
+    img_ras = nib.as_closest_canonical(img)                                                                     # bringt Bild in RAS-Layout, falls es noch nciht passt
+    vol = np.asarray(img_ras.dataobj, dtype=np.float32)                                                         # vol = NumPy Array mit Shape (X,Y,Z)
+    aff = img_ras.affine                                                                                        # diag(dx,dy,dz)
     X, Y, Z = vol.shape
     dx, dy, dz = float(aff[0, 0]), float(aff[1, 1]), float(aff[2, 2])
 
     v = view.lower()
     if v == "coronal":
-        # Coronal: X fixieren → Ebene (Y,Z)
-        sl = vol[X // 2, :, :]  # (Y,Z)
+        # Coronal: X mittig fixieren → Ebene (Y,Z)
+        sl = vol[X // 2, :, :]
 
         # Standarddarstellung (PA): Blickrichtung von posterior → anterior
         img2 = np.flipud(sl)  # Kopf oben behalten, Z horizontal, Y vertikal
@@ -296,7 +296,7 @@ def main():
     nib.save(nib.Nifti1Image(vol_ras, aff_ras), out_ras_path)
     print(f"[OK] saved (canonical RAS): {out_ras_path}   voxel(mm)=({dx:.4f},{dy:.4f},{dz:.4f})")
 
-    # Optional: Preview-PNG mit sinnvollem Namen speichern
+    # Optional: Preview-PNG speichern
     if args.quick_ap_png:
         target_for_preview = out_ras_path  # immer die kanonische Datei
         out_path = args.quick_ap_png

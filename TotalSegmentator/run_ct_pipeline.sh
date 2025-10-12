@@ -13,7 +13,7 @@ set -euo pipefail
 set -x
 
 echo "========================================================"
-echo "[INFO] Starting CT reconstruction + calibration pipeline"
+echo "[INFO] Starting CT pipeline (FDK → µ→HU → TS → Overlay)"
 echo "========================================================"
 echo "GPUs available: ${SLURM_JOB_GPUS:-unknown}"
 echo "Running on node: $(hostname)"
@@ -22,108 +22,85 @@ echo "--------------------------------------------------------"
 
 # === 1) Environment ===
 source /home/mnguest12/mambaforge/bin/activate totalseg
-cd /home/mnguest12/projects/thesis/TotalSegmentator
+BASE="/home/mnguest12/projects/thesis/TotalSegmentator"
+cd "$BASE"
 
-# --- Argumente ---
-MAT_FILE=${1:-ct_proj_stack.mat}
-PROJ_FILE=${2:-proj.txt}
-PREFIX=${3:-ct_recon_rtk360}
-RUN_TAG=${4:-360}  # z. B. "180" oder "360"
-OUTDIR="runs_${RUN_TAG}"
+# === 2) Parameter/Defaults ===
+# Optional: Übergabe per CLI: <RUN_TAG> <MAT> <PROJ>
+RUN_TAG="${1:-360}"
+MAT_FILE="${2:-${BASE}/runs_${RUN_TAG}/ct_proj_stack${RUN_TAG}.mat}"
+PROJ_FILE="${3:-${BASE}/runs_${RUN_TAG}/proj${RUN_TAG}.txt}"
 
-mkdir -p "${OUTDIR}/ts_preview"
+OUTDIR="${BASE}/runs_${RUN_TAG}"
+PREV_DIR="${OUTDIR}/ts_preview"
+mkdir -p "$OUTDIR" "$PREV_DIR"
 
-# Phantom-ROIs optional
-ROI_AIR="phantom_air_mask.nii.gz"
-ROI_WATER="phantom_water_mask.nii.gz"
-USE_PHANTOM="no"
-if [[ -f "$ROI_AIR" && -f "$ROI_WATER" ]]; then
-  USE_PHANTOM="yes"
-fi
+# Zielpfade (einheitlich)
+RECON_RAS="${OUTDIR}/ct_recon_rtk_RAS.nii"
+HU_NII="${OUTDIR}/ct_recon_rtk_HU.nii"
+HU_ISO="${OUTDIR}/ct_recon_rtk_HU_iso1.0mm.nii"
+PNG_HU_COR="${OUTDIR}/ct_recon_rtk_HU_coronal.png"
+TS_OUTPUT="${OUTDIR}/ts_output.nii"
+PNG_OVERLAY="${PREV_DIR}/coronal_overlay.png"
 
-echo "[INFO] Input MAT=${MAT_FILE}, PROJ=${PROJ_FILE}, PREFIX=${PREFIX}, RUN=${RUN_TAG}"
+echo "[INFO] Using:"
+echo "  RUN_TAG     = ${RUN_TAG}"
+echo "  MAT_FILE    = ${MAT_FILE}"
+echo "  PROJ_FILE   = ${PROJ_FILE}"
+echo "  OUTDIR      = ${OUTDIR}"
 
-# === 2) FDK Reconstruction (RAS) ===
-echo "[STEP 1] Running FDK reconstruction ..."
+# === 3) FDK Reconstruction → RAS ===
+echo "[STEP 1] FDK reconstruction (RTK) → RAS ..."
 python recon_fdk_rtk.py \
-  --mat "$MAT_FILE" \
-  --proj "$PROJ_FILE" \
-  --out "${OUTDIR}/${PREFIX}_RAS.nii" \
-  --quick_ap_png "${OUTDIR}/ts_preview/" \
+  --mat  "${MAT_FILE}" \
+  --proj "${PROJ_FILE}" \
+  --out_ras "${RECON_RAS}" \
+  --quick_ap_png "${PREV_DIR}/" \
   --preview_view coronal \
-  --base_h_in 6.0
+  --coronal_orient AP
 
-RAS_NII="${OUTDIR}/${PREFIX}_RAS.nii"
-test -f "${RAS_NII}" || { echo "[FATAL] missing: ${RAS_NII}"; exit 2; }
+test -f "${RECON_RAS}" || { echo "[FATAL] missing: ${RECON_RAS}"; exit 2; }
 
-# === 3) µ→HU Calibration ===
-echo "[STEP 2] Calibrating µ→HU ..."
-HU_OUT="${OUTDIR}/${PREFIX}_RAS_HU.nii.gz"
+# === 4) µ → HU (Anchors + Keep-Box + iso 1.0 mm + Preview) ===
+echo "[STEP 2] µ→HU calibration + outside-air removal + keep-box ..."
+python mu_to_hu_and_preview_2.py \
+  --in  "${RECON_RAS}" \
+  --out "${HU_NII}" \
+  --anchor "x/2,480,180:60" \
+  --anchor "x/2,300,210:30" \
+  --anchor "x/2,300,100:-1000" \
+  --keep_box_mm 110 690 95 405 95 405 \
+  --smooth_sigma 0.0 \
+  --resample_mm 1.0 \
+  --preview \
+  --view coronal \
+  --coronal_orient AP \
+  --png "${PNG_HU_COR}" \
+  --percentile 2 98
 
-if [[ "$USE_PHANTOM" == "yes" ]]; then
-  echo "[INFO] Using phantom ROIs"
-  python calibrate_mu_to_hu.py \
-    -i "${RAS_NII}" \
-    -o "$HU_OUT" \
-    --roi-air "$ROI_AIR" \
-    --roi-water "$ROI_WATER" \
-    --target-tissue-hu 40 \
-    --clip -1050 3000 \
-    --report-json "${OUTDIR}/ts_preview/hu_calibration_report.json" \
-    --coronal-png "${OUTDIR}/ts_preview/${PREFIX}_HU_coronal_phantom.png"
-else
-  echo "[WARN] No ROIs found → Auto calibration"
-  python calibrate_mu_to_hu.py \
-    -i "${RAS_NII}" \
-    -o "$HU_OUT" \
-    --target-tissue-hu 40 \
-    --clip -1050 3000 \
-    --report-json "${OUTDIR}/ts_preview/hu_calibration_report_auto.json" \
-    --coronal-png "${OUTDIR}/ts_preview/${PREFIX}_HU_coronal_auto.png"
-fi
+# Das Skript legt bei --resample_mm zusätzlich ${HU_ISO} an
+test -f "${HU_ISO}" || { echo "[FATAL] expected isotropic HU not found: ${HU_ISO}"; exit 3; }
 
-test -f "$HU_OUT" || { echo "[FATAL] missing HU output: $HU_OUT"; exit 3; }
+# === 5) TotalSegmentator + Coronal Overlay (AP) ===
+echo "[STEP 3] TotalSegmentator (multi-label) + coronal overlay ..."
+# Vorsichtshalber altes Ergebnis entfernen
+rm -f "${TS_OUTPUT}"
 
-# === 4) TotalSegmentator (Multi-Label ins OUTDIR) ===
-echo "[STEP 3] Running TotalSegmentator ..."
-TotalSegmentator -i "$HU_OUT" -o "${OUTDIR}" --ml
-echo "[OK] Segmentation finished → ${OUTDIR}"
+python ts_run_and_overlay.py \
+  --in-hu "${HU_ISO}" \
+  --seg    "${TS_OUTPUT}" \
+  --overlay "${PNG_OVERLAY}" \
+  --run-ts
 
-# Multi-Label-Datei konsolidieren (einheitlicher Name)
-if   [[ -f "${OUTDIR}/segmentations.nii.gz" ]]; then
-  SEG_IN="${OUTDIR}/segmentations.nii.gz"
-elif [[ -f "${OUTDIR}/segmentation.nii.gz" ]]; then
-  SEG_IN="${OUTDIR}/segmentation.nii.gz"
-elif [[ -f "${OUTDIR}/ts_output_calib.nii.gz" ]]; then
-  SEG_IN="${OUTDIR}/ts_output_calib.nii.gz"
-elif [[ -f "${OUTDIR}/ts_output_calib.nii" ]]; then
-  SEG_IN="${OUTDIR}/ts_output_calib.nii"
-else
-  echo "[FATAL] Konnte Multi-Label nicht finden in ${OUTDIR}."
-  ls -lh "${OUTDIR}" || true
-  exit 4
-fi
-
-SEG_STD="${OUTDIR}/ts_output_calib.nii.gz"
-if [[ "${SEG_IN}" == *.nii.gz ]]; then
-  cp -f "${SEG_IN}" "${SEG_STD}"
-else
-  gzip -c "${SEG_IN}" > "${SEG_STD}"
-fi
-echo "[OK] Multi-Label bereit: ${SEG_STD}"
-
-# === 5) Overlay rendern ===
-echo "[STEP 4] Making coronal AP overlay ..."
-python hu_seg_and_preview.py \
-  --in-hu "$HU_OUT" \
-  --seg-path "${SEG_STD}" \
-  --coronal-out "${OUTDIR}/ts_preview/${PREFIX}_overlay_HUcalib.png" \
-  --force
+test -f "${TS_OUTPUT}" || { echo "[FATAL] TS output missing: ${TS_OUTPUT}"; exit 4; }
+test -f "${PNG_OVERLAY}" || { echo "[FATAL] overlay missing: ${PNG_OVERLAY}"; exit 5; }
 
 echo "--------------------------------------------------------"
 echo "[INFO] Pipeline finished successfully at $(date)"
 echo "Results in: ${OUTDIR}/"
-echo "  - HU volume:        ${HU_OUT}"
-echo "  - Seg multilabel:   ${SEG_STD}"
-echo "  - Preview PNGs:     ${OUTDIR}/ts_preview/"
+echo "  - RAS recon:       ${RECON_RAS}"
+echo "  - HU volume:       ${HU_NII}"
+echo "  - HU (iso 1.0mm):  ${HU_ISO}"
+echo "  - TS multilabel:   ${TS_OUTPUT}"
+echo "  - Previews:        ${PREV_DIR}/"
 echo "--------------------------------------------------------"
