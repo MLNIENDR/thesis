@@ -104,3 +104,45 @@ echo "  - HU (iso 1.0mm):  ${HU_ISO}"
 echo "  - TS multilabel:   ${TS_OUTPUT}"
 echo "  - Previews:        ${PREV_DIR}/"
 echo "--------------------------------------------------------"
+
+# === 6) HU-Histogramm erzeugen ===
+echo "[STEP 6] Creating HU histogram ..."
+
+# Pfade aus vorherigen Schritten
+HU_ISO="${OUTDIR}/ct_recon_rtk_HU_iso1.0mm.nii"
+PREV_DIR="${OUTDIR}/ts_preview"
+mkdir -p "${PREV_DIR}"
+
+python - <<EOF
+import nibabel as nib
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import os, sys
+
+hu_path = "${HU_ISO}"
+out_png = os.path.join("${PREV_DIR}", "HU_histogram.png")
+
+if not os.path.exists(hu_path):
+    print(f"[WARN] HU_ISO not found: {hu_path}")
+    sys.exit(1)
+
+# HU-Daten laden
+img = nib.load(hu_path)
+arr = np.asarray(img.dataobj).astype(np.float32)
+vals = arr[np.isfinite(arr)]
+
+# Histogramm plotten
+plt.figure(figsize=(7,5))
+plt.hist(vals, bins=400, range=(-1200,2500), color='steelblue', alpha=0.85)
+plt.title("HU Histogram (iso volume)")
+plt.xlabel("Hounsfield Units [HU]")
+plt.ylabel("Voxel count")
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig(out_png, dpi=150)
+plt.close()
+
+print(f"[OK] HU histogram saved → {out_png}")
+EOF
