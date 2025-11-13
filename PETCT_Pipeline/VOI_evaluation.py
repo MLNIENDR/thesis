@@ -128,7 +128,7 @@ def fmt_int(value):
         return ""
     return value
 
-def write_pretty_table(results, out_path):
+def write_readable_table(results, out_path):
     """
     Schreibt eine schön ausgerichtete Texttabelle (fixed width) nach out_path.
     Gut zum Lesen im Editor/Terminal.
@@ -345,9 +345,9 @@ def run_evaluation(
                     "max": fmt_int(r["max"]),
                 })
         # Zusätzlich eine hübsch formatierte Texttabelle schreiben
-        pretty_path = os.path.splitext(output_csv)[0] + "_pretty.txt"
-        print(f"Schreibe lesbare Texttabelle nach: {pretty_path}")
-        write_pretty_table(results, pretty_path)
+        readable_path = os.path.splitext(output_csv)[0] + "_readable.txt"
+        print(f"Schreibe lesbare Texttabelle nach: {readable_path}")
+        write_readable_table(results, readable_path)
 
 
 def main():
