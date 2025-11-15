@@ -56,7 +56,7 @@ def project_mask_to_2d(mask_arr_zyx: np.ndarray, view: str) -> np.ndarray:
     analog zur Projektion der Aktivität.
     """
     if view == "AP":
-        return np.any(mask_arr_zyx, axis=1).astype(np.uint8)      # (z,x)
+        return np.any(mask_arr_zyx, axis=1).astype(np.uint8)      # für jeden Pixel im 2D-Pixel wird geschaut, ob in ges. Tiefe irgendwo Maske = 1 war
     elif view == "PA":
         return np.any(mask_arr_zyx[:, ::-1, :], axis=1).astype(np.uint8)
     else:

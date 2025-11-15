@@ -21,6 +21,10 @@ python stratos_applied.py \
   --ap            /home/mnguest12/projects/thesis/PETCT_Pipeline/data/example_01/results/scintigraphy_sim/projection_AP.npy \
   --pa            /home/mnguest12/projects/thesis/PETCT_Pipeline/data/example_01/results/scintigraphy_sim/projection_PA.npy \
   --output_dir    /home/mnguest12/projects/thesis/PETCT_Pipeline/data/example_01/results/stratos_applied \
+    --scatter_sigma_xy 2.0 \
+  --coll_sigma_xy 0.0 \
+  --collimator_kernel_mat /home/mnguest12/projects/thesis/PhantomGenerator/LEAP_Kernel.mat \
+  --z0_slices 1 \
   --use_nnls
 """
 
@@ -273,6 +277,8 @@ def build_system_matrix(
     use_scatter: bool,
     use_attenuation: bool,
     use_collimator: bool,
+    coll_kernel: np.ndarray | None = None,
+    z0_slices: int = 0,
 ) -> Tuple[np.ndarray, List[str]]:
     """Baut die Systemmatrix A:
 
@@ -303,12 +309,16 @@ def build_system_matrix(
         proj_ap, proj_pa = scinti.gamma_camera_forward_zyx(
             act_zyx=act_zyx,
             mu_zyx=mu_zyx,
-            scatter_sigma_xy=scatter_sigma_xy,
-            coll_sigma_xy=coll_sigma_xy,
+            # unsere Parameter heißen hier *_xy, scinti erwartet *_xz → einfach gemappt:
+            scatter_sigma_xz=scatter_sigma_xy,
+            coll_sigma_xz=coll_sigma_xy,
             use_scatter=use_scatter,
             use_attenuation=use_attenuation,
             use_collimator=use_collimator,
             spacing_y_mm=spacing_y,
+            coll_kernel=coll_kernel,
+            z0_slices=z0_slices,
+            use_fft_conv=True,  # oder scinti.USE_FFT_CONV, falls definiert
         )
 
         if proj_shape is None:
@@ -379,8 +389,16 @@ def run_stratos_applied(
     use_collimator: bool = True,
     use_nnls: bool = True,
     hu_threshold_body: float = -400.0,
+    collimator_kernel_mat: str | None = None,
+    z0_slices: int = 0,
 ):
     os.makedirs(output_dir, exist_ok=True)
+    # ggf. Kollimatorkernel aus .mat laden (LEAP-Kernel)
+    coll_kernel = None
+    if collimator_kernel_mat is not None:
+        print(f"[INFO] Lade Kollimatorkernel aus: {collimator_kernel_mat}")
+        coll_kernel = scinti.load_leap_kernel(collimator_kernel_mat)
+        print(f"[INFO] Kollimatorkernel-Shape: {coll_kernel.shape}")
 
     # --- PET/CT einlesen und µ-Map erzeugen ---
     print(f"[INFO] Lese PET-DICOM aus: {pet_dicom_dir}")
@@ -433,6 +451,8 @@ def run_stratos_applied(
         use_scatter=use_scatter,
         use_attenuation=use_attenuation,
         use_collimator=use_collimator,
+        coll_kernel=coll_kernel,
+        z0_slices=z0_slices,
     )
 
     # --- Lösen: A x ≈ b ---
@@ -560,6 +580,19 @@ def main():
                         help="Nichtnegative Lösung (NNLS) statt gewöhnlicher Least Squares.")
     parser.add_argument("--hu_threshold_body", type=float, default=-400.0,
                         help="HU-Schwelle für Body-Maske (Standard: -400 HU).")
+    parser.add_argument(
+        "--collimator_kernel_mat",
+        type=str,
+        default=None,
+        help="Pfad zu einer .mat-Datei mit Kollimatorkernel (z.B. LEAP_Kernel.mat). "
+             "Wenn gesetzt, wird dieser Kernel statt eines Gaußfilters verwendet.",
+    )
+    parser.add_argument(
+        "--z0_slices",
+        type=int,
+        default=0,
+        help="Anzahl der Slices (in y-Richtung), vor denen keine Kollimatorunschärfe angewandt wird.",
+    )
 
     args = parser.parse_args()
 
@@ -577,6 +610,8 @@ def main():
         use_collimator=not args.no_collimator,
         use_nnls=args.use_nnls,
         hu_threshold_body=args.hu_threshold_body,
+        collimator_kernel_mat=args.collimator_kernel_mat,
+        z0_slices=args.z0_slices,
     )
 
 

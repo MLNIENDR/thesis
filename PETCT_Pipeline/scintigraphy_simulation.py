@@ -25,8 +25,10 @@ python scintigraphy_simulation.py \
   --pet_dicom_dir /home/mnguest12/projects/thesis/PETCT_Pipeline/data/example_01/PET_WB_TRUEX2I14S0MM_AC_0102 \
   --ct_dicom_dir  /home/mnguest12/projects/thesis/PETCT_Pipeline/data/example_01/CT_WB_5_0_B30F_0005 \
   --output_dir    /home/mnguest12/projects/thesis/PETCT_Pipeline/data/example_01/results/scintigraphy_sim \
-  --scatter_sigma_xy 2.0 \
-  --coll_sigma_xy 2.0
+  --scatter_sigma_xz 2.0 \
+  --coll_sigma_xz 2.0 \
+  --collimator_kernel_mat /home/mnguest12/projects/thesis/PhantomGenerator/LEAP_Kernel.mat \
+  --z0_slices 1
 
 """
 
@@ -37,11 +39,14 @@ from typing import Tuple
 import numpy as np
 import SimpleITK as sitk
 from scipy.ndimage import gaussian_filter
+from scipy.io import loadmat
+from scipy.signal import fftconvolve, convolve2d
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
+# Soll für die Kollimator-Faltung FFT benutzt werden?
+USE_FFT_CONV = True
 
 # -------------------------------------------------------------
 # DICOM I/O
@@ -84,6 +89,37 @@ def resample_to_reference(
     return resampler.Execute(img)
 
 
+def load_leap_kernel(mat_path: str, key: str = None) -> np.ndarray:
+    """
+    Lädt den Kollimatorkern aus einer .mat-Datei.
+    Erwartet ein Array der Form (nz_kernel, nx_kernel, n_depth).
+
+    - mat_path: Pfad zu LEAP_Kernel.mat
+    - key: Name der Variable im .mat (falls bekannt).
+           Wenn None, wird das erste nicht-Meta-Array genommen.
+    """
+    m = loadmat(mat_path)
+    if key is None:
+        # erstes "normales" Array nehmen (alles, was nicht __header__/__version__/__globals__ ist)
+        data_keys = [k for k in m.keys() if not k.startswith("__")]
+        if not data_keys:
+            raise RuntimeError(f"Keine nutzbare Variable in {mat_path} gefunden.")
+        key = data_keys[0]
+
+    kernel_mat = np.asarray(m[key], dtype=np.float32)
+
+    # Optional: jede Tiefenscheibe auf Summe 1 normalisieren
+    if kernel_mat.ndim == 3:
+        for i in range(kernel_mat.shape[2]):
+            s = kernel_mat[:, :, i].sum()
+            if s > 0:
+                kernel_mat[:, :, i] /= s
+    else:
+        raise ValueError(f"Erwartete 3D-Kernelmatrix, bekommen: shape={kernel_mat.shape}")
+
+    return kernel_mat
+
+
 # -------------------------------------------------------------
 # CT -> µ-Map (stark vereinfacht)
 # -------------------------------------------------------------
@@ -92,8 +128,7 @@ def ct_hu_to_mu(ct_hu: np.ndarray, energy_keV: float = 140.0) -> np.ndarray:
     Sehr einfache HU -> µ-Abbildung.
 
     Annahme:
-      - Wasser bei 140 keV: µ_water ≈ 0.15 1/cm (Pi-mal-Daumen)
-      - relative Dichte ~ (HU / 1000 + 1)
+      - Wasser bei 140 keV: µ_water ≈ 0.15 1/cm (ca.)
       - daraus: µ = µ_water * (HU/1000 + 1)
 
     """
@@ -111,12 +146,15 @@ def ct_hu_to_mu(ct_hu: np.ndarray, energy_keV: float = 140.0) -> np.ndarray:
 def _forward_single_view_zyx(
     act_zyx: np.ndarray,
     mu_zyx: np.ndarray,
-    scatter_sigma_xy: float,
-    coll_sigma_xy: float,
+    scatter_sigma_xz: float,
+    coll_sigma_xz: float,
     use_scatter: bool,
     use_attenuation: bool,
     use_collimator: bool,
     spacing_y_mm: float,
+    coll_kernel: np.ndarray | None = None,
+    z0_slices: int = 0,
+    use_fft_conv: bool = True,
 ) -> np.ndarray:
     """
     Vorwärtsmodell für EINE Blickrichtung entlang der y-Achse (AP ODER PA).
@@ -130,13 +168,13 @@ def _forward_single_view_zyx(
     nz, ny, nx = act_zyx.shape
 
     # (1) Streuung in der Detektorebene (z,x) pro y-Schicht
-    if use_scatter and scatter_sigma_xy > 0:
-        act_sc = np.empty_like(act_zyx, dtype=np.float32)
+    if use_scatter and scatter_sigma_xz > 0:
+        act_sc = np.empty_like(act_zyx, dtype=np.float32)           # neues Array für gestreute Werte
         for j in range(ny):
             act_sc[:, j, :] = gaussian_filter(
                 act_zyx[:, j, :],
-                sigma=scatter_sigma_xy,
-                mode="nearest",
+                sigma=scatter_sigma_xz,
+                mode="nearest",                                     # verhindert Rand-Artefakte
             )
     else:
         act_sc = act_zyx.astype(np.float32, copy=True)
@@ -144,20 +182,45 @@ def _forward_single_view_zyx(
     # (2) Abschwächung entlang y (µ in 1/cm, dy in cm)
     if use_attenuation:
         spacing_y_cm = spacing_y_mm / 10.0
-        mu_cum = np.cumsum(mu_zyx * spacing_y_cm, axis=1)
-        vol_atn = act_sc * np.exp(-mu_cum)
+        mu_cum = np.cumsum(mu_zyx * spacing_y_cm, axis=1)           # kumulative Absorption entlang der y-Achse
+        vol_atn = act_sc * np.exp(-mu_cum)                          # quasi Anwendung Lamber-Beer-Gleichung
     else:
         vol_atn = act_sc
 
-    # (3) Kollimatorunschärfe (wieder in (z,x) pro y-Schicht)
-    if use_collimator and coll_sigma_xy > 0:
-        vol_coll = np.empty_like(vol_atn, dtype=np.float32)
-        for j in range(ny):
-            vol_coll[:, j, :] = gaussian_filter(
-                vol_atn[:, j, :],
-                sigma=coll_sigma_xy,
-                mode="nearest",
-            )
+    # (3) Kollimatorunschärfe / -PSF
+    if use_collimator:
+        # Fall A: echter LEAP-Kernel vorhanden → depth-dependent PSF
+        if coll_kernel is not None:
+            vol_coll = np.empty_like(vol_atn, dtype=np.float32)
+            nz, ny, nx = vol_atn.shape
+            conv2 = fftconvolve if use_fft_conv else convolve2d
+            n_kernels = coll_kernel.shape[2]
+
+            # wir gehen über die Projektionsrichtung (y) und
+            # falten je y-Schicht in der Detektorebene (z,x)
+            for j in range(ny):
+                if j <= z0_slices:
+                    # vor z0: noch keine Kollimatorunschärfe anwenden
+                    vol_coll[:, j, :] = vol_atn[:, j, :]
+                else:
+                    kk = min(j - z0_slices, n_kernels - 1)
+                    K = coll_kernel[:, :, kk]
+                    vol_coll[:, j, :] = conv2(
+                        vol_atn[:, j, :],   # shape (nz, nx)
+                        K,                  # shape (kz, kx)
+                        mode="same",
+                    ).astype(np.float32)
+        # Fall B: kein Kernel → fallback auf Gauß, wie bisher
+        elif coll_sigma_xz > 0:
+            vol_coll = np.empty_like(vol_atn, dtype=np.float32)
+            for j in range(ny):
+                vol_coll[:, j, :] = gaussian_filter(
+                    vol_atn[:, j, :],
+                    sigma=coll_sigma_xz,
+                    mode="nearest",
+                )
+        else:
+            vol_coll = vol_atn
     else:
         vol_coll = vol_atn
 
@@ -169,12 +232,15 @@ def _forward_single_view_zyx(
 def gamma_camera_forward_zyx(
     act_zyx: np.ndarray,
     mu_zyx: np.ndarray,
-    scatter_sigma_xy: float = 2.0,
-    coll_sigma_xy: float = 2.0,
+    scatter_sigma_xz: float = 2.0,
+    coll_sigma_xz: float = 2.0,
     use_scatter: bool = True,
     use_attenuation: bool = True,
     use_collimator: bool = True,
     spacing_y_mm: float = 4.0,
+    coll_kernel: np.ndarray | None = None,
+    z0_slices: int = 0,
+    use_fft_conv: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     AP/PA-Projektion aus Volumen (nz, ny, nx) mit Integration entlang y.
@@ -182,35 +248,39 @@ def gamma_camera_forward_zyx(
     """
     assert act_zyx.shape == mu_zyx.shape
 
-    # AP: entlang +y
     proj_ap = _forward_single_view_zyx(
         act_zyx=act_zyx,
         mu_zyx=mu_zyx,
-        scatter_sigma_xy=scatter_sigma_xy,
-        coll_sigma_xy=coll_sigma_xy,
+        scatter_sigma_xz=scatter_sigma_xz,
+        coll_sigma_xz=coll_sigma_xz,
         use_scatter=use_scatter,
         use_attenuation=use_attenuation,
         use_collimator=use_collimator,
         spacing_y_mm=spacing_y_mm,
+        coll_kernel=coll_kernel,
+        z0_slices=z0_slices,
+        use_fft_conv=use_fft_conv,
     )
 
-    # PA: entlang -y (y-Achse umdrehen)
     proj_pa = _forward_single_view_zyx(
         act_zyx=act_zyx[:, ::-1, :],
         mu_zyx=mu_zyx[:, ::-1, :],
-        scatter_sigma_xy=scatter_sigma_xy,
-        coll_sigma_xy=coll_sigma_xy,
+        scatter_sigma_xz=scatter_sigma_xz,
+        coll_sigma_xz=coll_sigma_xz,
         use_scatter=use_scatter,
         use_attenuation=use_attenuation,
         use_collimator=use_collimator,
         spacing_y_mm=spacing_y_mm,
+        coll_kernel=coll_kernel,
+        z0_slices=z0_slices,
+        use_fft_conv=use_fft_conv,
     )
 
     return proj_ap, proj_pa
 
 
 # -------------------------------------------------------------
-# Plot-Helper (einfach, wie in der „guten“ Version)
+# Plot-Helper
 # -------------------------------------------------------------
 def save_projection_png(proj: np.ndarray, path: str, title: str,
                         spacing_x: float, spacing_z: float):
@@ -255,13 +325,22 @@ def run_scintigraphy_simulation(
     pet_dicom_dir: str,
     ct_dicom_dir: str,
     output_dir: str,
-    scatter_sigma_xy: float = 2.0,
-    coll_sigma_xy: float = 2.0,
+    scatter_sigma_xz: float = 2.0,
+    coll_sigma_xz: float = 2.0,
     use_scatter: bool = True,
     use_attenuation: bool = True,
     use_collimator: bool = True,
+    collimator_kernel_mat: str | None = None,
+    z0_slices: int = 0,
 ):
     os.makedirs(output_dir, exist_ok=True)
+
+    # ggf. Kollimatorkernel laden
+    coll_kernel = None
+    if collimator_kernel_mat is not None:
+        print(f"[INFO] Lade Kollimatorkernel aus: {collimator_kernel_mat}")
+        coll_kernel = load_leap_kernel(collimator_kernel_mat)
+        print(f"[INFO] Kollimatorkernel-Shape: {coll_kernel.shape}")
 
     print(f"[INFO] Lese PET-DICOM aus: {pet_dicom_dir}")
     pet_img = read_dicom_series(pet_dicom_dir)
@@ -293,12 +372,15 @@ def run_scintigraphy_simulation(
     proj_ap, proj_pa = gamma_camera_forward_zyx(
         act_zyx=pet_arr_zyx,
         mu_zyx=mu_zyx,
-        scatter_sigma_xy=scatter_sigma_xy,
-        coll_sigma_xy=coll_sigma_xy,
+        scatter_sigma_xz=scatter_sigma_xz,
+        coll_sigma_xz=coll_sigma_xz,
         use_scatter=use_scatter,
         use_attenuation=use_attenuation,
         use_collimator=use_collimator,
         spacing_y_mm=spacing_y,
+        coll_kernel=coll_kernel,
+        z0_slices=z0_slices,
+        use_fft_conv=USE_FFT_CONV,
     )
 
     # Speichern als NPY
@@ -349,13 +431,13 @@ def main():
         help="Ausgabeordner für Projektionen (NPY + PNG).",
     )
     parser.add_argument(
-        "--scatter_sigma_xy",
+        "--scatter_sigma_xz",
         type=float,
         default=2.0,
         help="Sigma der Gauß-Streuung in der (z,x)-Ebene (in Pixeln). 0 = aus.",
     )
     parser.add_argument(
-        "--coll_sigma_xy",
+        "--coll_sigma_xz",
         type=float,
         default=2.0,
         help="Sigma der Gauß-Kollimatorunschärfe in der (z,x)-Ebene (in Pixeln). 0 = aus.",
@@ -375,6 +457,19 @@ def main():
         action="store_true",
         help="Kollimatorunschärfe abschalten.",
     )
+    parser.add_argument(
+        "--collimator_kernel_mat",
+        type=str,
+        default=None,
+        help="Pfad zu einer .mat-Datei mit Kollimatorkernel (z.B. LEAP_Kernel.mat). "
+             "Wenn gesetzt, wird dieser Kernel statt eines Gaußfilters verwendet.",
+    )
+    parser.add_argument(
+        "--z0_slices",
+        type=int,
+        default=0,
+        help="Anzahl der Slices (in y-Richtung), vor denen keine Kollimatorunschärfe angewandt wird.",
+    )
 
     args = parser.parse_args()
 
@@ -382,11 +477,13 @@ def main():
         pet_dicom_dir=args.pet_dicom_dir,
         ct_dicom_dir=args.ct_dicom_dir,
         output_dir=args.output_dir,
-        scatter_sigma_xy=args.scatter_sigma_xy,
-        coll_sigma_xy=args.coll_sigma_xy,
+        scatter_sigma_xz=args.scatter_sigma_xz,
+        coll_sigma_xz=args.coll_sigma_xz,
         use_scatter=not args.no_scatter,
         use_attenuation=not args.no_attenuation,
         use_collimator=not args.no_collimator,
+        collimator_kernel_mat=args.collimator_kernel_mat,
+        z0_slices=args.z0_slices,
     )
 
 

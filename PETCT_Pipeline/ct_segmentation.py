@@ -35,6 +35,7 @@ import matplotlib.pyplot as plt
 # --------------------------- Utility & I/O helpers ---------------------------
 
 def setup_logging():
+    # richtet Logging-Format ein (Zeit, Level, Nachricht)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)-8s | %(message)s",
@@ -43,11 +44,13 @@ def setup_logging():
 
 
 def assert_dir_exists(p: Path, what: str):
+    # prüft, ob ein Ordner existiert
     if not p.exists() or not p.is_dir():
         raise FileNotFoundError(f"{what} existiert nicht oder ist kein Ordner: {p}")
 
 
 def ensure_cmd_available(cmd: str, hint: str = ""):
+    # stellt sicher, dass externes Kommando (z.B. 'TotalSegmentator' im Path liegt)
     if shutil.which(cmd) is None:
         extra = f" ({hint})" if hint else ""
         raise EnvironmentError(
@@ -104,7 +107,7 @@ def convert_dicom_to_nifti(dicom_folder: Path, out_path: Path) -> Path:
 from nibabel.processing import resample_from_to
 
 def _is_gzip_file(path: Path) -> bool:
-    """Prüft den gzip-Header (0x1f 0x8b)."""
+    """Prüft anhand der ersten Bytes, ob die Datei wirklich gzip-komprimiert ist."""
     try:
         with open(path, "rb") as f:
             return f.read(2) == b"\x1f\x8b"
@@ -112,15 +115,14 @@ def _is_gzip_file(path: Path) -> bool:
         return False
 
 def _compress_with_nib(src: Path, dst_gz: Path):
-    """Liest ein NIfTI (komprimiert oder unkomprimiert) und speichert *echt* gzip-komprimiert."""
+    """Liest ein NIfTI (komprimiert oder unkomprimiert) und speichert gzip-komprimiert."""
     img = nib.load(str(src))
     dst_gz.parent.mkdir(parents=True, exist_ok=True)
     nib.save(img, str(dst_gz))
 
 def _find_seg_candidate_files(base_dirs: list[Path]) -> list[Path]:
     """
-    Durchsucht die angegebenen Verzeichnisse *nicht nur flach*, sondern auch rekursiv (Tiefe 2)
-    nach sinnvollen Kandidaten (*.nii / *.nii.gz).
+    Sucht in den angegebenen Verzeichnissen und Unterordner-Struktur nach möglichen Segmentierungsdateien (*.nii / *.nii.gz).
     """
     candidates: list[Path] = []
     patterns = ["*.nii", "*.nii.gz"]
