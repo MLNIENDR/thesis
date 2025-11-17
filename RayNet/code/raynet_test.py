@@ -2,14 +2,6 @@
 """
 raynet_test.py — Segment-RayNet mit explizitem Train/Test-Split auf K Strahlen
 
-Basis: raynet.py, mit folgenden Erweiterungen:
-- Es werden K Strahlen aus dem Datensatz ausgewählt (z.B. 1000)
-- Reproduzierbarer Split per Random-Seed
-- 80% → Training, 20% → Test
-- Training nur auf Train-Subset
-- Zusätzliches Batch-Plot-Panel für die Test-Strahlen (analog zum Train-Panel)
-- a_true wird im Test NUR zur Auswertung/Visualisierung genutzt, nicht als Input
-
 Beispielaufruf:
 
 python raynet_test.py \
@@ -47,20 +39,18 @@ class NPZRays(Dataset):
     def __init__(self, npz_path: str):
         data = np.load(npz_path)
 
+        # Ray-Features aus dem .npz (vom preprocessing.py gebaut)
         self.mu      = torch.from_numpy(data["mu_seq"]).float()      # [M,N]
         self.T_ap    = torch.from_numpy(data["T_ap_seq"]).float()    # [M,N]
         self.T_pa    = torch.from_numpy(data["T_pa_seq"]).float()    # [M,N]
         self.I_pairs = torch.from_numpy(data["I_pairs"]).float()     # [M,2]
-
         self.a_gt = torch.from_numpy(data["a_seq"]).float() \
             if "a_seq" in data.files else None
-
         self.mask_npz = torch.from_numpy(data["mask_meas"]).float() \
             if "mask_meas" in data.files else None
-
         self.ds = float(data["ds"]) if "ds" in data.files else 1.0
 
-        # Größe merken
+        # Anzahl Rays (M) und Samples pro Ray (N)
         self.M, self.N = self.mu.shape
 
         # optionale Strahlkoordinaten (Pixel-Indizes) -> auf [-1,1] normieren
@@ -89,17 +79,18 @@ class NPZRays(Dataset):
         return self.M
 
     def __getitem__(self, idx):
+        # Basis-Output pro Ray
         d = {
             "mu":       self.mu[idx],          # [N]
             "T_ap":     self.T_ap[idx],        # [N]
             "T_pa":     self.T_pa[idx],        # [N]
-            "I_ap":     self.I_pairs[idx, 0],  # []
-            "I_pa":     self.I_pairs[idx, 1],  # []
+            "I_ap":     self.I_pairs[idx, 0],  # Skalar
+            "I_pa":     self.I_pairs[idx, 1],  # Skalar
             "ds":       torch.tensor(self.ds, dtype=torch.float32),
-            "mask_def": self.mask_default[idx],
+            "mask_def": self.mask_default[idx],# 0/1: aktiver Ray?
         }
         if self.xy_norm is not None:
-            d["xy"] = self.xy_norm[idx]        # [2], normierte Koords
+            d["xy"] = self.xy_norm[idx]        
         if self.a_gt is not None:
             d["a_gt"] = self.a_gt[idx]
         if self.mask_npz is not None:
@@ -112,24 +103,28 @@ class NPZRaysSubset(Dataset):
 
     Schneidet alle Tensoren einmalig auf die gegebenen Indizes zu,
     damit Visualisierungen (I_pairs, a_gt, ...) weiter funktionieren.
+
+    Erklärung: 
+        - torch.utils.data.Subset liefert nur Indizes, aber die Daten
+        bleiben im Original-Datenset
+        - hier wird stattdessen ein "echtes" Sub-Dataset gebaut: alle
+        Tensoren werden einmal zugeschnitten und gespeichert
     """
     def __init__(self, base: NPZRays, indices):
         idx = torch.as_tensor(indices, dtype=torch.long)
-
+        # nehme aus dem Original-Dataset base nur die gewünschten Zeilen
         self.mu      = base.mu[idx]
         self.T_ap    = base.T_ap[idx]
         self.T_pa    = base.T_pa[idx]
         self.I_pairs = base.I_pairs[idx]
         self.ds      = base.ds
-
-        # normierte Koordinaten-Features übernehmen (falls vorhanden)
         self.xy_norm = base.xy_norm[idx] if getattr(base, "xy_norm", None) is not None else None
-
         self.a_gt     = base.a_gt[idx] if base.a_gt is not None else None
         self.mask_npz = base.mask_npz[idx] if base.mask_npz is not None else None
-
         self.M, self.N = self.mu.shape
 
+        # Neue Default-Maske: Strahlen, bei denen I_ap oder I_pa > 0 ist
+        # (hier kleiner als NPZRays: kein eps, sondern "größer null")
         with torch.no_grad():
             nz = (self.I_pairs[:, 0] > 0) | (self.I_pairs[:, 1] > 0)
             self.mask_default = nz.float()
@@ -158,10 +153,11 @@ class NPZRaysSubset(Dataset):
 
 # ---------------- Helpers ----------------
 @torch.no_grad()
+# einfache Normalisierung
 def zscore_1d(x: torch.Tensor) -> torch.Tensor:
-    m = x.mean()
-    s = x.std()
-    return (x - m) / (s + 1e-6)
+    m = x.mean()                    # Mittelwert
+    s = x.std()                     # Standardabweichung
+    return (x - m) / (s + 1e-6)     # z-Normierung, kleiner Offset gegen Div/0
 
 def fourier_encode_xy(xy: torch.Tensor, num_freqs: int = 4) -> torch.Tensor:
     """
@@ -172,7 +168,7 @@ def fourier_encode_xy(xy: torch.Tensor, num_freqs: int = 4) -> torch.Tensor:
     if num_freqs <= 0:
         return torch.empty(xy.shape[0], 0, device=xy.device, dtype=xy.dtype)
     B = xy.shape[0]
-    # Frequenzen: 1,2,4,... * pi
+    # Frequenzen: 1,2,4,... * pi --> Deckung versch. Skalen
     freqs = 2.0 ** torch.arange(num_freqs, device=xy.device, dtype=xy.dtype) * math.pi  # [F]
     freqs = freqs.view(1, num_freqs, 1)          # [1,F,1]
     xy = xy.view(B, 1, 2)                        # [B,1,2]
@@ -184,15 +180,19 @@ def fourier_encode_xy(xy: torch.Tensor, num_freqs: int = 4) -> torch.Tensor:
 
 @torch.no_grad()
 def segment_from_mu(mu: torch.Tensor, edge_tau: float, min_seg: int, K_max: int) -> Tuple[torch.Tensor, int]:
-    """Segmentmasken S∈{0,1}^{K,N} aus µ-Kanten (GPU/torch-only, min_seg-fest)."""
+    """Segmentmasken aus µ-Kanten."""
     N = mu.numel()
+    # µ z-normalisieren → Kanten unabhängig von Absolutwerten
     mu_n = (mu - mu.mean()) / (mu.std() + 1e-6)
+    # Kantenstärke als Betrag der 1D-Differenz
     e = (mu_n[1:] - mu_n[:-1]).abs()  # [N-1]
+    # Kante, wenn Differenz > edge_tau
     cuts = e > edge_tau               # bool
 
-    # Grenzen (inkl. Ränder)
+    # Indexliste der Segmentgrenzen (inkl. Anfang und Ende)
     idx = [0]
     if cuts.any():
+        # Positionen der Kanten → idx ==> 0: Start, +1: linke Grenze vom neuen Segment, N = Ende
         pos = torch.nonzero(cuts, as_tuple=False).squeeze(-1) + 1
         idx += pos.tolist()
     idx.append(N)
@@ -216,16 +216,16 @@ def segment_from_mu(mu: torch.Tensor, edge_tau: float, min_seg: int, K_max: int)
         if short.numel() == 0:
             break
         i = int(short[0])
-        if len(segs) == 1:
+        if len(segs) == 1:                          # Nur ein Segment → alles [0,N]
             segs = [[0, N]]
             break
-        if i == 0:
+        if i == 0:                                  # Am Rand: mit Nachbar rechts/links mergen
             segs[0][1] = segs[1][1]
             del segs[1]
         elif i == len(segs) - 1:
             segs[-2][1] = segs[-1][1]
             del segs[-1]
-        else:
+        else:                                       # In der Mitte: mit längerem Nachbarsegment mergen
             Lm = segs[i - 1][1] - segs[i - 1][0]
             Rm = segs[i + 1][1] - segs[i + 1][0]
             if Lm >= Rm:
@@ -235,7 +235,7 @@ def segment_from_mu(mu: torch.Tensor, edge_tau: float, min_seg: int, K_max: int)
                 segs[i][1] = segs[i + 1][1]
                 del segs[i + 1]
 
-    # K_max
+    # Maximal K_max Segmente erlauben → kleinste Segmente iterativ mergen
     while len(segs) > K_max:
         lengths = torch.tensor([b - a for a, b in segs], device=mu.device)
         i = int(torch.argmin(lengths).item())
@@ -255,7 +255,7 @@ def segment_from_mu(mu: torch.Tensor, edge_tau: float, min_seg: int, K_max: int)
                 segs[i][1] = segs[i + 1][1]
                 del segs[i + 1]
 
-    # Masken
+    # Segmentmasken S[k,n] = 1, wenn n in Segment k liegt
     K = len(segs)
     S = torch.zeros((K, N), dtype=torch.float32, device=mu.device)
     for k, (a, b) in enumerate(segs):
@@ -264,21 +264,23 @@ def segment_from_mu(mu: torch.Tensor, edge_tau: float, min_seg: int, K_max: int)
 
 # ---------------- Physics aggregator ----------------
 class PhysicsAggregator(nn.Module):
+    # Berechnet die vorhergesagten Messungen I_AP und I_PA (aus Aktivitäten, Transmissionen und Schrittweite)
     def forward(self, a: torch.Tensor, T_ap: torch.Tensor, T_pa: torch.Tensor, ds: torch.Tensor | float):
         if not torch.is_tensor(ds):
             ds = torch.tensor(ds, dtype=a.dtype, device=a.device)
         ds = ds.reshape(-1, 1)  # [B,1]
         T_ap = torch.nan_to_num(T_ap)
         T_pa = torch.nan_to_num(T_pa)
+        # Physikalisches Modell: Summe a[n] * T[n] * ds  (über n = Ray-Samples)
         I_ap_hat = torch.sum((a * T_ap) * ds, dim=1)
         I_pa_hat = torch.sum((a * T_pa) * ds, dim=1)
         return torch.nan_to_num(I_ap_hat), torch.nan_to_num(I_pa_hat)
 
-# ---------------- Segment-RayNet ----------------
+# ---------------- Segment-RayNet ----------------      Encoder --> FiLM --> Segmentierung --> Segment-Pooling --> a_k --> e_eff --> Physik
 class SegmentRayNet(nn.Module):
     """Vorhersage stückweise-konstanter Aktivität je µ-Segment."""
-    def __init__(self, in_ch: int = 3, hidden: int = 64,
-                 kernel_size: int = 5, dropout: float = 0.0,
+    def __init__(self, in_ch: int = 3, hidden: int = 64,                                # Input-Kanäle: mu, T_ap, T_pa; hidden = Anz. Feature-Channels H
+                 kernel_size: int = 5, dropout: float = 0.0,                            
                  num_fourier: int = 0):
         super().__init__()
         pad = kernel_size // 2
@@ -286,22 +288,23 @@ class SegmentRayNet(nn.Module):
             nn.Conv1d(in_ch, hidden, kernel_size, padding=pad), nn.GELU(),
             nn.Conv1d(hidden, hidden, kernel_size, padding=pad), nn.GELU(),
             nn.Dropout(p=dropout),
-        )
+        )                                                                               # Encoder produziert h mit Shape [B,H,N]
+        # FiLM (Feature-wise Linear Modulation) nimmt globale Infos (I_ap, I_pa, Fourier-Encoding von xy) --> berechnet gamma & beta, die dann h modulieren
         self.num_fourier = num_fourier
         film_in_dim = 2 + (4 * num_fourier if num_fourier > 0 else 0)
         self.film = nn.Sequential(
             nn.Linear(film_in_dim, 32), nn.GELU(), nn.Linear(32, 2 * hidden)
         )
-        self.seg_head = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, 1))
-        self.softplus = nn.Softplus()
-        self.log_gain = nn.Parameter(torch.tensor(math.log(1.0)))  # start ~1
-        self.b_global = nn.Parameter(torch.tensor(0.0))            # stark L2-regularisieren
+        self.seg_head = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, 1))       # aus Segment-Feature (H-dim) wird eine Aktivität pro Segment (Skalar) berechnet
+        self.softplus = nn.Softplus()                                                                   # a_k ≥ 0 (keine negative Aktivität)
+        self.log_gain = nn.Parameter(torch.tensor(math.log(1.0)))                                       # start ~1
+        self.b_global = nn.Parameter(torch.tensor(0.0))                                                 # stark L2-regularisieren
         self.disable_film = False
         self.disable_gain = False
         self.phys = PhysicsAggregator()
 
     @staticmethod
-    def _robust_unit(x: torch.Tensor) -> torch.Tensor:
+    def _robust_unit(x: torch.Tensor) -> torch.Tensor:                                  # normiert skalare Größen wie I_ap und I_pa --> stabileres Training
         x_pos = x[x > 0]
         if x_pos.numel() > 16:
             s = torch.quantile(x_pos.detach(), 0.99).clamp(min=1e-6)
@@ -309,96 +312,101 @@ class SegmentRayNet(nn.Module):
             s = x.detach().abs().max().clamp(min=1e-6)
         return x / s
 
-    def forward(self, mu, T_ap, T_pa, I_ap, I_pa, ds,
+    def forward(self, mu, T_ap, T_pa, I_ap, I_pa, ds,                                   # mu, T_ap, T_pa: [B,N] --> stapeln --> [B,3,N]
                 edge_tau: float, min_seg: int, K_max: int,
                 xy: Optional[torch.Tensor] = None):
         B, N = mu.shape[0], mu.shape[1]
-        x = torch.stack([mu, T_ap, T_pa], dim=1)  # [B,3,N]
-        h = self.enc(x)                           # [B,H,N]
+        x = torch.stack([mu, T_ap, T_pa], dim=1)                                        # [B,3,N]
+        h = self.enc(x)                                                                 # [B,H,N]
 
         # FiLM (optional) – jetzt mit optionalen Fourier-Koordinaten
         if not self.disable_film:
-            I_ap_n = self._robust_unit(I_ap)   # [B]
-            I_pa_n = self._robust_unit(I_pa)   # [B]
-            film_in = [torch.stack([I_ap_n, I_pa_n], dim=1)]  # [B,2]
+            I_ap_n = self._robust_unit(I_ap)                                            # [B]
+            I_pa_n = self._robust_unit(I_pa)                                            # [B]
+            film_in = [torch.stack([I_ap_n, I_pa_n], dim=1)]                            # [B,2]
 
             # Wenn num_fourier>0: immer 4F Zusatzeinträge liefern
             if self.num_fourier > 0:
                 if xy is not None:
-                    enc_xy = fourier_encode_xy(xy, num_freqs=self.num_fourier)  # [B,4F]
+                    enc_xy = fourier_encode_xy(xy, num_freqs=self.num_fourier)          # [B,4F]
                 else:
                     # Fallback: Dummy-Features, damit Dimension stimmt
                     enc_xy = I_ap.new_zeros(B, 4 * self.num_fourier)
                 film_in.append(enc_xy)
-            film_in = torch.cat(film_in, dim=1)  # [B, 2+4F]
-            ab = self.film(film_in)              # [B,2H]
-            gamma, beta = ab.chunk(2, dim=1)
-            gamma = torch.tanh(gamma)
+            film_in = torch.cat(film_in, dim=1)                                         # [B,2+4F]
+            ab = self.film(film_in)                                                     # [B,2H]
+            gamma, beta = ab.chunk(2, dim=1)                                            # teile Tensor in zwei Teile entlang der Feature-Achse (wenn ab[B,128] in 64 Werte gamma und 64 beta)
+            gamma = torch.tanh(gamma)                                                   # tanh: begrenzt beta und gamma auf [-1,1] --> keine extremen Skalierungen
             beta = torch.tanh(beta)
-            h = gamma.unsqueeze(-1) * h + beta.unsqueeze(-1)      # [B,H,N]
+            h = gamma.unsqueeze(-1) * h + beta.unsqueeze(-1)                            # [B,H,N] Feature-Tensor, der aus den Eingangssequenzen extrahiert wird
 
         # Segmentierung & Segment-Pooling (pro Ray)
         a_hat_list = []
         Ks = []
         for b in range(B):
-            S_b, K_eff = segment_from_mu(mu[b], edge_tau, min_seg, K_max)
+            S_b, K_eff = segment_from_mu(mu[b], edge_tau, min_seg, K_max)               # S_b: [K,N], Binärmasken; K_eff: tatsächliche Segmentzahl
             Ks.append(K_eff)
-            h_b = h[b]                               # [H,N]
-            denom = S_b.sum(dim=1, keepdim=True).clamp(min=1.0)  # [K,1]
-            seg_mean = (h_b @ S_b.t()) / denom.t()   # [H,K]
-            seg_mean = seg_mean.transpose(0, 1)      # [K,H]
-            a_k = self.softplus(self.seg_head(seg_mean)).squeeze(-1)  # [K]
-            a_hat_b = (a_k.unsqueeze(1) * S_b).sum(dim=0)             # [N]
+            h_b = h[b]                                                                  # [H,N]
+            denom = S_b.sum(dim=1, keepdim=True).clamp(min=1.0)                         # [K,1] Anzahl Punkte pro Segment (Länge des Segments)
+            seg_mean = (h_b @ S_b.t()) / denom.t()                                      # [H,K] Mittelwert der Features pro Segment
+            seg_mean = seg_mean.transpose(0, 1)                                         # [K,H] Transpose --> pro Segment ein H-dimensionsloser Feature-Vektor
+            a_k = self.softplus(self.seg_head(seg_mean)).squeeze(-1)                    # [K] MLP von H --> 1 & softplus: a_k ≥ 0
+            a_hat_b = (a_k.unsqueeze(1) * S_b).sum(dim=0)                               # [N] Summe über k --> an jeder Position n steht a_k-Wert seines Segments
             a_hat_list.append(a_hat_b)
 
-        a_hat = torch.stack(a_hat_list, dim=0)  # [B,N]
-        if self.disable_gain:
+        a_hat = torch.stack(a_hat_list, dim=0)                                          # [B,N] alle Rays stapeln
+        if self.disable_gain:                                                           # globaler Gain: korrigiert globale Fehlskalierung (z.B. falsche ds, Phantom-Scaling, ...)    
             gain = a_hat.new_tensor(1.0)
             b_global = a_hat.new_tensor(0.0)
         else:
             gain = F.softplus(self.log_gain) + 1e-6
             b_global = self.b_global
 
-        a_eff = a_hat * gain + b_global
+        a_eff = a_hat * gain + b_global                                                 # finale effektive Aktivität, die in die Physik eingeht
         I_ap_hat, I_pa_hat = self.phys(a_eff, T_ap, T_pa, ds)
-        return a_eff, I_ap_hat, I_pa_hat, gain, Ks
+        return a_eff, I_ap_hat, I_pa_hat, gain, Ks                                      # a_eff [B,N]: vorhergesagte Aktivitätsprofile, I_ap_hat / I_pa_hat [B]: vorhergesagte Messungen, gain: Skalar, Ks: Liste der Segmentzahlen pro Ray
 
 # ---------------- Losses & Regularizers ----------------
-def meas_loss(pred: torch.Tensor, target: torch.Tensor, kind: str = "mse",
+def meas_loss(pred: torch.Tensor, target: torch.Tensor, kind: str = "mse",              # Messfehler zwischen Vorhersage und Messung
               mask: Optional[torch.Tensor] = None, huber_delta: float = 100.0) -> torch.Tensor:
-    if kind in ("logmae", "loghuber"):
+    # Optional: erst in den Log-Raum gehen
+    if kind in ("logmae", "loghuber"):                  # Huber-Loss im Log-Raum --> kombiniert L1- und L2-Verhalten (huber_delta als Schwelle)
         pred = torch.log1p(torch.clamp(pred, min=0.0))
         target = torch.log1p(torch.clamp(target, min=0.0))
+    # Je nach 'kind' unterschiedliche Fehlerfunktion
     if kind in ("mae", "logmae"):
-        err = torch.abs(pred - target)
+        err = torch.abs(pred - target)                  # L1 / MAE  (absoluter Fehler: robust gegen Ausreißer)
     elif kind == "mse":
-        err = (pred - target) ** 2
+        err = (pred - target) ** 2                      # L2 / MSE  (quadratischer Fehler: empfindlich für Ausreißer)
     elif kind == "loghuber":
         err = F.huber_loss(pred, target, delta=huber_delta, reduction="none")
     else:
         raise ValueError(f"Unknown loss kind: {kind}")
+    # ohne Maske: einfacher Mittelwert über alle Einträge
     if mask is None:
         return err.mean()
+    # mit Maske (jeder Messpunkt bekommt ein Gewicht w[i]): gewichteter Mittelwert
     w = mask.view(-1)
     err = err.view(-1)
     return (err * w).sum() / (w.sum() + 1e-8)
 
 @torch.no_grad()
-def pearson_corr_per_ray(a: torch.Tensor, mu: torch.Tensor) -> torch.Tensor:
-    """Pearson a vs. µ pro Ray, Mittel über Batch; a,mu: [B,N]."""
+def pearson_corr_per_ray(a: torch.Tensor, mu: torch.Tensor) -> torch.Tensor:           
+    """Klassische Pearson-Korrelation zwischen a und µ pro Ray, dann Mittelwert über Batch; a,mu: [B,N]."""
     a = a.float()
     mu = mu.float()
     a_m = a.mean(dim=1, keepdim=True)
     mu_m = mu.mean(dim=1, keepdim=True)
-    a_c = a - a_m
+    a_c = a - a_m                                                                       # zentriere pro Ray
     mu_c = mu - mu_m
-    num = (a_c * mu_c).sum(dim=1)
-    den = torch.sqrt((a_c.pow(2).sum(dim=1) + 1e-12) * (mu_c.pow(2).sum(dim=1) + 1e-12))
-    r = num / (den + 1e-12)
+    num = (a_c * mu_c).sum(dim=1)                                                       # Numerator = Kovarianz-Summe
+    den = torch.sqrt((a_c.pow(2).sum(dim=1) + 1e-12) * (mu_c.pow(2).sum(dim=1) + 1e-12))# Denominator = Produkt der Standardabweichungen
+    r = num / (den + 1e-12)                                                             # r E [-1,1]: nahe +1 --> a und µ stark positiv korreliert (nur zur Auswertung, nicht für Training)
     return r.mean()
 
 def pearson_corr_per_ray_grad(a: torch.Tensor, mu: torch.Tensor) -> torch.Tensor:
-    """Differenzierbare Pearson-Korrelation pro Ray (Mittel über Batch); a,mu: [B,N]."""
+    """Differenzierbare Pearson-Korrelation pro Ray (Mittel über Batch); a,mu: [B,N].
+    Gleiche Formel etc. wie oben, aber mit Gradienten --> geeignet, in einem Loss zu erscheinen..."""
     a_m = a.mean(dim=1, keepdim=True)
     mu_m = mu.mean(dim=1, keepdim=True)
     a_c = a - a_m
@@ -432,9 +440,9 @@ class TrainConfig:
     epochs: int = 15
     batch_size: int = 16
     lr: float = 1e-3
-    alpha: float = 1.0       # Gewicht Mess-Loss
-    beta: float = 1e-2       # Gewicht supervised (a)
-    gamma: float = 0.0       # TV (unused)
+    alpha: float = 1.0              # Gewicht Mess-Loss (I_ap/I_pa)
+    beta: float = 1e-2              # Gewicht supervised (a_eff vs. a_gt)
+    gamma: float = 0.0              # TV (unused)
     device: str = "cpu"
     use_supervised: bool = True
     loss_kind: str = "logmae"
@@ -445,17 +453,17 @@ class TrainConfig:
     min_seg: int = 3
     K_max: int = 8
     # Regularisierung
-    lambda_l1: float = 0.0
-    lambda_bg: float = 0.0
-    bg_eps: float = 5e-4
-    lambda_off: float = 0.0
-    lambda_nb: float = 0.0
+    lambda_l1: float = 0.0          # L1 auf a_eff (Sparsity)
+    lambda_bg: float = 0.0          # bestraft zu hohe Aktivität im Hintergrund
+    bg_eps: float = 5e-4            # Schwelle "Hintergrund"
+    lambda_off: float = 0.0         # Bestrafung für globalen Offset b_global
+    lambda_nb: float = 0.0          # Gewicht für neighbor_coherence
     sigma_mu: float = 0.2
     nb_radius: int = 2
     # Ablationen
     no_film: bool = False
     no_gain: bool = False
-    K_one: bool = False
+    K_one: bool = False             # wenn True: nur 1 Segment pro Ray (kein Segment-Modell)
     dropout: float = 0.0
     # Adaptives Beta
     beta_adapt: bool = False
@@ -474,16 +482,16 @@ class TrainConfig:
 def train_one_epoch(model: SegmentRayNet, loader: DataLoader,
                     opt: torch.optim.Optimizer, cfg: TrainConfig) -> Dict[str, float]:
     model.train()
-    stats = {
+    stats = {   
         "loss": 0.0, "loss_I": 0.0, "loss_sup": 0.0,
         "loss_l1": 0.0, "loss_bg": 0.0, "loss_off": 0.0, "loss_nb": 0.0,
         "rmse_I_ap": 0.0, "rmse_I_pa": 0.0, "rmse_a": 0.0,
         "rrmse_ap": 0.0, "rrmse_pa": 0.0, "spars": 0.0, "corr_am": 0.0,
     }
-    n = 0
+    n = 0                                                                                       # Anz. der Rays über die gemittelt wird
 
-    for batch in loader:
-        mu = batch["mu"].to(cfg.device)
+    for batch in loader:                                                                        # Batch aus DataLoader holen
+        mu = batch["mu"].to(cfg.device)                                                         # Inputs...
         T_ap = batch["T_ap"].to(cfg.device)
         T_pa = batch["T_pa"].to(cfg.device)
         I_ap = batch["I_ap"].to(cfg.device)
@@ -492,23 +500,23 @@ def train_one_epoch(model: SegmentRayNet, loader: DataLoader,
         xy = batch.get("xy")
         xy = xy.to(cfg.device) if xy is not None else None
 
-        a_gt = batch.get("a_gt")
+        a_gt = batch.get("a_gt")                                                                
         a_gt = a_gt.to(cfg.device) if a_gt is not None else None
 
-        m_npz = batch.get("mask_npz")
+        m_npz = batch.get("mask_npz")                                                           
         m_def = batch.get("mask_def")
         mask = m_npz.to(cfg.device) if m_npz is not None else (
             m_def.to(cfg.device) if cfg.mask_nonzero and m_def is not None else None
         )
 
-        opt.zero_grad(set_to_none=True)
+        opt.zero_grad(set_to_none=True)                                             # alle Gradienten der Parameter vor jeder neuen Batch auf None setzen
         a_eff, I_ap_hat, I_pa_hat, gain, Ks = model(
             mu, T_ap, T_pa, I_ap, I_pa, ds,
             cfg.edge_tau, cfg.min_seg, 1 if cfg.K_one else cfg.K_max,
             xy=xy,
         )
 
-        # Kein per-Batch-Rescaling mehr: physikalische Skala der Intensitäten
+        # Mess-Loss (Data-Fit)
         I_ap_hat_n, I_pa_hat_n = I_ap_hat, I_pa_hat
         I_ap_n, I_pa_n         = I_ap, I_pa
 
@@ -518,9 +526,9 @@ def train_one_epoch(model: SegmentRayNet, loader: DataLoader,
                          mask=mask, huber_delta=cfg.huber_delta)
         loss_I = l_ap + l_pa
 
-        # Class-weighted supervised: Hintergrund 3×
+        # Supervised-Loss auf a (wenn a_gt vorhanden)
         if cfg.use_supervised and a_gt is not None:
-            w_bg = (a_gt < cfg.bg_eps).float()
+            w_bg = (a_gt < cfg.bg_eps).float()                                      # bg_eps: Schwellenwert, ab dem als Hintergrund betrachtet wird
             w_pos = 1.0 - w_bg
             w = 3.0 * w_bg + 1.0 * w_pos
             loss_sup = ((a_eff - a_gt) ** 2 * w).mean()
@@ -528,17 +536,18 @@ def train_one_epoch(model: SegmentRayNet, loader: DataLoader,
             loss_sup = a_eff.new_tensor(0.0)
 
         # Zusatzregularisierungen
-        loss_l1 = cfg.lambda_l1 * a_eff.mean()
-        loss_bg = a_eff.new_tensor(0.0)
+        loss_l1 = cfg.lambda_l1 * a_eff.mean()                                      # einfacher Sparsity-Anteil (L1-artig, weil mean(a_eff) klein gehalten wird)
+        
+        loss_bg = a_eff.new_tensor(0.0)                                             # bestraft zu hohe Aktivitäten im Hintergrund
         if a_gt is not None and cfg.lambda_bg > 0:
             w_bg = (a_gt < cfg.bg_eps).float()
             loss_bg = cfg.lambda_bg * (F.relu(a_eff - cfg.bg_eps) * w_bg).mean()
 
-        loss_off = a_eff.new_tensor(0.0)
+        loss_off = a_eff.new_tensor(0.0)                                            # quadratische Strafe auf globalen Bias b_global --> soll nahe 0 bleiben
         if hasattr(model, "b_global") and cfg.lambda_off > 0:
             loss_off = cfg.lambda_off * model.b_global.pow(2)
 
-        loss_nb = a_eff.new_tensor(0.0)
+        loss_nb = a_eff.new_tensor(0.0)                                             # neighbor_coherence: koppel a-Effekte zwischen Rays mit ähnlichen mu-Profilen
         if cfg.lambda_nb > 0:
             loss_nb = cfg.lambda_nb * neighbor_coherence(
                 a_eff, mu, sigma_mu=cfg.sigma_mu, radius=cfg.nb_radius
@@ -550,13 +559,13 @@ def train_one_epoch(model: SegmentRayNet, loader: DataLoader,
             corr_for_loss = pearson_corr_per_ray_grad(a_eff, mu)
             loss_corr = cfg.lambda_corr * (corr_for_loss ** 2)
 
-        loss = (
+        loss = (                                                                    # Gesamtverlust: gewichtete Summe aller Losses...
             cfg.alpha * loss_I +
             cfg.beta * loss_sup +
             loss_l1 + loss_bg + loss_off + loss_nb + loss_corr
         )
         loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)                  # begrenzt Gradienten-Norm --> stabilisiert Training
         opt.step()
 
         # Metriken
@@ -578,7 +587,7 @@ def train_one_epoch(model: SegmentRayNet, loader: DataLoader,
             spars = (a_eff < cfg.bg_eps).float().mean().item()
             corr_am = pearson_corr_per_ray(a_eff.detach(), mu.detach()).item()
 
-            stats["loss"] += loss.item() * bsz
+            stats["loss"] += loss.item() * bsz                                      # Berechnung Durchschnitt über alle Rays der Epoche (bsz=batchsize)
             stats["loss_I"] += loss_I.item() * bsz
             stats["loss_sup"] += loss_sup.item() * bsz
             stats["loss_l1"] += (loss_l1.item() if torch.is_tensor(loss_l1) else loss_l1) * bsz
@@ -609,9 +618,8 @@ def train_one_epoch(model: SegmentRayNet, loader: DataLoader,
 
 @torch.no_grad()
 def evaluate_on_loader(model: SegmentRayNet, loader: DataLoader, cfg: TrainConfig) -> Dict[str, float]:
-    """Einfache Eval-Phase (z.B. auf Testdaten) mit denselben Metriken wie im Training.
-    Kein Gradient, kein Update.
-    """
+    """wie train_one_epoch, aber kein Training, nur Auswertung (wird für Val-Loader nach jeder Epoche und Test-Loader am Ende genutzt)
+    man will sehen, wie gut das Modell auf ungesehenen Daten generalisiert --> dafür darf während der Auswertung nicht geupdated werden ==> reine Metrikberechnung"""
     model.eval()
     stats = {
         "rmse_I_ap": 0.0, "rmse_I_pa": 0.0, "rmse_a": 0.0,
@@ -717,29 +725,27 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if args.seed is not None:
+    if args.seed is not None:                                       # seed setzen --> reproduzierbare Zufälle (z.B. bei Ray-Auswahl)
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
 
     # Voller Datensatz
     ds_full = NPZRays(args.data)
-    # ---------------------------------------------
+
     # Ausgabepfad (gleicher Ordner wie NPZ-Datei)
-    # ---------------------------------------------
     import os
     out_dir = os.path.dirname(args.data)
     os.makedirs(out_dir, exist_ok=True)
     print(f"[INFO] Output directory set to: {out_dir}")
 
-    # K Strahlen auswählen (oder alles, falls num_rays >= M)
-    M = ds_full.M
-    K = min(args.num_rays, M)
+    M = ds_full.M                                                   # Anzahl Rays im vollen Dataset
+    K = min(args.num_rays, M)                                       # so viele Rays wollen wir max. nutzen
 
     g = torch.Generator(device="cpu")
     g.manual_seed(args.seed if args.seed is not None else 0)
     perm = torch.randperm(M, generator=g)[:K]
 
-    n_train = max(1, int(0.8 * K))
+    n_train = max(1, int(0.8 * K))                                  # 80 % Trainingsdaten, Rest für Test
     train_idx = perm[:n_train]
     test_idx  = perm[n_train:]
 
@@ -810,7 +816,7 @@ def main():
           f"N={ds_full.N} bins | device={device}")
 
     for epoch in range(1, cfg.epochs + 1):
-        stats_train = train_one_epoch(model, loader_train, opt, cfg)
+        stats_train = train_one_epoch(model, loader_train, opt, cfg)            # für jede Epoche trainieren auf Train-Set und evaluieren auf Test-Set
         stats_test  = evaluate_on_loader(model, loader_test, cfg)
 
         # Ein Batch für Gain/Ks und Logging
@@ -886,9 +892,9 @@ def main():
 
     # ---------------- Checkpoint speichern ----------------
     torch.save(
-        {"state_dict": model.state_dict(),
-         "N": ds_full.N,
-         "config": cfg.__dict__},
+        {"state_dict": model.state_dict(),                          # Gewichte des Modells
+         "N": ds_full.N,                                            # Anzahl Bins pro Ray
+         "config": cfg.__dict__},                                   # Konfiguration
         "segment_raynet_test.pt",
     )
     print("Saved checkpoint: segment_raynet_test.pt")
@@ -900,7 +906,7 @@ def main():
         x = x.detach().float().cpu()
         mn, mx = float(x.min()), float(x.max())
         if mx - mn < 1e-12:
-            return torch.full_like(x, 0.2)
+            return torch.full_like(x, 0)
         return (x - mn) / (mx - mn)
 
     model.eval()
@@ -909,7 +915,7 @@ def main():
     with torch.no_grad():
         I_train = ds_train.I_pairs
         nz = (I_train[:, 0] > 0) | (I_train[:, 1] > 0)
-        idx_train = int(torch.argmax((I_train[:, 0] + I_train[:, 1]) * nz.float()).item()) if nz.any() else 0
+        idx_train = int(torch.argmax((I_train[:, 0] + I_train[:, 1]) * nz.float()).item()) if nz.any() else 0   # sucht Index des Rays mit größter Summe I_ap+I_pa und lässt Modell damit laufen
 
         mu = ds_train.mu[idx_train].unsqueeze(0).to(device)
         T_ap = ds_train.T_ap[idx_train].unsqueeze(0).to(device)
@@ -961,7 +967,7 @@ def main():
 
     # ---- Mehrstrahl-Panel (Train/Test) ----
     def visualize_multiple_rays(model, ds, cfg,
-                                num=10, save_prefix="ray_profiles"):
+                                num=10, save_prefix="ray_profiles"):                # soritert alle Rays nach Gesamtintensität --> wählt z.B. 10 Rays gleichmäßig aus dem Bereich (von schwach bis stark)
         model.eval()
         I_sum = ds.I_pairs[:, 0] + ds.I_pairs[:, 1]
         vals, idx_sorted = torch.sort(I_sum)  # von dunkel nach hell

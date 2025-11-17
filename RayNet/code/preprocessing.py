@@ -148,13 +148,11 @@ def load_mat_2d(path: Path, var: Optional[str]) -> np.ndarray:
 def load_act_bin(path: Path, shape_str: str, dtype: str = "float32", order: str = "C") -> np.ndarray:
     """
     Liest ein Volumen aus einer rohen .bin-Datei.
-    shape_str ist 'x,y,z' (MATLAB-Export häufig in Fortran-Order -> order='F').
+    shape_str ist 'x,y,z' (MATLAB-Export in Fortran-Order -> order='F').
     Gibt (D,H,W) = (y,z,x) zurück.
     """
     x, y, z = [int(s) for s in shape_str.split(",")]
     expected = x * y * z
-    # WICHTIG: nur expected Elemente lesen (wie in stratos.py),
-    # falls die Datei mehrere Volumina hintereinander enthält.
     arr = np.fromfile(path, dtype=np.dtype(dtype), count=expected)
     if arr.size != expected:
         raise ValueError(f"{path.name}: size {arr.size} != {expected} from shape {(x,y,z)}")
@@ -225,7 +223,7 @@ def load_bin_xyz(path: Path, shape_str: str, dtype: str = "float32", order: str 
 # Gamma-Kamera Forward Model (aus stratos.py übernommen)
 # -----------------
 
-USE_FFT_CONV = True  # schneller für große Kernel; Physik bleibt gleich
+USE_FFT_CONV = True
 
 def _process_view_phys(act_data: np.ndarray, atn_data: np.ndarray,
                        comp_scatter: bool, atn_on: bool, coll_on: bool,
@@ -353,13 +351,14 @@ def normalize_projections(ap: np.ndarray,
 # -----------------
 
 def _resample_1d(x: np.ndarray, N: int) -> np.ndarray:
+    # streckt / staucht Sequenz auf feste Länge N
     L = x.shape[0]
     if L == N: return x.astype(np.float32, copy=True)
-    xi = np.linspace(0, L - 1, num=N, dtype=np.float64)
-    x0 = np.floor(xi).astype(np.int64)
-    x1 = np.clip(x0 + 1, 0, L - 1)
-    t = xi - x0
-    return ((1.0 - t) * x[x0] + t * x[x1]).astype(np.float32)
+    xi = np.linspace(0, L - 1, num=N, dtype=np.float64)         # gleichm. verteilte Abtastpunkte im Originalsignal
+    x0 = np.floor(xi).astype(np.int64)                          # linker Index d. Intervalls
+    x1 = np.clip(x0 + 1, 0, L - 1)                              # rechter Index (geclipped, damit es nicht aus dem Array läuft)
+    t = xi - x0                                                 # Interpolationsgewicht zw. x0 und x1
+    return ((1.0 - t) * x[x0] + t * x[x1]).astype(np.float32)   # lin. Interpolation
 
 
 def build_rays_parallel(ap,
@@ -376,21 +375,23 @@ def build_rays_parallel(ap,
     D, Hm, Wm = mu_dhw.shape           # (256,256,651)
     assert (Hm, Wm) == (H, W), f"Mismatch: mu_dhw({mu_dhw.shape}) vs ap({ap.shape})"
 
+    # alle y,x-Korrdinaten (ggf. ausgedünnt d. subsample)
     ys = range(0, H, subsample)
     xs = range(0, W, subsample)
     coords = [(y, x) for y in ys for x in xs]
-    M = len(coords)
+    M = len(coords)                                 # Anz. Rays = Anz. betr. Pixel
 
+    # Arrays für: µ-Sequenzen, Transmission vorwärts/rückwärts, Intensitätspaare, Aktivität
     mu_seq   = np.zeros((M, N), np.float32)
     T_ap_seq = np.zeros((M, N), np.float32)
     T_pa_seq = np.zeros((M, N), np.float32)
     I_pairs  = np.zeros((M, 2), np.float32)
     a_seq    = None if act_dhw is None else np.zeros((M, N), np.float32)
 
-    # NEU: Koordinaten-Array [M,2]
+    # speichert die x,y-Position des Rays im Bild
     xy_pairs = np.zeros((M, 2), np.float32)
 
-    # Schrittweite entlang der D-Achse ...
+    # Schrittweite entlang der Tiefenachse
     if use_physical_ds:
         if mu_unit == "per_cm":
             ds = sd_mm / 10.0  # cm
@@ -399,27 +400,36 @@ def build_rays_parallel(ap,
     else:
         ds = 1.0  # voxel units
 
+    # Schleife über alle ausgewählten Bildpixel --> pro Pixel ein Ray durchs Volumen
     for i, (y, x) in enumerate(coords):
+        # 1D-Profil der Schwächung entlang der Tiefenachse D durch diesen Pixel
         mu_line = mu_dhw[:, y, x].astype(np.float64)
+        # Auf feste Länge N resamplen (für batchbares NN-Input)
         mu_res  = _resample_1d(mu_line, N).astype(np.float64)
+        # Integrierte Schwächung in AP-Richtung (von "oben nach unten") / PA
         tau_ap = np.cumsum(mu_res) * ds
         tau_pa = np.cumsum(mu_res[::-1]) * ds
+        # µ-Sequenz speichern
         mu_seq[i]   = mu_res.astype(np.float32)
+        # Transmission T = exp(-∫µ ds), einmal für AP, einmal für PA
         T_ap_seq[i] = np.exp(-tau_ap).astype(np.float32)
         T_pa_seq[i] = np.exp(-tau_pa[::-1]).astype(np.float32)
+        # Gemessene Intensitäten für dieses Pixel aus den Projektionen (AP, PA)
         I_pairs[i, 0] = ap[y, x]
         I_pairs[i, 1] = pa[y, x]
+        # Optional: Aktivitätsprofil entlang des Rays, resampled auf N und >= 0
         if a_seq is not None:
             a_seq[i] = np.maximum(_resample_1d(act_dhw[:, y, x], N), 0.0)
 
-        # NEU: Koordinaten (hier einfach Pixel-Index)
+        # (x,y)-Koordinaten des Rays im Bild speichern
         xy_pairs[i, 0] = float(x)   # x-Koordinate
         xy_pairs[i, 1] = float(y)   # y-Koordinate
 
+    # Optional: µ-Sequenzen global z-normalisieren (für stabileres Training)
     if zscore:
         mu_seq = ((mu_seq - mu_seq.mean()) / (mu_seq.std() + 1e-8)).astype(np.float32)
 
-    # NEU: xy_pairs mit zurückgeben
+    # Rückgabe inkl. ds (Schrittweite) und xy_pairs (Ray-Positionen)
     return mu_seq, T_ap_seq, T_pa_seq, I_pairs, a_seq, float(ds), xy_pairs
 
 
@@ -622,12 +632,11 @@ def main():
 
     nx, ny, nz = mu_xyz.shape  # sollte (256,256,651) sein
     mu_src_kind = "bin"
-    # Spacings nur als Meta – D/H/W-Zuordnung hier nicht superkritisch
     sp_dhw = (args.sd_mm, args.sh_mm, args.sw_mm)
     dhw_src = (nx, ny, nz)
 
     # 2) Für RayNet: (D,H,W) := (nx,ny,nz)
-    #    Wir interpretieren die erste Achse als "D" (Sampling-Richtung der Rays)
+    #    Interpretation der ersten Achse als "D" (Sampling-Richtung der Rays)
     mu_dhw   = mu_xyz.copy()       # (256,256,651)
     mask_dhw = mask_xyz.copy()     # (256,256,651)
 
@@ -679,7 +688,7 @@ def main():
     coll_on      = not args.disable_collimator
 
     # Physikalische Schrittweite entlang der Projektionsrichtung (z-Achse)
-    # Wir nehmen hier sd_mm als Slice-Abstand an.
+    # hier sd_mm als Slice-Abstand angenommen
     if args.mu_target_unit == "per_cm":
         step_len = args.sd_mm / 10.0  # mm -> cm
     else:
@@ -793,11 +802,11 @@ def main():
         mu_unit=args.mu_target_unit,
     )
 
-    # --- NEU: Rays ohne Aktivität filtern ---
-    # Wir behalten nur Rays, bei denen max(a_true) > thr ist.
+    # --- Rays ohne Aktivität filtern ---
+    # nur die Rays behalten, bei denen max(a_true) > thr ist.
     if a_seq is not None:
         max_a = a_seq.max(axis=1)           # [M]
-        thr = 1e-3                          # Schwellwert, gerne anpassbar (z.B. 1e-4 oder 1e-2)
+        thr = 1e-3                          # Schwellwert, ggf. anpassbar (z.B. 1e-4 oder 1e-2)
         keep = max_a > thr                  # Bool-Maske
         print(f"[FILTER] keep {keep.sum()}/{len(keep)} rays with max(a_true) > {thr}")
 
