@@ -33,7 +33,6 @@ srun python -u train_emission.py \
     --log-every 10 \
     --preview-every 50 \
     --save-every 100 \
-    --normalize-targets \
     --bg-weight 0.1 \
     --weight-threshold 0.0 \
     --act-loss-weight 0.05 \
@@ -42,5 +41,5 @@ srun python -u train_emission.py \
     --ct-threshold 0.05 \
     --ct-samples 8192 \
     --z-reg-weight 1e-4
-
+#       --normalize-targets \
 echo "✅ Training finished at: $(date)"

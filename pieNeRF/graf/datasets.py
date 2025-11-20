@@ -51,35 +51,41 @@ class SpectDataset(torch.utils.data.Dataset):
 
         # einfache Normierung auf [0,1]
         maxv = tensor.max()                         # Maximalwert suchen
-        if maxv > 0:                                
-            tensor = tensor / maxv                      
+        if maxv > 0:
+            tensor = tensor / maxv
 
         # optionales Resize kann mann später einbauen, wenn nötig
         return tensor
 
     def _load_npy_ct(self, path):
-        vol = np.load(path).astype(np.float32)      # CT-Volumen, z.B. [D,H,W]
-        vol = torch.from_numpy(vol)                 # in Tensor umwandeln
+        if path is None:
+            return torch.empty(0)
 
-        # auch hier einfache Normierung [0,1]
-        vmin = vol.min()
-        vmax = vol.max()
-        if vmax > vmin:
-            vol = (vol - vmin) / (vmax - vmin)
+        # Original gespeichert als (LR, AP, SI)
+        vol = np.load(path).astype(np.float32)
 
-        # wenn lieber [1,D,H,W] gewollt:
-        # vol = vol.unsqueeze(0)
-        return vol
+        # 👉 korrekt in (AP, SI, LR) = (D,H,W) permutieren
+        vol = np.transpose(vol, (1, 2, 0))
+
+        # optionaler scale-factor (falls du den drin hattest)
+        vol *= 10.0
+
+        return torch.from_numpy(vol)
 
     def _load_npy_act(self, path):
         if path is None:
             return torch.empty(0)
+
         vol = np.load(path).astype(np.float32)
-        vol = torch.from_numpy(vol)
+
+        # selbe Permutation wie CT!
+        vol = np.transpose(vol, (1, 2, 0))
+
         maxv = vol.max()
         if maxv > 0:
             vol = vol / maxv
-        return vol
+
+        return torch.from_numpy(vol)
 
     def __getitem__(self, idx):
         e = self.entries[idx]                           # holt das idx-te Manifest-Dict

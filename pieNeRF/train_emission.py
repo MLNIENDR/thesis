@@ -203,7 +203,7 @@ def build_loss_weights(target: torch.Tensor, bg_weight: float, threshold: float)
 
 def build_pose_rays(generator, pose):
     """Pre-compute all rays for a fixed pose and keep them on the target device."""
-    focal_or_size = (generator.H, generator.W) if generator.orthographic else generator.focal
+    focal_or_size = generator.ortho_size if generator.orthographic else generator.focal
     rays_full, _, _ = generator.val_ray_sampler(generator.H, generator.W, focal_or_size, pose)
     return rays_full.to(generator.device, non_blocking=True)
 

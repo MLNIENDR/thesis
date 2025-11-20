@@ -53,6 +53,7 @@ class Generator(object):
         self.fixed_poses_enabled = False
         self.pose_ap = None
         self.pose_pa = None
+        self.ortho_size = None  # (height, width) in Weltkoordinaten für Orthographie
         self._fixed_pose_toggle = 0  # 0=AP, 1=PA
 
         # Pixel-Gitter
@@ -192,7 +193,7 @@ class Generator(object):
         # Orthographische SPECT-Setups brauchen stets das volle Raster → FullRaySampler nutzen.
         if self.orthographic:
             sampler = self.val_ray_sampler
-            focal_or_size = (self.H, self.W)
+            focal_or_size = self.ortho_size or (self.H, self.W)
         else:
             sampler = self.val_ray_sampler if self.use_test_kwargs else self.ray_sampler
             focal_or_size = self.focal
@@ -243,6 +244,11 @@ class Generator(object):
         self.fixed_poses_enabled = True
         self._fixed_pose_toggle = 0  # starte mit AP
 
+        # Orthographische Größe an den CT-Würfel anpassen: Breite/Höhe = 2*radius
+        if self.orthographic:
+            size = 2.0 * float(radius)
+            self.ortho_size = (size, size)
+
     def render_from_pose(self, z, pose, ct_context=None):
         """
         Render eine komplette Projektion aus einer festen Kamerapose.
@@ -261,7 +267,7 @@ class Generator(object):
 
         # 1) Feste Rays für diese Pose aufbauen
         #    Orthographisch: (H, W) als Größe, sonst "focal"
-        focal_or_size = (self.H, self.W) if getattr(self, "orthographic", False) else self.focal
+        focal_or_size = self.ortho_size if getattr(self, "orthographic", False) else self.focal
 
         # FullRaySampler erzeugt alle Rays für das Bild-FOV
         batch_rays, _, _ = self.val_ray_sampler(self.H, self.W, focal_or_size, pose)
@@ -363,6 +369,9 @@ class Generator(object):
             vol = vol.unsqueeze(0)
         if vol.dim() != 5:
             raise ValueError(f"Expected CT data with D/H/W axes, got shape {tuple(ct_volume.shape)}")
+
+        # Flip entlang der x-Achse, damit CT-Seitenlage zur AP/PA-Darstellung passt
+        vol = torch.flip(vol, dims=[-1])
 
         radius = self.radius
         if isinstance(radius, tuple):
