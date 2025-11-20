@@ -234,9 +234,11 @@ class Generator(object):
         loc_ap = np.array([0.0, 0.0, +float(radius)], dtype=np.float32)
         loc_pa = np.array([0.0, 0.0, -float(radius)], dtype=np.float32)
 
-        # Falls du ein anderes up brauchst, kannst du hier später look_at(..., up=...)
         self.pose_ap = _pose_from_loc(loc_ap, up=up)
         self.pose_pa = _pose_from_loc(loc_pa, up=up)
+        # look_at(..., -z) kehrt die x-Achse um (diag[-1,1,-1]); dadurch wäre PA spiegelverkehrt
+        # zu den PA-GT-Projektionen. Durch Rückspiegeln der x-Achse stimmen die Pixelrichtungen wieder.
+        self.pose_pa[:, 0] *= -1.0
 
         self.fixed_poses_enabled = True
         self._fixed_pose_toggle = 0  # starte mit AP

@@ -42,7 +42,7 @@ def parse_args():
     parser.add_argument(
         "--preview-every",
         type=int,
-        default=0,
+        default=50,
         help="If >0 renders and stores full AP/PA previews every N steps (slow, full-frame render).",
     )
     parser.add_argument(
@@ -150,12 +150,13 @@ def save_img(arr, path, title=None):
 
 
 def adjust_projection(arr: np.ndarray, view: str) -> np.ndarray:
-    if view.lower() == "ap":
-        return np.rot90(arr, k=1)
-    if view.lower() == "pa":
-        rotated = np.rot90(arr, k=-1)
-        return np.fliplr(rotated)
-    return arr
+    """
+    Bringe die Projektionen in dieselbe Orientierung wie data_check.py:
+    erst vertikal flippen, dann 90° im Uhrzeigersinn drehen.
+    """
+    flipped = np.flipud(arr)
+    rotated = np.rot90(flipped, k=-1)
+    return rotated
 
 
 def poisson_nll(
@@ -248,8 +249,6 @@ def maybe_render_preview(step, args, generator, z_eval, outdir, ct_volume=None, 
     H, W = generator.H, generator.W
     ap_np = proj_ap[0].reshape(H, W).detach().cpu().numpy()
     pa_np = proj_pa[0].reshape(H, W).detach().cpu().numpy()
-    ap_np = adjust_projection(ap_np, "ap")
-    pa_np = adjust_projection(pa_np, "pa")
     ap_np = adjust_projection(ap_np, "ap")
     pa_np = adjust_projection(pa_np, "pa")
     out_dir = outdir / "preview"
@@ -788,6 +787,8 @@ def train():
     H, W = generator.H, generator.W
     ap_np = proj_ap[0].reshape(H, W).detach().cpu().numpy()
     pa_np = proj_pa[0].reshape(H, W).detach().cpu().numpy()
+    ap_np = adjust_projection(ap_np, "ap")
+    pa_np = adjust_projection(pa_np, "pa")
     fp = outdir / "preview"
     fp.mkdir(parents=True, exist_ok=True)
     save_img(ap_np, fp / "final_AP.png", "AP final")
