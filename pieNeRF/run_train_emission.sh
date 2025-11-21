@@ -28,7 +28,7 @@ nvidia-smi
 echo "🏋️ Running train_emission.py..."
 srun python -u train_emission.py \
     --config configs/spect.yaml \
-    --max-steps 800 \
+    --max-steps 1000 \
     --rays-per-step 16384 \
     --log-every 10 \
     --preview-every 50 \

@@ -255,7 +255,7 @@ def maybe_render_preview(step, args, generator, z_eval, outdir, ct_volume=None, 
     out_dir.mkdir(parents=True, exist_ok=True)
     save_img(ap_np, out_dir / f"step_{step:05d}_AP.png", title=f"AP @ step {step}")
     save_img(pa_np, out_dir / f"step_{step:05d}_PA.png", title=f"PA @ step {step}")
-    save_depth_profile(step, generator, z_eval, ct_volume, act_volume, out_dir)
+    save_depth_profile(step, generator, z_eval, ct_volume, act_volume, out_dir, proj_ap=proj_ap, proj_pa=proj_pa)
     print("🖼️ Preview gespeichert:", flush=True)
     print("   ", (out_dir / f"step_{step:05d}_AP.png").resolve(), flush=True)
     print("   ", (out_dir / f"step_{step:05d}_PA.png").resolve(), flush=True)
@@ -378,25 +378,159 @@ def normalize_curve(arr: np.ndarray) -> np.ndarray:
     return arr
 
 
-def save_depth_profile(step, generator, z_latent, ct_vol, act_vol, outdir: Path):
+def save_depth_profile(step, generator, z_latent, ct_vol, act_vol, outdir: Path, proj_ap=None, proj_pa=None):
     if ct_vol is None and act_vol is None:
         return
 
-    def extract_curve(vol):
+    def extract_curve(vol, y_idx: int, x_idx: int):
         if vol is None:
-            return None
+            return None, None
         data = vol.squeeze(0).detach().cpu().numpy() if vol.dim() == 4 else vol.detach().cpu().numpy()
         if data.ndim != 3:
-            return None
+            return None, None
         D, H, W = data.shape
-        return data[:, H // 2, W // 2], (D, H, W)
+        # Falls H/W vertauscht sind (z. B. 651x256 statt 256x651), tauschen.
+        if H == generator.W and W == generator.H:
+            data = np.transpose(data, (0, 2, 1))
+            D, H, W = data.shape
+        y_idx = int(np.clip(y_idx, 0, H - 1))
+        x_idx = int(np.clip(x_idx, 0, W - 1))
+        return data[:, y_idx, x_idx], (D, H, W)
 
-    curve_ct, shape_ct = extract_curve(ct_vol) if ct_vol is not None else (None, None)
-    curve_act, shape_act = extract_curve(act_vol) if act_vol is not None else (None, None)
+    def to_np_image(tensor):
+        if tensor is None:
+            return None
+        return tensor.detach().cpu().reshape(generator.H, generator.W).numpy()
 
-    target_shape = shape_ct or shape_act
+    ap_img = to_np_image(proj_ap)
+    pa_img = to_np_image(proj_pa)
+
+    act_data = None
+    act_masks = None
+    if act_vol is not None:
+        act_data = act_vol.squeeze(0).detach().cpu().numpy() if act_vol.dim() == 4 else act_vol.detach().cpu().numpy()
+        if act_data.ndim != 3:
+            act_data = None
+        else:
+            if act_data.shape[1] == generator.W and act_data.shape[2] == generator.H:
+                act_data = np.transpose(act_data, (0, 2, 1))
+            depth_max = act_data.max(axis=0)
+            if depth_max.shape == (generator.W, generator.H):
+                depth_max = depth_max.T
+            elif depth_max.shape != (generator.H, generator.W):
+                depth_max = None
+            if depth_max is not None:
+                act_masks = (depth_max <= 1e-8, depth_max > 1e-8)
+
+    ct_data = None
+    ct_depth_max = None
+    if ct_vol is not None:
+        ct_data = ct_vol.squeeze(0).detach().cpu().numpy() if ct_vol.dim() == 4 else ct_vol.detach().cpu().numpy()
+        if ct_data.ndim == 3:
+            if ct_data.shape[1] == generator.W and ct_data.shape[2] == generator.H:
+                ct_data = np.transpose(ct_data, (0, 2, 1))
+            ct_depth_max = ct_data.max(axis=0)
+            if ct_depth_max.shape == (generator.W, generator.H):
+                ct_depth_max = ct_depth_max.T
+            elif ct_depth_max.shape != (generator.H, generator.W):
+                ct_depth_max = None
+
+
+    def pick_ray_indices(num: int = 2):
+        H, W = generator.H, generator.W
+        chosen = []
+
+        def add_unique(idx):
+            if idx not in chosen:
+                chosen.append(idx)
+
+        # feste Strahlen (y,x), auf Bildgröße geclippt
+        fixed_coords = [(72, 428), (69, 336)]
+        for y_raw, x_raw in fixed_coords:
+            if len(chosen) >= num:
+                break
+            y = int(np.clip(y_raw, 0, H - 1))
+            x = int(np.clip(x_raw, 0, W - 1))
+            add_unique((y, x))
+        if len(chosen) >= num:
+            return chosen[:num]
+
+        def pick_from_mask(mask):
+            if mask is None:
+                return None
+            mask = mask.astype(bool)
+            if mask.shape != (H, W) or not mask.any():
+                return None
+            coords = np.argwhere(mask)
+            if coords.size == 0:
+                return None
+            if ap_img is not None and pa_img is not None:
+                weight_map = ap_img + pa_img
+                weight_map = np.where(mask, weight_map, -np.inf)
+                y, x = np.unravel_index(np.nanargmax(weight_map), weight_map.shape)
+                return int(y), int(x)
+            yx = coords[0]
+            return int(yx[0]), int(yx[1])
+
+        if act_data is not None:
+            if act_masks is not None:
+                zero_mask, nonzero_mask = act_masks
+            else:
+                zero_mask = nonzero_mask = None
+
+            ct_pos_mask = None
+            if ct_depth_max is not None:
+                ct_pos_mask = ct_depth_max > 1e-8
+
+            def combine(m_act, require_ct: bool):
+                if m_act is None:
+                    return None
+                if ct_pos_mask is not None and require_ct:
+                    combo = m_act & ct_pos_mask
+                    if combo.any():
+                        return combo
+                return m_act
+
+            zero_idx = pick_from_mask(combine(zero_mask, require_ct=True))
+            nonzero_idx = pick_from_mask(combine(nonzero_mask, require_ct=True))
+            if zero_idx is None and zero_mask is not None:
+                zero_idx = pick_from_mask(zero_mask)
+            if nonzero_idx is None and nonzero_mask is not None:
+                nonzero_idx = pick_from_mask(nonzero_mask)
+            if zero_idx is not None:
+                add_unique(zero_idx)
+            if nonzero_idx is not None:
+                add_unique(nonzero_idx)
+
+        rel_coords = [(0.5, 0.5), (0.25, 0.75), (0.75, 0.25)]
+        for ry, rx in rel_coords:
+            if len(chosen) >= num:
+                break
+            y = int(np.clip(round((H - 1) * ry), 0, H - 1))
+            x = int(np.clip(round((W - 1) * rx), 0, W - 1))
+            add_unique((y, x))
+            if len(chosen) >= num:
+                break
+
+        if ap_img is not None and pa_img is not None and len(chosen) < num:
+            max_y, max_x = np.unravel_index(np.argmax(ap_img + pa_img), ap_img.shape)
+            add_unique((int(max_y), int(max_x)))
+
+        return chosen[:num]
+
+    def first_shape(vol_a, vol_b):
+        for v in (vol_a, vol_b):
+            if v is None:
+                continue
+            data = v.squeeze(0).detach().cpu().numpy() if v.dim() == 4 else v.detach().cpu().numpy()
+            if data.ndim == 3:
+                return data.shape
+        return None
+
+    target_shape = first_shape(ct_vol, act_vol)
     if target_shape is None:
         return
+
     D = target_shape[0]
     radius = generator.radius
     if isinstance(radius, tuple):
@@ -404,35 +538,59 @@ def save_depth_profile(step, generator, z_latent, ct_vol, act_vol, outdir: Path)
 
     depth_idx = torch.arange(D, device=generator.device)
     z_coords = idx_to_coord(depth_idx, D, radius)
-    zeros = torch.zeros_like(z_coords)
-    coords = torch.stack([zeros, zeros, z_coords], dim=1)
-    pred = query_emission_at_points(generator, z_latent, coords).detach().cpu().numpy()
-
     depth_axis = np.linspace(0.0, 1.0, D)
-    curves = []
-    labels = []
-    if curve_ct is not None:
-        curves.append(normalize_curve(curve_ct.copy()))
-        labels.append("μ (CT)")
-    if curve_act is not None:
-        curves.append(normalize_curve(curve_act.copy()))
-        labels.append("Aktivität (GT)")
-    curves.append(normalize_curve(pred.copy()))
-    labels.append("Aktivität (NeRF)")
-
     import matplotlib.pyplot as plt
 
-    plt.figure(figsize=(6, 4))
-    for curve, label in zip(curves, labels):
-        plt.plot(depth_axis, curve, label=label)
-    plt.xlabel("Tiefe (anterior → posterior)")
-    plt.ylabel("normierte Intensität")
-    plt.ylim(0, 1.05)
-    plt.legend()
-    plt.tight_layout()
+    ray_indices = pick_ray_indices(num=2)
+    fig, axes = plt.subplots(1, len(ray_indices), figsize=(4 * len(ray_indices), 4), sharex=True, sharey=True)
+    if not isinstance(axes, np.ndarray):
+        axes = [axes]
+
+    for ax, (y_idx, x_idx) in zip(axes, ray_indices):
+        curves = []
+        labels = []
+        curve_ct = extract_curve(ct_vol, y_idx, x_idx) if ct_vol is not None else (None, None)
+        curve_act = extract_curve(act_vol, y_idx, x_idx) if act_vol is not None else (None, None)
+
+        if curve_ct[0] is not None:
+            curves.append(normalize_curve(curve_ct[0].copy()))
+            labels.append("μ (CT)")
+        if curve_act[0] is not None:
+            curves.append(normalize_curve(curve_act[0].copy()))
+            labels.append("Aktivität (GT)")
+
+        x_coord = idx_to_coord(torch.tensor(x_idx, device=generator.device), target_shape[2], radius)
+        y_coord = idx_to_coord(torch.tensor(y_idx, device=generator.device), target_shape[1], radius)
+        coords = torch.stack(
+            (x_coord.repeat(D), y_coord.repeat(D), z_coords),
+            dim=1,
+        )
+        pred = query_emission_at_points(generator, z_latent, coords).detach().cpu().numpy()
+        curves.append(normalize_curve(pred.copy()))
+        labels.append("Aktivität (NeRF)")
+
+        for curve, label in zip(curves, labels):
+            ax.plot(depth_axis, curve, label=label)
+
+        title_extra = []
+        if ap_img is not None:
+            title_extra.append(f"I_AP={ap_img[y_idx, x_idx]:.2e}")
+        if pa_img is not None:
+            title_extra.append(f"I_PA={pa_img[y_idx, x_idx]:.2e}")
+        aux = " | ".join(title_extra)
+        ax.set_title(f"Strahl y={y_idx}, x={x_idx}" + (f"\n{aux}" if aux else ""))
+        ax.set_ylim(0, 1.05)
+        ax.grid(True, alpha=0.2)
+        ax.legend(loc="upper right", fontsize=8)
+
+    axes[0].set_ylabel("normierte Intensität")
+    for ax in axes:
+        ax.set_xlabel("Tiefe (anterior → posterior)")
+    fig.suptitle(f"Depth-Profile @ step {step:05d}")
+    fig.tight_layout()
     outdir.mkdir(parents=True, exist_ok=True)
-    plt.savefig(outdir / f"depth_profile_step_{step:05d}.png", dpi=150)
-    plt.close()
+    fig.savefig(outdir / f"depth_profile_step_{step:05d}.png", dpi=150)
+    plt.close(fig)
 
 
 def log_attenuation_profile(step: int, view: str, extras: dict):
