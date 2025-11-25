@@ -716,7 +716,7 @@ def main():
 
     H, W = ap_raw.shape   # sollte (256,651) sein
 
-    # 6) Projektionen optional normalisieren
+    # 6) Projektionen normalisieren (99.9-Perzentil) oder Rohwerte lassen
     if args.normalize_projections:
         ap_norm, pa_norm, scale_auto = normalize_projections(
             ap_raw, pa_raw, percentile=99.9,
@@ -733,6 +733,10 @@ def main():
     if args.proj_scale != 1.0:
         ap_norm *= args.proj_scale
         pa_norm *= args.proj_scale
+
+    # Monitoring der Wertebereiche
+    print("AP range:", ap_norm.min(), ap_norm.max(), "nonzero:", np.count_nonzero(ap_norm))
+    print("PA range:", pa_norm.min(), pa_norm.max(), "nonzero:", np.count_nonzero(pa_norm))
 
     np.save(data_dir / "ap.npy", ap_norm)
     np.save(data_dir / "pa.npy", pa_norm)

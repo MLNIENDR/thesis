@@ -102,19 +102,17 @@ class SpectPixelPieNeRF(nn.Module):
         sigma_ap = self.mlp(xyz_ap_pe, z_feat)  # (N,1)
         sigma_pa = self.mlp(xyz_pa_pe, z_feat)  # (N,1)
 
-        # Reshape to volumes (D, H, W)
-        sigma_ap_grid = sigma_ap.view(D, W, H).permute(0, 2, 1)
-        sigma_pa_grid = sigma_pa.view(D, W, H).permute(0, 2, 1)
-        sigma_volume = 0.5 * (sigma_ap_grid + sigma_pa_grid)
-        sigma_volume = sigma_volume.unsqueeze(0).unsqueeze(1)  # (B,1,D,H,W)
+        # Average AP/PA predictions.
+        sigma = 0.5 * (sigma_ap + sigma_pa)  # (N,1)
+        # sample_spect_rays flattens in order (SI, LR, AP), so reshape accordingly then permute to (SI, AP, LR).
+        sigma_lr_ap = sigma.view(D, W, H)           # (SI, LR, AP)
+        sigma_volume = sigma_lr_ap.permute(0, 2, 1)  # (SI, AP, LR)
+        sigma_volume = sigma_volume.unsqueeze(0).unsqueeze(1)  # (B,1,SI,AP,LR)
 
-        if mu_volume is None:
-            mu_volume = ct[:, 0]  # (B,D,H,W)
-
-        # Forward operator (placeholder): expects per-batch (D,H,W)
-        ap_pred, pa_pred = forward_spect(sigma_volume[0, 0], mu_volume[0])
-        ap_pred = ap_pred.unsqueeze(0).unsqueeze(0)  # (B,1,H,W)
-        pa_pred = pa_pred.unsqueeze(0).unsqueeze(0)  # (B,1,H,W)
+        # Forward operator (placeholder) consumes full volume.
+        ap_pred, pa_pred = forward_spect(sigma_volume)
+        ap_pred = ap_pred.unsqueeze(0).unsqueeze(0)  # (B,1,SI,LR)
+        pa_pred = pa_pred.unsqueeze(0).unsqueeze(0)  # (B,1,SI,LR)
 
         return {
             "ap_pred": ap_pred,
