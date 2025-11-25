@@ -10,6 +10,7 @@ def sample_spect_rays(
     voxel_size: float | Tuple[float, float, float],
     view: str,
     num_samples: int,
+    batch_size: int | None = None,
     device: torch.device | None = None,
     dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -21,14 +22,15 @@ def sample_spect_rays(
         voxel_size: float (isotropic) or tuple (vz, vy, vx) in world units.
         view: 'AP' (rays along +AP) or 'PA' (rays along -AP).
         num_samples: number of points per ray along AP.
+        batch_size: optional batch dimension to replicate rays for B elements.
         device/dtype: optional torch device/dtype for outputs.
 
     Returns:
-        xyz_points: (N, 3) sampled world coordinates.
-        ray_dirs:   (N, 3) normalized ray directions; (0, +1, 0) for AP, (0, -1, 0) for PA.
+        xyz_points: (N, 3) or (B, N, 3) sampled world coordinates.
+        ray_dirs:   (N, 3) or (B, N, 3) normalized ray directions; (0, +1, 0) for AP, (0, -1, 0) for PA.
 
     Note:
-        N = D * W * num_samples (one ray per (d, w), sampled uniformly along AP).
+        N = D * W * num_samples (one ray per (d, w), sampled uniformly along AP), replicated across batch if provided.
     """
     if device is None:
         device = torch.device("cpu")
@@ -81,4 +83,7 @@ def sample_spect_rays(
     )
 
     ray_dirs = ray_dir.view(1, 3).expand(xyz_points.shape[0], -1)  # (N, 3)
+    if batch_size is not None:
+        xyz_points = xyz_points.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
+        ray_dirs = ray_dirs.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
     return xyz_points, ray_dirs

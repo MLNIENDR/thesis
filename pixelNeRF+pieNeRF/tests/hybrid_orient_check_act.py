@@ -47,8 +47,8 @@ def main():
     with torch.no_grad():
         ap_fwd, pa_fwd = forward_spect(sigma_volume)
 
-    ap_fwd = ap_fwd.cpu().numpy()
-    pa_fwd = pa_fwd.cpu().numpy()
+    ap_fwd = ap_fwd[0].cpu().numpy()
+    pa_fwd = pa_fwd[0].cpu().numpy()
 
     ap_gt_n = _normalize(ap_gt)
     pa_gt_n = _normalize(pa_gt)
@@ -77,6 +77,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "orient_hybrid_vs_gt.png"
     plt.savefig(out_path, dpi=150)
+    plt.close(fig)
     print("Saved", out_path)
 
 

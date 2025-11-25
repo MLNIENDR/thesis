@@ -60,6 +60,12 @@ def parse_args():
     parser.add_argument("--gpu_id", type=int, default=0)
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--vis_interval", type=int, default=100)
+    parser.add_argument(
+        "--vis_index",
+        type=int,
+        default=0,
+        help="Visualize/depth-profile only this batch index to avoid looping over full batches.",
+    )
     parser.add_argument("--ckpt_interval", type=int, default=200)
     parser.add_argument("--run_name", type=str, default="spect_pienerf_pixelnerf")
     parser.add_argument(
@@ -81,6 +87,31 @@ def parse_args():
         type=int,
         default=0,
         help="If >0, save depth profile (GT act/ct vs pred sigma) every N steps at max-intensity pixel.",
+    )
+    parser.add_argument("--use_attenuation", action="store_true", help="Enable attenuation in forward projection.")
+    parser.add_argument(
+        "--mu_scale",
+        type=float,
+        default=0.01,
+        help="Scale factor applied to positive CT values to form mu_volume when attenuation is enabled.",
+    )
+    parser.add_argument(
+        "--step_len",
+        type=float,
+        default=1.0,
+        help="Step length for attenuation integration inside forward_spect.",
+    )
+    parser.add_argument(
+        "--w_act",
+        type=float,
+        default=0.0,
+        help="Weight for optional ACT L1 loss between predicted sigma_volume and GT activity.",
+    )
+    parser.add_argument(
+        "--w_reg_sigma",
+        type=float,
+        default=0.0,
+        help="Weight for L2 regularization on predicted sigma_volume.",
     )
     return parser.parse_args()
 
@@ -116,7 +147,7 @@ def get_dataloader(data_root: str, batch_size: int, target_hw: tuple[int, int], 
     return dataset, loader, first
 
 
-def make_model(first_batch, device: torch.device):
+def make_model(first_batch, device: torch.device, mu_scale: float, step_len: float):
     ct = first_batch["ct"]
     # ct comes as (B, D, H, W); extract volume shape (D, H, W).
     if ct.dim() == 4:
@@ -134,6 +165,8 @@ def make_model(first_batch, device: torch.device):
         mlp_width=256,
         mlp_depth=8,
         multires_xyz=6,
+        mu_scale=mu_scale,
+        step_len=step_len,
     ).to(device)
     return model
 
@@ -174,12 +207,25 @@ def save_visual(ap, pa, ap_pred, pa_pred, vis_path: Path, rotate: bool):
     plt.close(fig)
 
 
-def save_depth_profile(ap, pa, sigma_volume, act, ct, vis_path: Path):
+def save_depth_profile(ap, pa, sigma_volume, act, ct, vis_path: Path, batch_index: int = 0):
     """
     Save depth profile at max-intensity pixel (sum of AP+PA GT).
     Plots GT activity (if available), predicted sigma, and CT (if available) along AP depth.
     Always writes a file (with a note if no curves available). Returns True if curves were found.
     """
+    def _pick_batch(tensor):
+        if tensor is None or not torch.is_tensor(tensor):
+            return tensor
+        if tensor.dim() >= 4 and tensor.shape[0] > 1:
+            return tensor[batch_index : batch_index + 1]
+        return tensor
+
+    ap = _pick_batch(ap)
+    pa = _pick_batch(pa)
+    sigma_volume = _pick_batch(sigma_volume)
+    act = _pick_batch(act)
+    ct = _pick_batch(ct)
+
     curves_found = False
     with torch.no_grad():
         weight_proj = (ap + pa).detach().cpu()  # (1,1,SI,LR)
@@ -339,10 +385,11 @@ def train():
 
     target_hw = (args.target_hw[0], args.target_hw[1])
     dataset, loader, first_batch = get_dataloader(args.data_root, args.batch_size, target_hw, args.target_depth)
-    model = make_model(first_batch, device)
+    model = make_model(first_batch, device, mu_scale=args.mu_scale, step_len=args.step_len)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
     rotate_for_vis = getattr(dataset, "rotate_projections", False)
+    use_attenuation = args.use_attenuation
 
     global_step = 0
     for epoch in range(args.epochs):
@@ -351,6 +398,7 @@ def train():
             ct = batch["ct"]
             ap = batch["ap"]
             pa = batch["pa"]
+            act = batch.get("act")
 
             # Ensure channel dims exist.
             if ct.dim() == 4:
@@ -359,13 +407,20 @@ def train():
                 ap = ap.unsqueeze(1)
             if pa.dim() == 3:
                 pa = pa.unsqueeze(1)
+            if act is not None and torch.is_tensor(act) and act.numel() > 0:
+                if act.dim() == 3:
+                    act = act.unsqueeze(0)
 
             ct = ct.to(device, non_blocking=True)
             ap = ap.to(device, non_blocking=True)
             pa = pa.to(device, non_blocking=True)
+            if act is not None and torch.is_tensor(act) and act.numel() > 0:
+                act = act.to(device, non_blocking=True)
+            else:
+                act = None
 
             optimizer.zero_grad(set_to_none=True)
-            out = model(ct, ap, pa)
+            out = model(ct, ap, pa, use_attenuation=use_attenuation, step_len=args.step_len)
 
             ap_pred = out["ap_pred"]
             pa_pred = out["pa_pred"]
@@ -374,23 +429,53 @@ def train():
             loss_pa = criterion(pa_pred, pa)
             loss = loss_ap + loss_pa
 
+            loss_act = None
+            if args.w_act > 0.0 and act is not None and act.numel() > 0:
+                act_t = act
+                if act_t.dim() == 3:
+                    act_t = act_t.unsqueeze(0)
+                if act_t.dim() == 4:
+                    act_t = act_t.unsqueeze(1)
+                loss_act = torch.mean(torch.abs(out["sigma_volume"] - act_t))
+                loss = loss + args.w_act * loss_act
+
+            loss_reg = None
+            if args.w_reg_sigma > 0.0:
+                loss_reg = torch.mean(out["sigma_volume"] ** 2)
+                loss = loss + args.w_reg_sigma * loss_reg
+
             loss.backward()
             optimizer.step()
 
             if global_step % args.log_interval == 0:
-                print(
+                msg = (
                     f"[epoch {epoch} step {global_step}] "
                     f"loss={loss.item():.6f} ap={loss_ap.item():.6f} pa={loss_pa.item():.6f}"
                 )
+                if loss_act is not None:
+                    msg += f" act={loss_act.item():.6f} (w={args.w_act})"
+                if loss_reg is not None:
+                    msg += f" reg_sigma={loss_reg.item():.6f} (w={args.w_reg_sigma})"
+                print(msg)
 
             if global_step % args.vis_interval == 0:
                 vis_path = vis_dir / f"step_{global_step:06d}.png"
-                save_visual(ap[0], pa[0], ap_pred[0], pa_pred[0], vis_path, rotate_for_vis)
+                vis_idx = min(max(args.vis_index, 0), ap.shape[0] - 1)
+                save_visual(ap[vis_idx], pa[vis_idx], ap_pred[vis_idx], pa_pred[vis_idx], vis_path, rotate_for_vis)
                 print(f"Saved visualization to {vis_path}")
 
             if args.depth_profile_interval > 0 and global_step % args.depth_profile_interval == 0:
                 dp_path = vis_dir / f"depth_profile_{global_step:06d}.png"
-                saved = save_depth_profile(ap, pa, out.get("sigma_volume"), batch.get("act"), ct, dp_path)
+                vis_idx = min(max(args.vis_index, 0), ap.shape[0] - 1)
+                saved = save_depth_profile(
+                    ap,
+                    pa,
+                    out.get("sigma_volume"),
+                    batch.get("act"),
+                    ct,
+                    dp_path,
+                    batch_index=vis_idx,
+                )
                 if saved:
                     print(f"Saved depth profile to {dp_path}")
                 else:

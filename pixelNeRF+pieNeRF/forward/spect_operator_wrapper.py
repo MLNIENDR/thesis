@@ -1,57 +1,76 @@
-"""Wrapper that aligns hybrid forward projection with RayNet orientation."""
+"""Wrapper that aligns hybrid forward projection with RayNet orientation.
+
+Volume convention: (B, 1, SI, AP, LR) or (B, SI, AP, LR). Only attenuation is
+implemented; scatter and collimator are TODO/not implemented on purpose.
+"""
+
+from typing import Optional
 
 import torch
 
 
-def forward_spect(sigma_volume: torch.Tensor, *args, **kwargs):
+def forward_spect(
+    sigma_volume: torch.Tensor,
+    mu_volume: Optional[torch.Tensor] = None,
+    use_attenuation: bool = False,
+    step_len: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Differentiable forward aligned with RayNet gamma_camera_core orientation chain.
-
-    Expected input: sigma_volume (B, 1, SI, AP, LR). Currently assumes B=1.
-
-    RayNet orientation chain (from preprocessing.py/gamma_camera_core):
-        act_ap = transpose(0,2,1) -> rot90 -> transpose(1,0,2)
-        act_pa = flip(act_ap, axis=2)
-        proj = sum over AP axis
-        orient_patch: rot90 -> flipud -> transpose
-
-    This implementation mirrors that logic with torch ops so gradients flow.
+    Replicates pieNeRF's AP/PA forward chain:
+    - Volumes are interpreted as (SI, AP, LR) and reordered to (AP, SI, LR) like pieNeRF.
+    - CT-based attenuation is flipped along LR before integration (build_ct_context).
+    - AP integrates along +z→-z (reverse AP axis), PA along -z→+z.
+    - Attenuation uses the same cumulative/shift logic as raw2outputs_emission.
     """
-    if sigma_volume.ndim != 5:
-        raise ValueError(f"sigma_volume must be (B,1,SI,AP,LR), got {tuple(sigma_volume.shape)}")
-    if sigma_volume.shape[0] != 1:
-        raise NotImplementedError("forward_spect currently expects B=1.")
 
-    act_dhw = sigma_volume[0, 0]  # (SI, AP, LR)
+    def _strip_channel(vol: torch.Tensor) -> torch.Tensor:
+        if vol.dim() == 5 and vol.shape[1] == 1:
+            return vol[:, 0]
+        if vol.dim() == 4:
+            return vol
+        raise ValueError(f"Expected volume with shape (B,1,SI,AP,LR) or (B,SI,AP,LR), got {tuple(vol.shape)}")
 
-    # RayNet expects (LR, AP, SI) before its internal rotations.
-    act_xyz = act_dhw.permute(2, 1, 0)  # (LR, AP, SI)
+    act = _strip_channel(sigma_volume)  # (B, SI, AP, LR)
+    # pieNeRF internal order: (AP=z, SI=y, LR=x)
+    act_aslr = act.permute(0, 2, 1, 3).contiguous()
 
-    # MATLAB pre-rotations mirrored in torch.
-    act_ap = act_xyz.permute(0, 2, 1)          # (LR, SI, AP)
-    act_ap = torch.rot90(act_ap, k=1, dims=(0, 1))  # rot90 over LR/SI
-    act_ap = act_ap.permute(1, 0, 2)           # (SI, LR, AP)
-    act_pa = torch.flip(act_ap, dims=[2])      # flip along AP
+    mu_aslr = None
+    atten_enabled = bool(use_attenuation)
+    if mu_volume is not None and atten_enabled:
+        mu = _strip_channel(mu_volume)
+        mu_aslr = mu.permute(0, 2, 1, 3).contiguous()
+        # build_ct_context flips LR to align CT with AP/PA rays
+        mu_aslr = torch.flip(mu_aslr, dims=[3])
+        mu_aslr = torch.clamp(mu_aslr, min=0.0)
+    else:
+        atten_enabled = False  # mirror pieNeRF: disable attenuation if no CT is provided
 
-    proj_ap = act_ap.sum(dim=2)  # (SI, LR)
-    proj_pa = act_pa.sum(dim=2)  # (SI, LR)
+    step = torch.as_tensor(step_len, device=act_aslr.device, dtype=act_aslr.dtype)
 
-    def orient_patch(P: torch.Tensor) -> torch.Tensor:
-        P1 = torch.rot90(P, k=1, dims=(0, 1))
-        P2 = torch.flip(P1, dims=[0])
-        return P2.t()
+    def _project(act_vol: torch.Tensor, mu_vol: Optional[torch.Tensor], reverse_ap_axis: bool) -> torch.Tensor:
+        """Integrate along AP axis with optional attenuation; reverse controls +z→-z vs -z→+z."""
+        a_dir = torch.flip(act_vol, dims=[1]) if reverse_ap_axis else act_vol
+        m_dir = torch.flip(mu_vol, dims=[1]) if (mu_vol is not None and reverse_ap_axis) else mu_vol
 
-    ap_pred = orient_patch(proj_ap)
-    pa_pred = orient_patch(proj_pa)
+        weights = a_dir * step
+        if atten_enabled and m_dir is not None:
+            mu_scaled = m_dir * step
+            # raw2outputs_emission: cumulative μ·Δs, shifted by one step, clamped
+            atten = torch.cumsum(mu_scaled, dim=1)
+            atten = torch.cat([torch.zeros_like(atten[:, :1]), atten[:, :-1]], dim=1)
+            atten = torch.clamp(atten, min=0.0, max=60.0)
+            trans = torch.exp(-atten)
+            weights = a_dir * trans * step
 
-    # Final alignment to dataset convention (SI, LR) = (act_dhw.shape[0], act_dhw.shape[2]).
-    # Empirically, flipping both axes aligns with RayNet-generated GT.
-    ap_pred = torch.flip(ap_pred, dims=[0, 1])
-    pa_pred = torch.flip(pa_pred, dims=[0, 1])
+        return weights.sum(dim=1)  # (B, SI, LR)
 
-    si_target, _, lr_target = act_dhw.shape
-    if ap_pred.shape == (lr_target, si_target):
-        ap_pred = ap_pred.t()
-    if pa_pred.shape == (lr_target, si_target):
-        pa_pred = pa_pred.t()
-    return ap_pred, pa_pred
+    # AP = camera at +z, integrates toward -z ⇒ reverse AP axis
+    proj_ap = _project(act_aslr, mu_aslr, reverse_ap_axis=True)
+    # PA = camera at -z, integrates toward +z ⇒ natural order
+    proj_pa = _project(act_aslr, mu_aslr, reverse_ap_axis=False)
+
+    # Align LR orientation with dataset projections (mirror LR once).
+    proj_ap = torch.flip(proj_ap, dims=[2])
+    proj_pa = torch.flip(proj_pa, dims=[2])
+
+    return proj_ap, proj_pa

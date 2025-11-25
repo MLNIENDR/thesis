@@ -33,12 +33,18 @@ srun python -u train/train_spect_pienerf_pixelnerf.py \
     --data_root thesis_med/pieNeRF/data \
     --epochs 2000 \
     --lr 3e-4 \
-    --batch_size 1 \
+    --batch_size 2 \
     --gpu_id 0 \
     --run_name dirfix_lrflip \
     --log_interval 50 \
     --vis_interval 100 \
     --depth_profile_interval 100 \
+    --vis_index 0 \
+    --use_attenuation \
+    --mu_scale 0.01 \
+    --step_len 1.0 \
+    --w_act 0.0 \
+    --w_reg_sigma 0.0 \
     "$@"
 
 echo "✅ Training finished at: $(date)"

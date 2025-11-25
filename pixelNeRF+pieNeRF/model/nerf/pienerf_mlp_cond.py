@@ -12,8 +12,8 @@ class PieNeRFConditionalMLP(nn.Module):
     pieNeRF MLP extended with latent conditioning via concatenation.
 
     Inputs:
-        xyz_pe: positional-encoded 3D coordinates, shape (N, C_xyz_pe).
-        z_feat: global latent vector from encoder, shape (B, C_latent); in this step we assume B=1.
+        xyz_pe: positional-encoded 3D coordinates, shape (N, C_xyz_pe) or (B, N, C_xyz_pe).
+        z_feat: global latent vector from encoder, shape (B, C_latent).
 
     Forward:
         - Take z_feat[0], expand to (N, C_latent).
@@ -68,22 +68,33 @@ class PieNeRFConditionalMLP(nn.Module):
         Compute sigma given positional-encoded xyz and latent code.
 
         Args:
-            xyz_pe: Tensor (N, C_xyz_pe) positional-encoded coordinates.
-            z_feat: Tensor (B, C_latent) global latent; currently only z_feat[0] is used (assumes B=1).
+            xyz_pe: Tensor (N, C_xyz_pe) or (B, N, C_xyz_pe) positional-encoded coordinates.
+            z_feat: Tensor (B, C_latent) global latent. For batched xyz_pe, each block uses matching z_feat[b].
 
         Returns:
-            sigma: Tensor (N, 1) predicted densities sigma(x).
+            sigma: Tensor (N, 1) if input was 2D, else (B, N, 1).
         """
         if z_feat.ndim != 2:
             raise ValueError(f"z_feat must be (B, C_latent); got shape {tuple(z_feat.shape)}")
         if z_feat.shape[0] < 1:
             raise ValueError("z_feat batch dimension is empty.")
 
-        # For now, use the first batch element; future work can map xyz_pe to matching batch indices.
-        latent = z_feat[0]  # (C_latent,)
-        latent_expanded = latent.expand(xyz_pe.shape[0], -1)  # (N, C_latent)
+        is_batched_xyz = xyz_pe.dim() == 3
+        if xyz_pe.dim() not in (2, 3):
+            raise ValueError(f"xyz_pe must be (N,C) or (B,N,C); got {tuple(xyz_pe.shape)}")
 
-        h0 = torch.cat([xyz_pe, latent_expanded], dim=-1)  # (N, input_ch)
+        if is_batched_xyz:
+            B, N, _ = xyz_pe.shape
+            if B != z_feat.shape[0]:
+                raise ValueError(f"xyz_pe batch {B} != z_feat batch {z_feat.shape[0]}")
+            xyz_flat = xyz_pe.reshape(-1, xyz_pe.shape[-1])  # (B*N, C_xyz_pe)
+            latent_expanded = z_feat[:, None, :].expand(-1, N, -1).reshape(-1, z_feat.shape[1])
+        else:
+            xyz_flat = xyz_pe
+            latent = z_feat[0]  # (C_latent,)
+            latent_expanded = latent.expand(xyz_pe.shape[0], -1)  # (N, C_latent)
+
+        h0 = torch.cat([xyz_flat, latent_expanded], dim=-1)  # (flat_N, input_ch)
         h = h0
         relu = partial(F.relu, inplace=True)
         for i, _ in enumerate(self.pts_linears):
@@ -92,5 +103,7 @@ class PieNeRFConditionalMLP(nn.Module):
             if i in self.skips:
                 h = torch.cat([h0, h], dim=-1)
 
-        sigma = self.output_linear(h)  # (N, 1)
+        sigma = self.output_linear(h)  # (flat_N, 1)
+        if is_batched_xyz:
+            sigma = sigma.view(z_feat.shape[0], -1, 1)  # (B, N, 1)
         return sigma
