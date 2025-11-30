@@ -1,12 +1,14 @@
+"""Generator wrapper around NeRF rendering: manages ray sampling, fixed AP/PA poses, CT context, and rendering helpers."""
+
 import numpy as np
 import torch
 from graf.utils import sample_on_sphere, look_at, to_sphere
 from graf.transforms import FullRaySampler
-from nerf.run_nerf_mod import render, run_network  # conditional render
+from nerf.run_nerf_mod import render, run_network
 from functools import partial
 
 
-def _pose_from_loc(loc_np: np.ndarray, up=np.array([0.0, 1.0, 0.0], dtype=np.float32)) -> torch.Tensor:
+def _pose_from_loc(loc_np: np.ndarray, up=np.array([0.0, 1.0, 0.0], dtype=np.float32)) -> torch.Tensor:         # wird bei SPECT Setup nicht genutzt, ist aber allgemeiner GRAF-/NeRF-Helfer für "Kamera blickt auf den Ursprung"
     """Erzeugt eine c2w-Pose (3x4) für eine Weltposition `loc` (Kamera blickt zum Ursprung)."""
     R = look_at(loc_np, up=np.array(up, dtype=np.float32))[0]  # 3x3
     RT = np.concatenate([R, loc_np.reshape(3, 1)], axis=1)  # 3x4
@@ -24,7 +26,7 @@ class Generator(object):
       - __call__ gibt flache Projektionskarten zurück.
     """
 
-    def __init__(
+    def __init__(                                                                               # was alles gespeichert wird
         self,
         H,
         W,
@@ -36,12 +38,12 @@ class Generator(object):
         parameters,
         named_parameters,
         range_u=(0, 1),
-        range_v=(0.01, 0.49),
+        range_v=(0.01, 0.99),
         chunk=None,
         device="cuda",
         orthographic=False,
-    ):
-        self.device = device
+    ):                                                                                          # Basis-Parameter
+        self.device = device        
         self.H = int(H)
         self.W = int(W)
         self.focal = focal
@@ -49,21 +51,21 @@ class Generator(object):
         self.range_u = range_u
         self.range_v = range_v
         self.chunk = chunk
-        self.orthographic = orthographic  # wichtig für FullRaySampler
+        self.orthographic = orthographic
         self.fixed_poses_enabled = False
         self.pose_ap = None
         self.pose_pa = None
-        self.ortho_size = None  # (height, width) in Weltkoordinaten für Orthographie
-        self._fixed_pose_toggle = 0  # 0=AP, 1=PA
+        self.ortho_size = None  
+        self._fixed_pose_toggle = 0                                                             # 0=AP, 1=PA
 
         # Pixel-Gitter
         coords = torch.from_numpy(
             np.stack(np.meshgrid(np.arange(H), np.arange(W), indexing="ij"), -1)
         )
-        self.coords = coords.view(-1, 2)
+        self.coords = coords.view(-1, 2)                                                        # Liste aller Pixelindizes im Bild als 2D-Tensor (y,x)            
 
-        self.ray_sampler = ray_sampler
-        self.val_ray_sampler = FullRaySampler(orthographic=orthographic)
+        self.ray_sampler = ray_sampler                                                          # flexibler Sampler
+        self.val_ray_sampler = FullRaySampler(orthographic=orthographic)                        # Sampler rendert komplette Bilder
 
         self.render_kwargs_train = render_kwargs_train
         self.render_kwargs_test = render_kwargs_test
@@ -103,22 +105,17 @@ class Generator(object):
           - im Train-Mode: proj_flat [B, H*W]
           - im Eval-Mode: (proj_flat, disp_flat, acc_flat, extras)
         """
-        bs = z.shape[0]
-        # Alle Features strikt auf das Generator-Device legen, sonst kollidieren CPU/GPU-Tensors.
-        z = z.to(self.device, non_blocking=True)
+        bs = z.shape[0]                                                                                     # z: latenter Code pro Batch, Shape [B, feat_dim]
+    
+        z = z.to(self.device, non_blocking=True)                                                            # Alle Features strikt auf das Generator-Device (GPU) legen, sonst kollidieren CPU/GPU-Tensors.
 
-        # Falls keine Rays gegeben sind: standardmäßige GRAF-Pose-Samples
-        if rays is None:
-            rays = torch.cat([self.sample_rays() for _ in range(bs)], dim=1)
-
-        # Sicherstellen, dass die Rays auf demselben Device liegen wie das Netz.
-        rays = rays.to(self.device, non_blocking=True)
+        rays = rays.to(self.device, non_blocking=True)                                                      # Sicherstellen, dass die Rays auf demselben Device liegen wie das Netz.
 
         # Render-Settings wählen
         render_kwargs = self.render_kwargs_test if self.use_test_kwargs else self.render_kwargs_train
-        render_kwargs = dict(render_kwargs)  # copy
+        render_kwargs = dict(render_kwargs)                                                                 # Kopie, damit das Original nicht verändert wird
 
-        # variable radius → near/far anpassen
+        # variable radius → near/far anpassen (nutze ich nicht)
         if isinstance(self.radius, tuple):
             assert (
                 self.radius[1] - self.radius[0] <= render_kwargs["near"]
@@ -136,15 +133,15 @@ class Generator(object):
                 shift.max(),
             )
 
-        # z als Features an NeRF durchreichen
+        # z als latente Features an NeRF durchreichen (zusätzlich zu Position & Viewdir --> conditional NeRF)
         render_kwargs["features"] = z
 
-        if render_kwargs.get("use_attenuation") and "ct_context" not in render_kwargs:
+        if render_kwargs.get("use_attenuation") and "ct_context" not in render_kwargs:                      # falls attenuation==True aber kein CT-Kontext --> Attenuation ausschalten
             render_kwargs["use_attenuation"] = False
 
         # Emissions-NeRF rendern
         proj_rgb, disp, acc, extras = self.render(rays=rays, **render_kwargs)
-        # proj_rgb: [N_rays, 3]
+        # proj_rgb: [N_rays, 3] (drei gleiche Kanäle im Grauwertbild, API Hack weil Renderfunktion das so erwartet)
         # disp:     [N_rays]
         # acc:      [N_rays]
 
@@ -154,30 +151,30 @@ class Generator(object):
             Bei Emission keine [-1, 1]-Skalierung (wir wollen positive Intensitäten).
             """
             x = x.view(len(x), -1)
-            return x
+            return x                                                                                        # x hat Form: proj_rgb: [N_rays, 3], disp: [N_rays], acc: [N_rays]
 
-        if self.use_test_kwargs:
-            proj_flat = rays_to_output(proj_rgb)
-            disp_flat = rays_to_output(disp)
-            acc_flat = rays_to_output(acc)
+        if self.use_test_kwargs:                                                                            # Im Test-Mode Ausgabe von Projektion + Disparity + Accumulation
+            proj_flat = rays_to_output(proj_rgb)                                                            # Grauwert-Bild
+            disp_flat = rays_to_output(disp)                                                                # 1/Tiefe, gewichtet mit Volumenrender-Gewichten (Tiefenindikator, der sagt: wenn ray früh stoppte (viel Dichte vor): disparity groß)
+            acc_flat = rays_to_output(acc)                                                                  # gesamt akkumulierte Opazität eines Rays (1: viel Material / Emission, 0: ging durch leeren Raum)
             return proj_flat, disp_flat, acc_flat, extras
 
-        proj_flat = rays_to_output(proj_rgb)
+        proj_flat = rays_to_output(proj_rgb)                                                                # Im Train-Mode nur Ausgabe von proj_flat
         return proj_flat
 
-    def decrease_nerf_noise(self, it):
-        end_it = 5000
+    def decrease_nerf_noise(self, it):                                                                      # Idee: anfangs viel Rauschen auf NeRF-Ausgabe, damit Modell nicht zu früh overfittet
+        end_it = 5000                                                                                       # nach 5000 Iterationen soll Noise = 0 sein
         if it < end_it:
-            noise_std = self.initial_raw_noise_std - self.initial_raw_noise_std / end_it * it
+            noise_std = self.initial_raw_noise_std - self.initial_raw_noise_std / end_it * it               # linearer Abfall
             self.render_kwargs_train["raw_noise_std"] = noise_std
 
     def sample_pose(self):
-        if self.fixed_poses_enabled and (self.pose_ap is not None) and (self.pose_pa is not None):
+        if self.fixed_poses_enabled and (self.pose_ap is not None) and (self.pose_pa is not None):          # wenn fixe AP/PA-Posen aktiviert
             pose = self.pose_ap if self._fixed_pose_toggle == 0 else self.pose_pa
             self._fixed_pose_toggle = 1 - self._fixed_pose_toggle  # toggle AP<->PA
             return pose
 
-        # fallback: zufällige Pose auf Kugel
+        # fallback: zufällige Pose auf Kugel (nutze ich nicht)
         loc = sample_on_sphere(self.range_u, self.range_v)
         radius = self.radius
         if isinstance(radius, tuple):
@@ -199,22 +196,22 @@ class Generator(object):
             focal_or_size = self.focal
 
         batch_rays, _, _ = sampler(self.H, self.W, focal_or_size, pose)
-        return batch_rays
+        return batch_rays                                                                           # batch_rays: Tensor mit Ursprung & Richtung pro Ray, Shape [2, N_rays, 3]
 
-    def to(self, device):
+    def to(self, device):                                                                           # verschiebt NeRF-Netz auf GPU
         self.render_kwargs_train["network_fn"].to(device)
         if self.render_kwargs_train["network_fine"] is not None:
             self.render_kwargs_train["network_fine"].to(device)
         self.device = device
         return self
 
-    def train(self):
+    def train(self):                                                                                # setzt PyTorch in Train-Mode
         self.use_test_kwargs = False
         self.render_kwargs_train["network_fn"].train()
         if self.render_kwargs_train["network_fine"] is not None:
             self.render_kwargs_train["network_fine"].train()
 
-    def eval(self):
+    def eval(self):                                                                                 # Eval-Mode
         self.use_test_kwargs = True
         self.render_kwargs_train["network_fn"].eval()
         if self.render_kwargs_train["network_fine"] is not None:
@@ -239,10 +236,10 @@ class Generator(object):
         self.pose_pa = _pose_from_loc(loc_pa, up=up)
         # look_at(..., -z) kehrt die x-Achse um (diag[-1,1,-1]); dadurch wäre PA spiegelverkehrt
         # zu den PA-GT-Projektionen. Durch Rückspiegeln der x-Achse stimmen die Pixelrichtungen wieder.
-        self.pose_pa[:, 0] *= -1.0
+        self.pose_pa[:, 0] *= -1.0                          # multipliziert die erste Spalte (x-Achse) mit -1 (korrigiert so die Spiegelung)
 
         self.fixed_poses_enabled = True
-        self._fixed_pose_toggle = 0  # starte mit AP
+        self._fixed_pose_toggle = 0                         # starte mit AP
 
         # Orthographische Größe an den CT-Würfel anpassen: Breite/Höhe = 2*radius
         if self.orthographic:
@@ -280,7 +277,7 @@ class Generator(object):
         # Latente Codes als "features" übergeben
         render_kwargs["features"] = z
 
-        # 3) Falls Radius als Intervall gegeben ist: near/far pro Ray anpassen
+        # 3) Falls Radius als Intervall gegeben ist: near/far pro Ray anpassen (brauche ich eig. nicht)
         if isinstance(self.radius, tuple):
             rays_radius = batch_rays[0].norm(dim=-1)  # [N_rays]
             shift = (self.radius[1] - rays_radius).view(-1, 1).float().to(device)
@@ -308,12 +305,12 @@ class Generator(object):
             render_kwargs["use_attenuation"] = False
 
         # 5) NeRF-Rendering aufrufen
-        #    Achtung: in unserer Emissions-Variante gibt "render" proj_map statt rgb_map zurück.
+        #    Achtung: in der Emissions-Variante gibt "render" proj_map statt rgb_map zurück.
         proj_map, disp, acc, extras = self.render(rays=batch_rays, **render_kwargs)
 
         # 6) proj_map auf einen Skalar pro Ray reduzieren und auf [bs, H*W] bringen
         #    Mögliche Formen:
-        #      - [N_rays]         (unser Emissionsfall)
+        #      - [N_rays]         (Emissionsfall)
         #      - [N_rays, 1]      (ein Kanal)
         #      - [N_rays, 3]      (RGB, im alten Setup)
         #      - [H, W, 3]        (altes Vollbild)
@@ -355,7 +352,7 @@ class Generator(object):
         Bereitet ein CT-Volumen für das Attenuation-Rendering vor.
         Annahme: Das Volumen ist zentriert und teilt sich den Bounding Cube [-radius, radius]^3 mit dem NeRF.
         """
-        if ct_volume is None:
+        if ct_volume is None:                                           # CT als [D, H, W] --> wird zu [1,1,D,H,W] (Batch-Dimension, Channel-Dimension, D,H,W)
             return None
         if not torch.is_tensor(ct_volume):
             raise TypeError("ct_volume must be a torch.Tensor")

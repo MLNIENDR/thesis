@@ -1,8 +1,10 @@
+"""Sampling and camera utility functions for pieNeRF (sphere sampling, look-at matrices, vector helpers)."""
+
 import numpy as np
 
 
 def to_sphere(u, v):
-    """Map (u,v) \in [0,1]^2 auf Einheitskugelkoordinaten."""
+    """NICHT GENUTZT; Definiert geleichverteilte (u,v) ([0,1]^2) in 3D-Punktkoordinaten auf Einheitskugel."""
     theta = 2 * np.pi * u
     phi = np.arccos(1 - 2 * v)
     cx = np.sin(phi) * np.cos(theta)
@@ -12,7 +14,7 @@ def to_sphere(u, v):
 
 
 def sample_on_sphere(range_u=(0.0, 1.0), range_v=(0.0, 1.0)):
-    """Zufälliger Punkt auf der Einheitskugel innerhalb der gegebenen Parameterbereiche."""
+    """NICHT GENUTZT; Zufälliger Punkt auf der Einheitskugel innerhalb der gegebenen Parameterbereiche."""
     u = np.random.uniform(*range_u)
     v = np.random.uniform(*range_v)
     return to_sphere(u, v)

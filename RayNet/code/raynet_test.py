@@ -472,9 +472,6 @@ class TrainConfig:
     # Anti-Korrelation + Mess-Skalierung
     lambda_corr: float = 0.0
     meas_quantile: float = 0.999
-    # Skalen für die RRMSE-Normierung
-    scale_I_ap: float = 1.0
-    scale_I_pa: float = 1.0
     # Anzahl Fourier-Frequenzen für (x,y)-Koordinaten (0 = keine Koordinatenfeatures)
     num_fourier: int = 0
 
@@ -486,7 +483,9 @@ def train_one_epoch(model: SegmentRayNet, loader: DataLoader,
         "loss": 0.0, "loss_I": 0.0, "loss_sup": 0.0,
         "loss_l1": 0.0, "loss_bg": 0.0, "loss_off": 0.0, "loss_nb": 0.0,
         "rmse_I_ap": 0.0, "rmse_I_pa": 0.0, "rmse_a": 0.0,
-        "rrmse_ap": 0.0, "rrmse_pa": 0.0, "spars": 0.0, "corr_am": 0.0,
+        "mae_I_ap": 0.0, "mae_I_pa": 0.0,
+        "logrmse_ap": 0.0, "logrmse_pa": 0.0,
+        "spars": 0.0, "corr_am": 0.0,
     }
     n = 0                                                                                       # Anz. der Rays über die gemittelt wird
 
@@ -579,9 +578,16 @@ def train_one_epoch(model: SegmentRayNet, loader: DataLoader,
             rmse_I_ap_item = rmse_I_ap.item()
             rmse_I_pa_item = rmse_I_pa.item()
 
-            # RRMSE (normiert mit globalen Skalen aus dem Train-Set)
-            rrmse_ap = (rmse_I_ap / (cfg.scale_I_ap + 1e-8)).item()
-            rrmse_pa = (rmse_I_pa / (cfg.scale_I_pa + 1e-8)).item()
+            # MAE und Log-RMSE (Lograum robust gegen winzige Werte)
+            mae_I_ap = F.l1_loss(I_ap_hat, I_ap).item()
+            mae_I_pa = F.l1_loss(I_pa_hat, I_pa).item()
+
+            logI_ap_hat = torch.log1p(torch.clamp(I_ap_hat, min=0.0))
+            logI_ap = torch.log1p(torch.clamp(I_ap, min=0.0))
+            logI_pa_hat = torch.log1p(torch.clamp(I_pa_hat, min=0.0))
+            logI_pa = torch.log1p(torch.clamp(I_pa, min=0.0))
+            logrmse_ap = torch.sqrt(F.mse_loss(logI_ap_hat, logI_ap)).item()
+            logrmse_pa = torch.sqrt(F.mse_loss(logI_pa_hat, logI_pa)).item()
 
             rmse_a = torch.sqrt(F.mse_loss(a_eff, a_gt)).item() if a_gt is not None else 0.0
             spars = (a_eff < cfg.bg_eps).float().mean().item()
@@ -597,9 +603,11 @@ def train_one_epoch(model: SegmentRayNet, loader: DataLoader,
 
             stats["rmse_I_ap"] += rmse_I_ap_item * bsz
             stats["rmse_I_pa"] += rmse_I_pa_item * bsz
+            stats["mae_I_ap"] += mae_I_ap * bsz
+            stats["mae_I_pa"] += mae_I_pa * bsz
+            stats["logrmse_ap"] += logrmse_ap * bsz
+            stats["logrmse_pa"] += logrmse_pa * bsz
             stats["rmse_a"] += rmse_a * bsz
-            stats["rrmse_ap"] += rrmse_ap * bsz
-            stats["rrmse_pa"] += rrmse_pa * bsz
             stats["spars"] += spars * bsz
             stats["corr_am"] += corr_am * bsz
             n += bsz
@@ -623,7 +631,9 @@ def evaluate_on_loader(model: SegmentRayNet, loader: DataLoader, cfg: TrainConfi
     model.eval()
     stats = {
         "rmse_I_ap": 0.0, "rmse_I_pa": 0.0, "rmse_a": 0.0,
-        "rrmse_ap": 0.0, "rrmse_pa": 0.0, "spars": 0.0, "corr_am": 0.0,
+        "mae_I_ap": 0.0, "mae_I_pa": 0.0,
+        "logrmse_ap": 0.0, "logrmse_pa": 0.0,
+        "spars": 0.0, "corr_am": 0.0,
     }
     n = 0
 
@@ -654,8 +664,15 @@ def evaluate_on_loader(model: SegmentRayNet, loader: DataLoader, cfg: TrainConfi
         rmse_I_ap_item = rmse_I_ap.item()
         rmse_I_pa_item = rmse_I_pa.item()
 
-        rrmse_ap = (rmse_I_ap / (cfg.scale_I_ap + 1e-8)).item()
-        rrmse_pa = (rmse_I_pa / (cfg.scale_I_pa + 1e-8)).item()
+        mae_I_ap = F.l1_loss(I_ap_hat, I_ap).item()
+        mae_I_pa = F.l1_loss(I_pa_hat, I_pa).item()
+
+        logI_ap_hat = torch.log1p(torch.clamp(I_ap_hat, min=0.0))
+        logI_ap = torch.log1p(torch.clamp(I_ap, min=0.0))
+        logI_pa_hat = torch.log1p(torch.clamp(I_pa_hat, min=0.0))
+        logI_pa = torch.log1p(torch.clamp(I_pa, min=0.0))
+        logrmse_ap = torch.sqrt(F.mse_loss(logI_ap_hat, logI_ap)).item()
+        logrmse_pa = torch.sqrt(F.mse_loss(logI_pa_hat, logI_pa)).item()
 
         rmse_a = torch.sqrt(F.mse_loss(a_eff, a_gt)).item() if a_gt is not None else 0.0
         spars = (a_eff < cfg.bg_eps).float().mean().item()
@@ -663,9 +680,11 @@ def evaluate_on_loader(model: SegmentRayNet, loader: DataLoader, cfg: TrainConfi
 
         stats["rmse_I_ap"] += rmse_I_ap_item * bsz
         stats["rmse_I_pa"] += rmse_I_pa_item * bsz
+        stats["mae_I_ap"] += mae_I_ap * bsz
+        stats["mae_I_pa"] += mae_I_pa * bsz
+        stats["logrmse_ap"] += logrmse_ap * bsz
+        stats["logrmse_pa"] += logrmse_pa * bsz
         stats["rmse_a"] += rmse_a * bsz
-        stats["rrmse_ap"] += rrmse_ap * bsz
-        stats["rrmse_pa"] += rrmse_pa * bsz
         stats["spars"] += spars * bsz
         stats["corr_am"] += corr_am * bsz
         n += bsz
@@ -752,31 +771,6 @@ def main():
     ds_train = NPZRaysSubset(ds_full, train_idx)
     ds_test  = NPZRaysSubset(ds_full, test_idx) if len(test_idx) > 0 else NPZRaysSubset(ds_full, train_idx)
 
-
-    # -------- Intensity-Skalen für RRMSE bestimmen (aus dem Train-Subset) --------
-    def compute_intensity_scales(ds, quantile=0.99, eps=1e-12):
-        I = ds.I_pairs   # [M,2]
-        I_ap = I[:, 0].abs()
-        I_pa = I[:, 1].abs()
-
-        I_ap_pos = I_ap[I_ap > eps]
-        I_pa_pos = I_pa[I_pa > eps]
-
-        if I_ap_pos.numel() > 0:
-            scale_ap = torch.quantile(I_ap_pos, quantile).item()
-        else:
-            scale_ap = float(I_ap.mean().item())
-
-        if I_pa_pos.numel() > 0:
-            scale_pa = torch.quantile(I_pa_pos, quantile).item()
-        else:
-            scale_pa = float(I_pa.mean().item())
-
-        return scale_ap, scale_pa
-
-    scale_ap, scale_pa = compute_intensity_scales(ds_train, quantile=0.99)
-    print(f"[INFO] Intensity scales (train, q=0.99): AP={scale_ap:.3e}, PA={scale_pa:.3e}")
-
     cfg = TrainConfig(
         epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
         alpha=args.alpha, beta=args.beta, device=args.device,
@@ -794,8 +788,6 @@ def main():
         corr_kappa=args.corr_kappa,
         lambda_corr=args.lambda_corr, meas_quantile=args.meas_quantile,
         num_fourier=args.num_fourier,
-        scale_I_ap=scale_ap,
-        scale_I_pa=scale_pa,
     )
 
     device = torch.device(cfg.device)
@@ -841,14 +833,18 @@ def main():
             f"train_sup={stats_train['loss_sup']:.3e} | "
             f"train_rmse_I_ap={stats_train['rmse_I_ap']:.3e} | "
             f"train_rmse_I_pa={stats_train['rmse_I_pa']:.3e} | "
+            f"train_mae_I_ap={stats_train['mae_I_ap']:.3e} | "
+            f"train_mae_I_pa={stats_train['mae_I_pa']:.3e} | "
+            f"train_logrmse_ap={stats_train['logrmse_ap']:.3e} | "
+            f"train_logrmse_pa={stats_train['logrmse_pa']:.3e} | "
             f"train_rmse_a={stats_train['rmse_a']:.3e} | "
-            f"train_rrmse_ap={stats_train['rrmse_ap']:.3e} | "
-            f"train_rrmse_pa={stats_train['rrmse_pa']:.3e} | "
             f"test_rmse_I_ap={stats_test['rmse_I_ap']:.3e} | "
             f"test_rmse_I_pa={stats_test['rmse_I_pa']:.3e} | "
             f"test_rmse_a={stats_test['rmse_a']:.3e} | "
-            f"test_rrmse_ap={stats_test['rrmse_ap']:.3e} | "
-            f"test_rrmse_pa={stats_test['rrmse_pa']:.3e} | "
+            f"test_mae_I_ap={stats_test['mae_I_ap']:.3e} | "
+            f"test_mae_I_pa={stats_test['mae_I_pa']:.3e} | "
+            f"test_logrmse_ap={stats_test['logrmse_ap']:.3e} | "
+            f"test_logrmse_pa={stats_test['logrmse_pa']:.3e} | "
             f"spars={stats_train['spars']:.3f} | "
             f"corr(a,mu)={stats_train['corr_am']:.3f} | "
             f"gain={gain_val.item():.3e} | "
@@ -868,8 +864,8 @@ def main():
     print("Zusammenfassung (letztes Modell)")
     print("======================")
     header = (
-        "Datensatz | RMSE(I_AP) | RMSE(I_PA) | RMSE(a)  | "
-        "RRMSE(I_AP) | RRMSE(I_PA) | Sparsity | corr(a,µ)"
+        "Datensatz | RMSE(I_AP) | RMSE(I_PA) | MAE(I_AP) | MAE(I_PA) | "
+        "LogRMSE(I_AP) | LogRMSE(I_PA) | RMSE(a) | Sparsity | corr(a,µ)"
     )
     print(header)
     print("-" * len(header))
@@ -879,9 +875,11 @@ def main():
             f"{name:8s} | "
             f"{fmt(s['rmse_I_ap'])} | "
             f"{fmt(s['rmse_I_pa'])} | "
+            f"{fmt(s['mae_I_ap'])} | "
+            f"{fmt(s['mae_I_pa'])} | "
+            f"{fmt(s['logrmse_ap'])} | "
+            f"{fmt(s['logrmse_pa'])} | "
             f"{fmt(s['rmse_a'])} | "
-            f"{fmt(s['rrmse_ap'])} | "
-            f"{fmt(s['rrmse_pa'])} | "
             f"{s['spars']:.3f} | "
             f"{s['corr_am']:.3f}"
         )

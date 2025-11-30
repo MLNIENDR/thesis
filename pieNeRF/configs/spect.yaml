@@ -1,15 +1,15 @@
-# Konfiguration für SPECT-ähnliches Emissions-NeRF aus AP/PA + CT (erstmal OHNE GAN)
+# Konfiguration für SPECT-ähnliches Emissions-NeRF aus AP/PA + CT
 
 expname: spect_emission
 data:
   type: spect                                   # Neuer Datensatz-Typ, der in graf/config.py → get_data() abgefragt wird
-  manifest: data/manifest.csv             # Manifest mit Spalten: patient_id, ap_path, pa_path, ct_path
+  manifest: data/manifest.csv                   # Manifest mit Spalten: patient_id, ap_path, pa_path, ct_path
   imsize: 128                                   # Zielbildgröße nach ggf. Resize (an deine Daten anpassen)
   white_bkgd: False                             # Bei Szinti i.d.R. kein "weißer Hintergrund" wie bei DRRs nötig
   fixed_poses: ap_pa
 
   # Projektionsgeometrie
-  orthographic: True                            # Für SPECT-ähnliche planare Szintigraphie meistens parallelbeam:
+  orthographic: True                            # Für SPECT-ähnliche planare Szintigraphie parallelbeam:
   far: 1.0                                      # near/far definieren den normierten Tiefenbereich im NeRF-Raum --> für den Anfang hier [0,1] annehmen und später aus der CT-BBox ableiten.
   near: 0.0
 
@@ -21,7 +21,7 @@ data:
   # Keine Zufalls-Augmentation bei medizinischen Daten
   augmentation: False
 
-  # Für deine festen AP/PA-Posen unbenutzt, aber der Vollständigkeit halber
+  # Für feste AP/PA-Posen unbenutzt, aber der Vollständigkeit halber
   umin: 0.0
   umax: 0.0
   vmin: 0.0
@@ -35,11 +35,11 @@ nerf:
   use_attenuation: True                         # aktiviert CT-basierte Schwächung im Forward-Modell
   attenuation_debug: False                      # falls True: logge λ/μ/T für einen Beispielstrahl
   multires: 10
-  multires_views: 0           # wird bei use_viewdirs=False sowieso ignoriert
+  multires_views: 0                             # wird bei use_viewdirs=False sowieso ignoriert
 
   # Sampling entlang der Strahlen
-  N_samples: 32               # eig. 128, aber für schnelles Training erstmal runter
-  N_importance: 0             # kein hierarchisches Fine-Sampling für den Anfang
+  N_samples: 32                                 # eig. 128, aber für schnelles Training erstmal runter
+  N_importance: 0                               # kein hierarchisches Fine-Sampling für den Anfang
 
   # MLP-Größe
   netdepth: 8
@@ -50,7 +50,7 @@ nerf:
   # Kein Jitter → deterministische Rays (ist zum Debuggen angenehmer)
   perturb: 0.0
 
-  # Rauschen direkt in den NeRF-Rohwerten brauchst du anfänglich nicht
+  # Rauschen direkt in den NeRF-Rohwerten anfänglich nicht
   raw_noise_std: 0.0
   decrease_noise: False
 
@@ -61,7 +61,7 @@ z_dist:
   dim_appearance: 128
 
 # Ray-Sampler aus dem Patch-GAN-Setup; für Full-Image-Sampling
-# wird wahrscheinlich in eigenem Code in graf/transforms.py geschrieben.
+# wird in eigenem Code in graf/transforms.py geschrieben.
 # Belassen bei neutralen Werten, damit nichts crasht, falls noch irgendwo gelesen.
 ray_sampler:
   min_scale: 1.0
@@ -88,7 +88,7 @@ training:
   batch_size: 1               # pro Patient / Fall
 
   # Wie viele Rays pro Forward-Pass (Speicherlimit)
-  # Kannst du später verfeinern; kleinere Werte = weniger VRAM, langsamer.
+  # später ggf. verfeinern; kleinere Werte = weniger VRAM, langsamer.
   chunk: 8192                 # eig. wars 32768
   netchunk: 16384             # eig. wars 65536
 
@@ -106,7 +106,7 @@ training:
 
   optimizer: adam             
 
-  # EMA & Style-GAN-Features kannst du vorerst ignorieren
+  # EMA & Style-GAN-Features vorerst ignorieren
   n_test_samples_with_same_shape_code: 1
   take_model_average: false
   model_average_beta: 0.999

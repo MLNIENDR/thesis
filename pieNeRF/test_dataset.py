@@ -1,3 +1,5 @@
+"""Utility script to load a SPECT YAML config, build the dataset, and visualize AP/PA/CT slices."""
+
 # test_dataset.py
 # -*- coding: utf-8 -*-
 import yaml

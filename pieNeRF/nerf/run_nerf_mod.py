@@ -1,3 +1,5 @@
+"""Modified NeRF implementation for emission rendering: embeds coordinates, supports latent features, optional attenuation, and renders SPECT rays."""
+
 import os, sys
 import numpy as np
 import imageio

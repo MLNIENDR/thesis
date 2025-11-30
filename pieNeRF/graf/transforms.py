@@ -1,3 +1,5 @@
+"""Ray sampling helpers and image-to-patch transforms used by the pieNeRF generator."""
+
 import torch
 from math import sqrt, exp
 
@@ -6,10 +8,12 @@ from nerf.run_nerf_helpers_mod import get_rays, get_rays_ortho
 
 class ImgToPatch(object):
     def __init__(self, ray_sampler, hwf):
+        """Initialisiert ImgToPatch mit Ray-Sampler und Kamera-Parametern (H,W,focal)"""
         self.ray_sampler = ray_sampler
         self.hwf = hwf      # camera intrinsics
 
     def __call__(self, img):
+        """Extrahiert zu gesampelten Rays passende GT-Pixelwerte aus dem Bild"""
         rgbs = []
         for img_i in img:
             pose = torch.eye(4)         # use dummy pose to infer pixel values
@@ -29,6 +33,7 @@ class ImgToPatch(object):
 
 class RaySampler(object):
     def __init__(self, N_samples, orthographic=False):
+        """speichert Ray-Sampling-Parameter"""
         super(RaySampler, self).__init__()
         self.N_samples = N_samples
         self.scale = torch.ones(1,).float()
@@ -36,6 +41,7 @@ class RaySampler(object):
         self.orthographic = orthographic
 
     def __call__(self, H, W, focal, pose):
+        """erzeugt Rays und wählt basierend auf sample_rays() die gewünschten Pixelpositionen aus"""
         if self.orthographic:
             size_h, size_w = focal      # Hacky
             rays_o, rays_d = get_rays_ortho(H, W, pose, size_h, size_w)
@@ -69,20 +75,24 @@ class RaySampler(object):
         return torch.stack([rays_o, rays_d]), select_inds, hw
 
     def sample_rays(self, H, W):
+        """Abstrakte Methode - muss in Unterklassen überschrieben werden, bestimmt welche Pixel/Rays gewählt werden"""
         raise NotImplementedError
 
 
 class FullRaySampler(RaySampler):
     def __init__(self, **kwargs):
+        """Initialisiert einen Sampler, der immer alle Rays des Bildes zurückgibt"""
         super(FullRaySampler, self).__init__(N_samples=None, **kwargs)
 
     def sample_rays(self, H, W):
+        """gibt eine Liste aller Pixelindizes zurück - voller Bildraster"""
         return torch.arange(0, H*W)
 
 
 class FlexGridRaySampler(RaySampler):
     def __init__(self, N_samples, random_shift=True, random_scale=True, min_scale=0.25, max_scale=1., scale_anneal=-1,
                  **kwargs):
+        """erzeugt regelmäßiges NxN-Sampling-Grid in [-1,1] und aktiviert Patch-Sampling statt Index-Sampling"""
         self.N_samples_sqrt = int(sqrt(N_samples))
         super(FlexGridRaySampler, self).__init__(self.N_samples_sqrt**2, **kwargs)
 
@@ -105,6 +115,7 @@ class FlexGridRaySampler(RaySampler):
         self.scale_anneal = scale_anneal
 
     def sample_rays(self, H, W):
+        """skaliert und verschiebt das Grid zufällig, um zufälligen Bildpatch für das Training auszuwählen"""
 
         if self.scale_anneal>0:
             k_iter = self.iterations // 1000 * 3
