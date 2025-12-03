@@ -5,7 +5,7 @@ raynet_test.py — Segment-RayNet mit explizitem Train/Test-Split auf K Strahlen
 Beispielaufruf:
 
 python raynet_test.py \
-  --data /home/mnguest12/projects/thesis/RayNet/phantom_04/out/rays_train.npz \
+  --data /home/mnguest12/projects/thesis/RayNet/phantom_06/out/rays_train.npz \
   --device cuda \
   --epochs 40 \
   --batch_size 32 \

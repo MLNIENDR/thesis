@@ -119,6 +119,7 @@ def parse_args():
 
 
 def set_seed(seed: int):
+    # deterministische Seeds für Torch + NumPy, damit Runs reproduzierbar bleiben
     torch.manual_seed(seed)
     np.random.seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -128,9 +129,11 @@ def save_img(arr, path, title=None):
     """Robust PNG visualisation with optional logarithmic stretch."""
     import matplotlib.pyplot as plt
 
+    # Nan/Inf-Fälle abfangen, damit matplotlib nicht abstürzt
     if not np.isfinite(arr).all():
         arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
 
+    # Wertebereich auf 0..1 strecken, notfalls via Log-Scaling
     a_min, a_max = float(np.min(arr)), float(np.max(arr))
     if np.isclose(a_min, a_max):
         img = np.zeros_like(arr) if a_max == 0 else arr / (a_max + 1e-8)
@@ -170,6 +173,7 @@ def poisson_nll(
     Poisson Negative Log-Likelihood Loss für Emissions- oder Zähl-Daten.
     Erwartet nichtnegative 'pred' und 'target' (z. B. Intensitäten).
     """
+    # Stabilisierung über clamping, damit log() definiert bleibt
     pred = pred.clamp_min(eps).clamp_max(clamp_max)
     nll = pred - target * torch.log(pred)
     if weight is not None:
@@ -179,6 +183,7 @@ def poisson_nll(
 
 def normalize_counts(x: torch.Tensor, return_params: bool = False):
     """Normalise per projection to [0, 1] to stabilise the loss."""
+    # single-image Min/Max, damit unterschiedliche Counts vergleichbar werden
     minv = torch.amin(x)
     maxv = torch.amax(x)
     span = maxv - minv
@@ -203,6 +208,7 @@ def build_loss_weights(target: torch.Tensor, bg_weight: float, threshold: float)
 
 def build_pose_rays(generator, pose):
     """Pre-compute all rays for a fixed pose and keep them on the target device."""
+    # Ortho-Kamera nutzt ortho_size statt focal
     focal_or_size = generator.ortho_size if generator.orthographic else generator.focal
     rays_full, _, _ = generator.val_ray_sampler(generator.H, generator.W, focal_or_size, pose)
     return rays_full.to(generator.device, non_blocking=True)
@@ -210,6 +216,7 @@ def build_pose_rays(generator, pose):
 
 def slice_rays(rays_full: torch.Tensor, ray_idx: torch.Tensor) -> torch.Tensor:
     """Select a subset of rays (by linear indices) for a mini-batch."""
+    # rays_full hat Form (2, HW, 3) -> mit Indexliste extrahieren
     return torch.stack(
         (
             rays_full[0, ray_idx],
@@ -221,6 +228,7 @@ def slice_rays(rays_full: torch.Tensor, ray_idx: torch.Tensor) -> torch.Tensor:
 
 def render_minibatch(generator, z_latent, rays_subset, need_raw: bool = False, ct_context=None):
     """Render a mini-batch of rays from a fixed pose while keeping training kwargs."""
+    # train/test kwargs werden durch use_test_kwargs umgeschaltet
     render_kwargs = generator.render_kwargs_train if not generator.use_test_kwargs else generator.render_kwargs_test
     render_kwargs = dict(render_kwargs)
     render_kwargs["features"] = z_latent
@@ -235,6 +243,7 @@ def render_minibatch(generator, z_latent, rays_subset, need_raw: bool = False, c
 
 
 def maybe_render_preview(step, args, generator, z_eval, outdir, ct_volume=None, act_volume=None, ct_context=None):
+    # Volle AP/PA-Renderings sind teuer; nur alle N Schritte ausführen
     if args.preview_every <= 0 or (step % args.preview_every) != 0:
         return
     prev_flag = generator.use_test_kwargs
@@ -262,6 +271,7 @@ def maybe_render_preview(step, args, generator, z_eval, outdir, ct_volume=None, 
 
 
 def init_log_file(path: Path):
+    # CSV-Header nur einmal schreiben
     if path.exists():
         return
     with path.open("w", newline="") as f:
@@ -296,6 +306,7 @@ def append_log(path: Path, row):
 
 def save_checkpoint(step, generator, z_train, optimizer, scaler, ckpt_dir: Path):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    # Minimal-Checkpoint: coarse/fine Netze, Optimizer, AMP-Scaler
     state = {
         "step": step,
         "z_train": z_train.detach().cpu(),
@@ -327,6 +338,7 @@ def sample_act_points(act: torch.Tensor, nsamples: int, radius: float) -> Tuple[
     """Zufällige Voxel (coords, values) aus act.npy ziehen."""
     if act is None:
         raise ValueError("act tensor missing despite act-loss-weight > 0.")
+    # Unterscheide (1,D,H,W) vs (D,H,W)
     if act.dim() == 4:
         act = act.squeeze(0)
     D, H, W = act.shape[-3:]
@@ -379,6 +391,7 @@ def normalize_curve(arr: np.ndarray) -> np.ndarray:
 
 
 def save_depth_profile(step, generator, z_latent, ct_vol, act_vol, outdir: Path, proj_ap=None, proj_pa=None):
+    # Nur aktiv, wenn Ground Truth CT oder act existieren
     if ct_vol is None and act_vol is None:
         return
 
@@ -473,6 +486,7 @@ def save_depth_profile(step, generator, z_latent, ct_vol, act_vol, outdir: Path,
             return int(yx[0]), int(yx[1])
 
         if act_data is not None:
+            # Falls act verfügbar ist, gezielt Null-/Nicht-Null-Strahlen auswählen
             if act_masks is not None:
                 zero_mask, nonzero_mask = act_masks
             else:
@@ -565,6 +579,7 @@ def save_depth_profile(step, generator, z_latent, ct_vol, act_vol, outdir: Path,
             (x_coord.repeat(D), y_coord.repeat(D), z_coords),
             dim=1,
         )
+        # Vorhersage entlang der Tiefe an genau diesem Pixel extrahieren
         pred = query_emission_at_points(generator, z_latent, coords).detach().cpu().numpy()
         curves.append(normalize_curve(pred.copy()))
         labels.append("Aktivität (NeRF)")
@@ -632,6 +647,7 @@ def sample_ct_pairs(ct: torch.Tensor, nsamples: int, thresh: float, radius: floa
     D, H, W = ct.shape[-3:]
     if D < 2:
         return None
+    # Differenz entlang z, kleine Gradienten => weiches Gewebe -> Loss erzwingt glatte Emission
     diff = torch.abs(ct[1:, :, :] - ct[:-1, :, :])
     ct_max = torch.max(ct)
     rel_diff = diff / (ct_max + 1e-8) if ct_max > 0 else diff
@@ -715,6 +731,7 @@ def train():
     torch.nn.init.normal_(z_train, mean=0.0, std=1.0)
 
     # --- Sofortiger Smoke-Test ---
+    # Einmal vor dem eigentlichen Training rendern, um Setup/NaNs zu prüfen
     with torch.no_grad():
         generator.eval()
         generator.use_test_kwargs = True
@@ -737,6 +754,7 @@ def train():
         "ap": build_pose_rays(generator, generator.pose_ap),
         "pa": build_pose_rays(generator, generator.pose_pa),
     }
+    # Gesamtzahl der Pixel bestimmt die Maximalzahl möglicher Strahlen
     num_pixels = generator.H * generator.W
 
     rays_per_proj = args.rays_per_step or config["training"]["chunk"]
@@ -842,6 +860,7 @@ def train():
                 radius = generator.radius
                 if isinstance(radius, tuple):
                     radius = radius[1]
+                # Stichprobe aus act.npy und direkte Dichteabfrage im NeRF
                 coords, act_samples = sample_act_points(act_vol, args.act_samples, radius=radius)
                 pred_act = query_emission_at_points(generator, z_latent, coords)
                 loss_act = F.l1_loss(pred_act, act_samples)
@@ -857,6 +876,7 @@ def train():
                     coords1, coords2, weights = ct_pairs
                     pred1 = query_emission_at_points(generator, z_latent, coords1)
                     pred2 = query_emission_at_points(generator, z_latent, coords2)
+                    # Loss zwingt Emission auf flachen CT-Strecken zur Konstanz
                     loss_ct = torch.mean(torch.abs(pred1 - pred2) * weights)
                     loss = loss + args.ct_loss_weight * loss_ct
 

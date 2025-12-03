@@ -29,6 +29,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 
 try:
     import pydicom
@@ -127,47 +128,53 @@ def stack_and_save_npy(grouped: Dict[str, List[np.ndarray]], out_dir: Path) -> D
     return out_arrays
 
 
-from matplotlib.colors import LogNorm  # oben bei den Imports ergänzen
 
 def save_preview_png(view: str, arr: np.ndarray, out_dir: Path, name_suffix: str = "",
                      clip_percentile: float = 99.5, use_log: bool = False):
     """
-    arr: (n, H, W) oder (H, W) – wir erzeugen ein Summenbild und machen ein adaptives Windowing.
-    - clip_percentile: oberes Perzentil für vmax (z.B. 99.5), um Hotspots (Kalibrierquelle) abzuschneiden
-    - use_log: True -> log-Skalierung, False -> linear
+    arr: (n, H, W) oder (H, W)
+    erzeugt ein Summenbild und speichert PNG mit Colorbar.
     """
+    # --- Summenbild erzeugen ---
     if arr.ndim == 3:
         img = arr.sum(axis=0)
-    elif arr.ndim == 2:
-        img = arr
     else:
-        raise ValueError(f"Unerwartige arr.ndim={arr.ndim} für View='{view}'.")
-
+        img = arr
     img = img.astype(np.float32)
+
+    # --- Wertebereich bestimmen ---
     img_min = float(img.min())
     img_max = float(img.max())
 
-    # robustes vmax: oberes Perzentil, ignoriert Extrem-Hotspots
+    # oberes Perzentil als vmax (robust gegen Hotspots)
     vmax = float(np.percentile(img, clip_percentile))
     if vmax <= 0:
         vmax = img_max if img_max > 0 else 1.0
 
-    out_path = out_dir / f"preview_{view}{name_suffix}.png"
+    # --- Figure & Achsen ---
+    fig, ax = plt.subplots(figsize=(5, 7))
 
-    plt.figure(figsize=(5, 7))
+    # --- Darstellung (linear oder log) ---
     if use_log:
-        # für LogNorm brauchen wir vmin > 0
         vmin = max(img_min, vmax * 1e-4, 1e-3)
         norm = LogNorm(vmin=vmin, vmax=vmax)
-        plt.imshow(img, cmap="inferno", interpolation="nearest", norm=norm)
+        im = ax.imshow(img, cmap="inferno", norm=norm, interpolation="nearest")
     else:
-        plt.imshow(img, cmap="inferno", interpolation="nearest", vmin=0, vmax=vmax)
+        im = ax.imshow(img, cmap="inferno", vmin=0, vmax=vmax, interpolation="nearest")
 
-    plt.title(f"Planare Szinti – {view}{name_suffix}")
-    plt.axis("off")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    plt.close()
+    ax.set_title(f"Planare Szinti – {view}{name_suffix}")
+    ax.axis("off")
+
+    # --- Colorbar rechts außen (gut platziert!) ---
+    cbar = fig.colorbar(im, ax=ax, shrink=0.80, pad=0.03)
+    cbar.set_label("Intensity (a.u.)", rotation=90)
+
+    # --- Speichern ---
+    out_path = out_dir / f"preview_{view}{name_suffix}.png"
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
     print(f"[INFO] Preview gespeichert: {out_path} (vmax={vmax:.1f}, img_max={img_max:.1f})")
 
 
