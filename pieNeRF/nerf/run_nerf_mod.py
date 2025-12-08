@@ -420,10 +420,19 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
         mu_vals = sample_ct_volume(pts, ct_context)           # [N_rays, N_samples]
         if not torch.isfinite(mu_vals).all():
             raise ValueError("CT samples contain NaN/Inf values.")
-        # Grober Bereichscheck – erwartet sind hier Werte ~[0,1] (nach Normierung/Skalierung)
-        if ((mu_vals < -1e-3) | (mu_vals > 1.1)).any():
+        # Bereichscheck gegen den tatsächlichen μ-Wertebereich (nur Clamping-Warnung, keine Normierung).
+        value_range = ct_context.get("value_range")
+        if value_range is not None:
+            vmin, vmax = value_range
+            tol_low = float(vmin) - 1e-2 * max(1.0, abs(float(vmin)))
+            tol_high = float(vmax) + 1e-2 * max(1.0, abs(float(vmax)))
+            out_of_range = (mu_vals < tol_low) | (mu_vals > tol_high)
+            if out_of_range.any() and not ct_context.get("_range_warned", False):
+                warnings.warn(f"CT attenuation samples outside expected range [{vmin:.3g}, {vmax:.3g}] (after scaling).")
+                ct_context["_range_warned"] = True
+        elif ((mu_vals < -1e-3) | (mu_vals > 1.1)).any():
             if not ct_context.get("_range_warned", False):
-                warnings.warn("CT attenuation samples outside expected [0,1] range.")
+                warnings.warn("CT attenuation samples outside expected range (no reference range available).")
                 ct_context["_range_warned"] = True
     elif use_attenuation and ct_context is None:
         # use_attenuation=True, aber kein CT → einmalige Warnung, dann deaktiviere Attenuation intern

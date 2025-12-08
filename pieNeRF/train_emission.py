@@ -54,13 +54,25 @@ def parse_args():
     parser.add_argument(
         "--normalize-targets",
         action="store_true",
-        help="Apply per-projection min/max normalisation to both targets and predictions.",
+        help="(Deprecated) Apply per-projection min/max normalisation to both targets and predictions.",
+    )
+    parser.add_argument(
+        "--projection-normalization",
+        type=str,
+        default=None,
+        choices=["none", "per_dataset", "per_projection"],
+        help="Override data.projection_normalization from the config (none|per_dataset|per_projection).",
     )
     parser.add_argument(
         "--bg-weight",
         type=float,
         default=1.0,
         help="Down-weights Hintergrundstrahlen im Loss (<1 reduziert Null-Strahlen, 1 = deaktiviert).",
+    )
+    parser.add_argument(
+        "--no-val",
+        action="store_true",
+        help="Deaktiviert die periodische Test-Split-Evaluation (schnellere Läufe).",
     )
     parser.add_argument(
         "--weight-threshold",
@@ -172,6 +184,9 @@ def poisson_nll(
     """
     Poisson Negative Log-Likelihood Loss für Emissions- oder Zähl-Daten.
     Erwartet nichtnegative 'pred' und 'target' (z. B. Intensitäten).
+    Falls projizierte Zählraten global skaliert werden, müssen pred/target
+    konsistent dieselbe Skalierung durchlaufen – der Loss bleibt physikalisch
+    äquivalent (nur numerische Reskalierung).
     """
     # Stabilisierung über clamping, damit log() definiert bleibt
     pred = pred.clamp_min(eps).clamp_max(clamp_max)
@@ -181,20 +196,89 @@ def poisson_nll(
     return nll.mean()
 
 
-def normalize_counts(x: torch.Tensor, return_params: bool = False):
-    """Normalise per projection to [0, 1] to stabilise the loss."""
-    # single-image Min/Max, damit unterschiedliche Counts vergleichbar werden
-    minv = torch.amin(x)
-    maxv = torch.amax(x)
-    span = maxv - minv
-    applied = bool((span > 1e-8).item())
-    if applied:
-        norm = (x - minv) / (span + 1e-8)
+def scale_projections(
+    x: torch.Tensor,
+    mode: str,
+    dataset_scale: Optional[float],
+    global_scale: float = 1.0,
+    return_params: bool = False,
+):
+    """
+    Gemeinsame Skalierung für AP/PA-Projektionen:
+      - none: Rohcounts nur mit globalem Faktor multiplizieren.
+      - per_dataset: durch einen globalen Datensatzwert teilen (z. B. 99%-Quantil) und optional global skalieren.
+      - per_projection: Min/Max je Bild → [0,1], optional global skaliert (schwächt Poisson-Interpretation).
+    """
+    mode = (mode or "none").lower()
+    params = {"mode": mode, "global_scale": float(global_scale)}
+    eps = 1e-8
+    if mode == "per_projection":
+        minv = torch.amin(x, dim=1, keepdim=True)
+        maxv = torch.amax(x, dim=1, keepdim=True)
+        span = maxv - minv
+        applied = span > eps
+        norm = torch.where(applied, (x - minv) / (span + eps), torch.zeros_like(x))
+        norm = norm * params["global_scale"]
+        params.update({"min": minv, "max": maxv, "applied": applied})
+    elif mode == "per_dataset":
+        scale = float(dataset_scale) if dataset_scale is not None else 1.0
+        if scale <= eps:
+            scale = 1.0
+        params["scale"] = scale
+        norm = x * (params["global_scale"] / scale)
     else:
-        norm = torch.zeros_like(x)
+        params["scale"] = 1.0
+        norm = x * params["global_scale"]
     if return_params:
-        return norm, minv, maxv, applied
+        return norm, params
     return norm
+
+
+def apply_projection_scaling(pred: torch.Tensor, params: dict) -> torch.Tensor:
+    """Wendet dieselbe Skalierung wie scale_projections() auf Modellvorhersagen an."""
+    if params is None:
+        return pred
+    mode = params.get("mode", "none")
+    global_scale = float(params.get("global_scale", 1.0))
+    eps = 1e-8
+    if mode == "per_projection":
+        minv = params["min"]
+        maxv = params["max"]
+        span = (maxv - minv).clamp_min(eps)
+        applied = params["applied"]
+        scaled = (pred - minv) / span
+        scaled = scaled * global_scale
+        scaled = torch.where(applied, scaled, torch.zeros_like(scaled))
+    elif mode == "per_dataset":
+        scale = float(params.get("scale", 1.0))
+        if scale <= eps:
+            scale = 1.0
+        scaled = pred * (global_scale / scale)
+    else:
+        scaled = pred * global_scale
+    return scaled
+
+
+def build_ray_split(num_pixels: int, split_ratio: float, device: torch.device):
+    """
+    Erzeuge einen festen Train/Test-Split über alle Rays einer Ansicht.
+    Split ist reproduzierbar, weil der globale Seed (set_seed) bereits gesetzt wurde.
+    """
+    ratio = float(split_ratio)
+    ratio = 0.0 if ratio < 0 else (1.0 if ratio > 1.0 else ratio)
+    perm = torch.randperm(num_pixels, device=device)
+    n_train = int(math.ceil(num_pixels * ratio))
+    train_idx = perm[:n_train]
+    test_idx = perm[n_train:]
+    return {"train": train_idx, "test": test_idx}
+
+
+def sample_split_indices(split_tensor: torch.Tensor, count: int) -> torch.Tensor:
+    """Ziehe zufällige Indizes aus einem vorgegebenen Split (keine neuen Rays von der Gegenseite)."""
+    if split_tensor.numel() <= count:
+        return split_tensor
+    rand_idx = torch.randint(0, split_tensor.numel(), (count,), device=split_tensor.device)
+    return split_tensor[rand_idx]
 
 
 def build_loss_weights(target: torch.Tensor, bg_weight: float, threshold: float) -> Optional[torch.Tensor]:
@@ -292,6 +376,11 @@ def init_log_file(path: Path):
                 "pred_mean_pa",
                 "pred_std_ap",
                 "pred_std_pa",
+                "loss_test",
+                "psnr_ap_test",
+                "psnr_pa_test",
+                "mae_ap_test",
+                "mae_pa_test",
                 "iter_ms",
                 "lr",
             ]
@@ -332,6 +421,79 @@ def compute_psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
     if mse <= 0:
         return float("inf")
     return -10.0 * math.log10(mse + 1e-12)
+
+
+def evaluate_split(
+    generator,
+    z_latent,
+    rays_cache,
+    ray_indices,
+    split: str,
+    ap_flat_proc: torch.Tensor,
+    pa_flat_proc: torch.Tensor,
+    ap_scale_params: dict,
+    pa_scale_params: dict,
+    rays_per_proj_eval: int,
+    bg_weight: float,
+    weight_threshold: float,
+    ct_context=None,
+):
+    """Evaluiert Poisson-NLL/PSNR auf einem festen Split (train/test) ohne Gradienten."""
+    idx_ap_all = ray_indices["ap"].get(split)
+    idx_pa_all = ray_indices["pa"].get(split)
+    if idx_ap_all is None or idx_pa_all is None or idx_ap_all.numel() == 0 or idx_pa_all.numel() == 0:
+        return None
+
+    n_ap = min(idx_ap_all.numel(), rays_per_proj_eval)
+    n_pa = min(idx_pa_all.numel(), rays_per_proj_eval)
+    idx_ap = sample_split_indices(idx_ap_all, n_ap)
+    idx_pa = sample_split_indices(idx_pa_all, n_pa)
+
+    prev_flag = generator.use_test_kwargs
+    # Eval-Mode aktivieren (kein Grad, festes Test-Split)
+    generator.eval()
+    generator.use_test_kwargs = True
+    with torch.no_grad():
+        ray_batch_ap = slice_rays(rays_cache["ap"], idx_ap)
+        ray_batch_pa = slice_rays(rays_cache["pa"], idx_pa)
+
+        pred_ap, _ = render_minibatch(generator, z_latent, ray_batch_ap, need_raw=False, ct_context=ct_context)
+        pred_pa, _ = render_minibatch(generator, z_latent, ray_batch_pa, need_raw=False, ct_context=ct_context)
+
+        target_ap = ap_flat_proc[0, idx_ap].unsqueeze(0)
+        target_pa = pa_flat_proc[0, idx_pa].unsqueeze(0)
+
+        pred_ap_raw = pred_ap.clamp_min(1e-8)
+        pred_pa_raw = pred_pa.clamp_min(1e-8)
+        pred_ap = apply_projection_scaling(pred_ap_raw, ap_scale_params)
+        pred_pa = apply_projection_scaling(pred_pa_raw, pa_scale_params)
+
+        weight_ap = build_loss_weights(target_ap, bg_weight, weight_threshold)
+        weight_pa = build_loss_weights(target_pa, bg_weight, weight_threshold)
+        loss_ap = poisson_nll(pred_ap, target_ap, weight=weight_ap)
+        loss_pa = poisson_nll(pred_pa, target_pa, weight=weight_pa)
+        loss_total = loss_ap + loss_pa
+
+        psnr_ap = compute_psnr(pred_ap, target_ap)
+        psnr_pa = compute_psnr(pred_pa, target_pa)
+        mae_ap = torch.mean(torch.abs(pred_ap - target_ap)).item()
+        mae_pa = torch.mean(torch.abs(pred_pa - target_pa)).item()
+
+    # Ursprünglichen Modus wiederherstellen (Train/Eval + use_test_kwargs)
+    if prev_flag:
+        generator.eval()
+    else:
+        generator.train()
+
+    return {
+        "loss": loss_total.item(),
+        "loss_ap": loss_ap.item(),
+        "loss_pa": loss_pa.item(),
+        "psnr_ap": psnr_ap,
+        "psnr_pa": psnr_pa,
+        "mae_ap": mae_ap,
+        "mae_pa": mae_pa,
+    }
 
 
 def sample_act_points(act: torch.Tensor, nsamples: int, radius: float) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -690,6 +852,21 @@ def train():
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
 
+    data_cfg = config.setdefault("data", {})
+    if args.normalize_targets:
+        print("⚠️ --normalize-targets ist veraltet – setze projection_normalization=per_projection für Kompatibilität.", flush=True)
+        data_cfg["projection_normalization"] = "per_projection"
+    if args.projection_normalization is not None:
+        data_cfg["projection_normalization"] = args.projection_normalization
+    data_cfg.setdefault("projection_normalization", "none")
+    data_cfg.setdefault("projection_quantile", 0.99)
+    data_cfg.setdefault("projection_scale", None)
+    data_cfg.setdefault("projection_global_scale", 1.0)
+    data_cfg.setdefault("act_scale", 1.0)
+    data_cfg.setdefault("ray_split_ratio", 0.8)
+    training_cfg = config.setdefault("training", {})
+    training_cfg.setdefault("val_interval", 0)
+
     print(f"📂 CWD: {Path.cwd().resolve()}", flush=True)
     outdir = Path(config.get("training", {}).get("outdir", "./results_spect")).expanduser().resolve()
     (outdir / "preview").mkdir(parents=True, exist_ok=True)
@@ -714,6 +891,25 @@ def train():
         pin_memory=True,
         drop_last=False,
     )
+
+    projection_mode = data_cfg.get("projection_normalization", "none").lower()
+    projection_dataset_scale = getattr(dataset, "dataset_projection_scale", None)
+    projection_global_scale = float(data_cfg.get("projection_global_scale", 1.0))
+    act_global_scale = float(data_cfg.get("act_scale", 1.0))
+    if projection_mode == "per_dataset" and projection_dataset_scale is None:
+        print("⚠️ projection_normalization=per_dataset gesetzt, aber kein Datensatz-Scale berechnet – verwende Faktor 1.0.", flush=True)
+    if projection_mode == "per_dataset" and projection_dataset_scale is not None:
+        print(
+            f"ℹ️ Projektionen werden global durch {projection_dataset_scale:.3e} geteilt "
+            f"(quantile={data_cfg.get('projection_quantile', 0.99)}), anschließend globaler Faktor {projection_global_scale}.",
+            flush=True,
+        )
+    if projection_global_scale != 1.0:
+        print(f"ℹ️ Zusätzlicher Projektions-Scale-Faktor: x{projection_global_scale}", flush=True)
+    if act_global_scale != 1.0:
+        print(f"ℹ️ ACT/λ globaler Faktor (im Loader angewandt): x{act_global_scale}", flush=True)
+    ray_split_ratio = float(data_cfg.get("ray_split_ratio", 0.8))
+    val_interval = int(training_cfg.get("val_interval", 0) or 0)
 
     generator = build_models(config)
     generator.to(device)
@@ -756,6 +952,16 @@ def train():
     }
     # Gesamtzahl der Pixel bestimmt die Maximalzahl möglicher Strahlen
     num_pixels = generator.H * generator.W
+    # Fester Train/Test-Split pro View (reproduzierbar via globalem Seed).
+    ray_indices = {
+        "ap": build_ray_split(num_pixels, ray_split_ratio, device),
+        "pa": build_ray_split(num_pixels, ray_split_ratio, device),
+    }
+    print(
+        f"🔀 Ray-Split (AP/PA): train={ray_indices['ap']['train'].numel()} / test={ray_indices['ap']['test'].numel()} "
+        f"(ratio={ray_split_ratio})",
+        flush=True,
+    )
 
     rays_per_proj = args.rays_per_step or config["training"]["chunk"]
     if rays_per_proj <= 0:
@@ -800,25 +1006,24 @@ def train():
             ct_vol = ct_vol.to(device, non_blocking=True).float()
         ct_context = generator.build_ct_context(ct_vol) if ct_vol is not None else None
 
+        # Projektionen rein numerisch skalieren (Config-gesteuert), ohne λ/μ inhaltlich zu normalisieren.
         ap_flat = ap.view(batch_size, -1)
         pa_flat = pa.view(batch_size, -1)
 
-        if args.normalize_targets:
-            ap_flat_proc, ap_min, ap_max, ap_norm_active = normalize_counts(ap_flat, return_params=True)
-            pa_flat_proc, pa_min, pa_max, pa_norm_active = normalize_counts(pa_flat, return_params=True)
-        else:
-            ap_flat_proc = ap_flat
-            pa_flat_proc = pa_flat
-            ap_min = pa_min = ap_max = pa_max = None
-            ap_norm_active = pa_norm_active = False
+        ap_flat_proc, ap_scale_params = scale_projections(
+            ap_flat, projection_mode, projection_dataset_scale, projection_global_scale, return_params=True
+        )
+        pa_flat_proc, pa_scale_params = scale_projections(
+            pa_flat, projection_mode, projection_dataset_scale, projection_global_scale, return_params=True
+        )
 
         z_latent = z_train
 
         optimizer.zero_grad(set_to_none=True)
         t0 = time.perf_counter()
 
-        idx_ap = torch.randint(0, num_pixels, (rays_per_proj,), device=device)
-        idx_pa = torch.randint(0, num_pixels, (rays_per_proj,), device=device)
+        idx_ap = sample_split_indices(ray_indices["ap"]["train"], rays_per_proj)
+        idx_pa = sample_split_indices(ray_indices["pa"]["train"], rays_per_proj)
 
         ray_batch_ap = slice_rays(rays_cache["ap"], idx_ap)
         ray_batch_pa = slice_rays(rays_cache["pa"], idx_pa)
@@ -835,15 +1040,11 @@ def train():
             target_pa = pa_flat_proc[0, idx_pa].unsqueeze(0)
 
             # Poisson-NLL erwartet pred >= 0
-            pred_ap = pred_ap.clamp_min(1e-8)
-            pred_pa = pred_pa.clamp_min(1e-8)
+            pred_ap_raw = pred_ap.clamp_min(1e-8)
+            pred_pa_raw = pred_pa.clamp_min(1e-8)
 
-            if args.normalize_targets and ap_norm_active:
-                scale_ap = (ap_max - ap_min).clamp_min(1e-8)
-                pred_ap = (pred_ap - ap_min) / scale_ap
-            if args.normalize_targets and pa_norm_active:
-                scale_pa = (pa_max - pa_min).clamp_min(1e-8)
-                pred_pa = (pred_pa - pa_min) / scale_pa
+            pred_ap = apply_projection_scaling(pred_ap_raw, ap_scale_params)
+            pred_pa = apply_projection_scaling(pred_pa_raw, pa_scale_params)
 
             weight_ap = build_loss_weights(target_ap, args.bg_weight, args.weight_threshold)
             weight_pa = build_loss_weights(target_pa, args.bg_weight, args.weight_threshold)
@@ -896,10 +1097,31 @@ def train():
         with torch.no_grad():
             mae_ap = torch.mean(torch.abs(pred_ap - target_ap)).item()
             mae_pa = torch.mean(torch.abs(pred_pa - target_pa)).item()
-            pred_mean = (pred_ap.mean().item(), pred_pa.mean().item())
+            pred_mean = (pred_ap.mean().item(), pred_pa.mean().item())              # skaliert gemäß Projektnorm
             pred_std = (pred_ap.std().item(), pred_pa.std().item())
+            pred_mean_raw = (pred_ap_raw.mean().item(), pred_pa_raw.mean().item())  # physikalischer Maßstab
+            pred_std_raw = (pred_ap_raw.std().item(), pred_pa_raw.std().item())
             psnr_ap = compute_psnr(pred_ap, target_ap)
             psnr_pa = compute_psnr(pred_pa, target_pa)
+            val_stats = None
+            if val_interval > 0 and (step % val_interval) == 0 and (not args.no_val):
+                # Test-Split evaluiert strikt auf den fixen Test-Rays, Gradienten bleiben aus.
+                rays_eval = rays_per_proj
+                val_stats = evaluate_split(
+                    generator,
+                    z_latent.detach(),
+                    rays_cache,
+                    ray_indices,
+                    split="test",
+                    ap_flat_proc=ap_flat_proc,
+                    pa_flat_proc=pa_flat_proc,
+                    ap_scale_params=ap_scale_params,
+                    pa_scale_params=pa_scale_params,
+                    rays_per_proj_eval=rays_eval,
+                    bg_weight=args.bg_weight,
+                    weight_threshold=args.weight_threshold,
+                    ct_context=ct_context,
+                )
             if args.debug_zero_var:
                 targ_std = (target_ap.std().item(), target_pa.std().item())
                 if pred_std[0] < 1e-7 or pred_std[1] < 1e-7:
@@ -920,14 +1142,26 @@ def train():
                         flush=True,
                     )
 
-        print(
+        val_loss = val_stats["loss"] if val_stats is not None else None
+        val_psnr_ap = val_stats["psnr_ap"] if val_stats is not None else None
+        val_psnr_pa = val_stats["psnr_pa"] if val_stats is not None else None
+        val_mae_ap = val_stats["mae_ap"] if val_stats is not None else None
+        val_mae_pa = val_stats["mae_pa"] if val_stats is not None else None
+
+        msg = (
             f"[step {step:05d}] loss={loss.item():.6f} | ap={loss_ap.item():.6f} | pa={loss_pa.item():.6f} "
             f"| act={loss_act.item():.6f} | ct={loss_ct.item():.6f} | zreg={loss_reg.item():.6f} "
             f"| mae_ap={mae_ap:.6f} | mae_pa={mae_pa:.6f} "
             f"| psnr_ap={psnr_ap:.2f} | psnr_pa={psnr_pa:.2f} "
-            f"| predμ=({pred_mean[0]:.3e},{pred_mean[1]:.3e}) predσ=({pred_std[0]:.3e},{pred_std[1]:.3e})",
-            flush=True
+            f"| predμ_raw=({pred_mean_raw[0]:.3e},{pred_mean_raw[1]:.3e}) predσ_raw=({pred_std_raw[0]:.3e},{pred_std_raw[1]:.3e}) "
+            f"| predμ=({pred_mean[0]:.3e},{pred_mean[1]:.3e}) predσ=({pred_std[0]:.3e},{pred_std[1]:.3e})"
         )
+        if val_stats is not None:
+            msg += (
+                f" | test_loss={val_loss:.6f} | test_psnr_ap={val_psnr_ap:.2f} | test_psnr_pa={val_psnr_pa:.2f} "
+                f"| test_mae_ap={val_mae_ap:.6f} | test_mae_pa={val_mae_pa:.6f}"
+            )
+        print(msg, flush=True)
         append_log(
             log_path,
             [
@@ -945,6 +1179,11 @@ def train():
                 pred_mean[1],
                 pred_std[0],
                 pred_std[1],
+                val_loss,
+                val_psnr_ap,
+                val_psnr_pa,
+                val_mae_ap,
+                val_mae_pa,
                 iter_ms,
                 optimizer.param_groups[0]["lr"],
             ],

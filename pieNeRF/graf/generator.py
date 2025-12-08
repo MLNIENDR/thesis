@@ -379,6 +379,8 @@ class Generator(object):
 
         vmin = float(vol.min().item())
         vmax = float(vol.max().item())
+        # μ-Werte werden hier unverändert (bis auf das vorab angewandte Skalieren, z. B. ×10) verwendet,
+        # keine zusätzliche Normalisierung – value_range dient nur für Plausibilitätschecks.
         vol = vol.contiguous().to(self.device, non_blocking=True)
         return {
             "volume": vol,
