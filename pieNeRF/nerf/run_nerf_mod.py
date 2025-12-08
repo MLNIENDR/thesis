@@ -2,6 +2,7 @@
 
 import numpy as np
 import warnings
+import random
 import torch
 import torch.nn.functional as F
 
@@ -247,6 +248,7 @@ def raw2outputs_emission(
     mu_vals=None,
     use_attenuation=False,
     attenuation_debug=False,
+    debug_prints: bool = False,
 ):
     """
     Emissions-NeRF:
@@ -323,6 +325,24 @@ def raw2outputs_emission(
 
     # Line-Integral entlang des Strahls
     proj_map = torch.sum(weights, dim=-1)                        # [N_rays]
+
+    if debug_prints and random.randint(0, 50) == 0:
+        lam_min, lam_max = e.min().item(), e.max().item()
+        w_min, w_max = weights.min().item(), weights.max().item()
+        mu_min = mu_max = float("nan")
+        trans_min = trans_max = float("nan")
+        if mu_vals is not None:
+            mu_min, mu_max = mu_vals.min().item(), mu_vals.max().item()
+        if use_attenuation and transmission is not None:
+            trans_min, trans_max = transmission.min().item(), transmission.max().item()
+        print(
+            f"[DEBUG][raw2outputs_emission] λ min/max: {lam_min:.3e}/{lam_max:.3e} | "
+            f"μ min/max: {mu_min:.3e}/{mu_max:.3e} | "
+            f"T min/max: {trans_min:.3e}/{trans_max:.3e} | "
+            f"weights min/max: {w_min:.3e}/{w_max:.3e} | "
+            f"proj min/max: {proj_map.min().item():.3e}/{proj_map.max().item():.3e}",
+            flush=True,
+        )
 
     # "Tiefe" = gewichtetes Mittel der z-Positionen
     depth_map = torch.sum(z_vals * weights, dim=-1) / (proj_map + 1e-8)
@@ -413,6 +433,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
     ct_context = kwargs.get("ct_context")
     use_attenuation = bool(kwargs.get("use_attenuation", False))
     attenuation_debug = bool(kwargs.get("attenuation_debug", False))
+    debug_prints = bool(kwargs.get("debug_prints", False))
     mu_vals = None
 
     # Falls Attenuation aktiviert und CT-Context vorhanden: µ aus CT sampeln
@@ -452,6 +473,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
             mu_vals=mu_vals,
             use_attenuation=use_attenuation,
             attenuation_debug=attenuation_debug,
+            debug_prints=debug_prints,
         )
         # Standard-Outputs
         ret = {'proj_map': proj_map, 'disp_map': disp_map, 'acc_map': acc_map}

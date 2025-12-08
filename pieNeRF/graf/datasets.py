@@ -22,10 +22,6 @@ class SpectDataset(torch.utils.data.Dataset):
         imsize=None,
         transform_img=None,
         transform_ct=None,
-        projection_normalization: str = "none",
-        projection_quantile: float = 0.99,
-        projection_scale: float = None,
-        projection_global_scale: float = 1.0,
         act_scale: float = 1.0,
     ):  
         super().__init__()
@@ -33,12 +29,7 @@ class SpectDataset(torch.utils.data.Dataset):
         self.imsize = imsize                                                    # momentan nicht genutzt
         self.transform_img = transform_img                                      # optionale Transformationsfunktionen für AP/PA und CT
         self.transform_ct = transform_ct                                        # "
-        self.projection_normalization = projection_normalization                # Steuerung der Projektskalen: none | per_dataset | per_projection
-        self.projection_quantile = projection_quantile                          # Quantil für per_dataset-Skalierung (z.B. 0.99)
-        self.projection_global_scale = float(projection_global_scale)           # fester globaler Faktor (nur Skalierung, keine Normierung)
-        self.projection_scale_override = projection_scale                       # optionaler fixer Max/Quantilwert
         self.act_scale = float(act_scale)                                       # globaler Faktor für ACT/λ (keine Normierung)
-        self.dataset_projection_scale = None                                    # wird bei per_dataset gesetzt
 
         self.entries = []                                                       # Liste in der für jeden Fall ein kleines Dict mit Pfaden & ID steht
         with open(self.manifest_path, newline="") as f:                         # CSV öffnen
@@ -59,17 +50,6 @@ class SpectDataset(torch.utils.data.Dataset):
                     "ct_path": Path(row["ct_path"]),
                     "act_path": act_path,
                 })
-
-        # Falls eine datensatzweite Projektskalierung gewünscht ist: einmalig berechnen.
-        if self.projection_normalization == "per_dataset":
-            if self.projection_scale_override is not None:
-                self.dataset_projection_scale = float(self.projection_scale_override)
-            else:
-                self.dataset_projection_scale = self._estimate_projection_scale(self.projection_quantile)
-        elif self.projection_scale_override is not None:
-            # fester Faktor erzwingen, auch wenn keine Normalisierung aktiv ist (z. B. zum Rescalen der Trainingszählraten)
-            self.dataset_projection_scale = float(self.projection_scale_override)
-
 
     def __len__(self):
         return len(self.entries)                                                # Anzahl der Einträge = Anzahl Zeilen im Manifest = Anzahl Phantome/Patienten
@@ -117,11 +97,25 @@ class SpectDataset(torch.utils.data.Dataset):
         ct = self._load_npy_ct(e["ct_path"])                                    # lädt CT Volumen (gescaled)  
         act = self._load_npy_act(e["act_path"])                                 # lädt ACT Volumen (ohne Normierung, nur globaler Faktor)
 
+        ap = self._normalize_projection(ap)
+        pa = self._normalize_projection(pa)
+
         if self.transform_img is not None:                                      # optionale zusätzliche Schritte (z.B. Resize, Cropping, ...)
             ap = self.transform_img(ap)
             pa = self.transform_img(pa)
         if self.transform_ct is not None:
             ct = self.transform_ct(ct)
+
+        # Debug-Ausgabe nur beim ersten Item, um Skalen zu prüfen (kein Einfluss auf Verhalten).
+        if idx == 0:
+            print(
+                f"[DEBUG][datasets] AP min/max: {ap.min().item():.3e}/{ap.max().item():.3e} | "
+                f"PA min/max: {pa.min().item():.3e}/{pa.max().item():.3e} | "
+                f"CT min/max: {ct.min().item():.3e}/{ct.max().item():.3e} | "
+                f"ACT min/max: {(act.min().item() if act.numel()>0 else float('nan')):.3e}/"
+                f"{(act.max().item() if act.numel()>0 else float('nan')):.3e}",
+                flush=True,
+            )
 
         return {                                                                # Rückgabe ist ein Dictionary   
             "ap": ap,
@@ -130,25 +124,13 @@ class SpectDataset(torch.utils.data.Dataset):
             "act": act,
             "meta": {
                 "patient_id": e["patient_id"],
-                "projection_normalization": self.projection_normalization,
-                "projection_dataset_scale": self.dataset_projection_scale,
-                "projection_global_scale": self.projection_global_scale,
                 "act_scale": self.act_scale,
             },
         }
 
-    def _estimate_projection_scale(self, quantile: float) -> float:
-        """Bestimme einmalig ein globales Skalierungsmaß (z.B. 99%-Quantil) über alle Projektionen."""
-        q = np.clip(float(quantile), 0.0, 1.0)
-        candidates = []
-        for entry in self.entries:
-            for key in ("ap_path", "pa_path"):
-                path = entry[key]
-                arr = np.load(path).astype(np.float32)
-                if arr.size == 0:
-                    continue
-                candidates.append(np.quantile(arr, q))
-        if not candidates:
-            return 1.0
-        max_q = float(np.max(candidates))
-        return max_q if max_q > 0 else 1.0
+    def _normalize_projection(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Einfache per-Projektion-Normierung auf [0,1], wie im ursprünglichen Code."""
+        maxv = tensor.max()
+        if maxv > 0:
+            tensor = tensor / maxv
+        return tensor

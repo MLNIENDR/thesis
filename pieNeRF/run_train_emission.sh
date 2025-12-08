@@ -41,5 +41,6 @@ srun python -u train_emission.py \
     --ct-threshold 0.05 \
     --ct-samples 8192 \
     --z-reg-weight 1e-4
-#       --normalize-targets \
+#   --no-val \                # kommentieren, falls Valuation deaktiviert werden soll
+#   --max-steps 60 \          # kleiner setzen für schnelle Smoke-Tests
 echo "✅ Training finished at: $(date)"

@@ -16,11 +16,8 @@ data:
   # Fester Ray-Split für Train/Test (reproduzierbar via globalem Seed)
   ray_split_ratio: 0.8                          # Anteil der Rays pro View für das Training (Rest = Test)
 
-  # Projektskalierung: "none" (Rohcounts), "per_dataset" (globales Quantil), "per_projection" (altes Verhalten, schwächt Poisson-Interpretation)
-  projection_normalization: per_dataset
-  projection_quantile: 0.99                     # nur relevant für per_dataset; 0.99 ≈ robustes Max
-  projection_scale: null                        # optional fester Max/Quantil-Wert (überschreibt projection_quantile)
-  projection_global_scale: 1.0                  # zusätzlicher konstanter Faktor für alle Projektionen (reine numerische Skalierung)
+  # Projektionen werden pro Bild auf [0,1] normiert (wie im ursprünglichen Setup)
+  projection_normalization: none
   act_scale: 1.0                                # globaler λ-Faktor (keine Normierung; für konsistente Skalen zu Projekten anpassen)
 
 
@@ -135,4 +132,4 @@ training:
   save_every: 500
   backup_every: 0
   video_every: 0
-  val_interval: 500           # alle N Schritte Test-Split evaluieren (<=0: deaktiviert)
+  val_interval: 200           # alle N Schritte Test-Split evaluieren (<=0: deaktiviert)
