@@ -95,6 +95,7 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     """Wendet 'render_rays' blockweise auf große Ray-Mengen an. Nutzt Chunking, damit GPU verträglich"""
     all_ret = {}
     features = kwargs.get('features')
+    tv_vals = []
     # blockweise über die Rays iterieren
     for i in range(0, rays_flat.shape[0], chunk):
         # z-Features passend mitschneiden
@@ -102,6 +103,9 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
             kwargs['features'] = features[i:i+chunk]
         # rendern eines Blockes
         ret = render_rays(rays_flat[i:i+chunk], **kwargs)
+        tv_val = ret.pop("tv_loss", None)
+        if tv_val is not None:
+            tv_vals.append(tv_val)
         # Ergebnisse sammeln
         for k in ret:
             if k not in all_ret:
@@ -109,6 +113,8 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
             all_ret[k].append(ret[k])
     # alle Blöcke wieder zu vollständigen Outputs zusammenfügen
     all_ret = {k: torch.cat(all_ret[k], 0) for k in all_ret}
+    if tv_vals:
+        all_ret["tv_loss"] = torch.stack(tv_vals).mean()
     return all_ret
 
 
@@ -215,10 +221,13 @@ def render(H, W, focal, chunk=1024*32, rays=None, c2w=None,
     # Renderin in Chunks aufteilen
     # ---------------------------
     all_ret = batchify_rays(rays, chunk, **kwargs)
+    tv_loss = all_ret.pop("tv_loss", None)
     # zurück in Bildform [H, W, ...]
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = torch.reshape(all_ret[k], k_sh)
+    if tv_loss is not None:
+        all_ret["tv_loss"] = tv_loss
 
     # ---------------------------
     # Projektion extrahieren
@@ -279,22 +288,28 @@ def raw2outputs_emission(
     dists = dists * ray_norm                                    # [N_rays, N_samples]
 
     # Emission >= 0 erzwingen (Softplus statt ReLU, um small-gradients bei kleinen Werten zu vermeiden)
-    e = F.softplus(raw[..., 0])                                 # [N_rays, N_samples]
+    lambda_vals = F.softplus(raw[..., 0])                       # [N_rays, N_samples]
 
     # Optionales Trainingsrauschen auf Emissionen (wie in Original-NeRF bei sigma)
     if raw_noise_std > 0.0:
-        noise = torch.randn_like(e) * raw_noise_std
+        noise = torch.randn_like(lambda_vals) * raw_noise_std
         if pytest:
             # deterministisches Rauschen bei Tests (NumPy-Seed)
             np.random.seed(0)
-            noise_np = np.random.rand(*list(e.shape)) * raw_noise_std
-            noise = torch.tensor(noise_np, dtype=e.dtype, device=e.device)
+            noise_np = np.random.rand(*list(lambda_vals.shape)) * raw_noise_std
+            noise = torch.tensor(noise_np, dtype=lambda_vals.dtype, device=lambda_vals.device)
         # Rauschen addieren und unten bei 0 abschneiden
-        e = torch.clamp(e + noise, min=0.0)
+        lambda_vals = torch.clamp(lambda_vals + noise, min=0.0)
+
+    # 1D-TV entlang der Samples (Charbonnier-Variante für stabile Gradienten)
+    diff = lambda_vals[..., 1:] - lambda_vals[..., :-1]
+    eps = 1e-6
+    tv_ray = torch.sqrt(diff * diff + eps)
+    tv_loss = tv_ray.mean()
 
     transmission = None
     # Grundfall: keine Attenuation → einfache Gewichte = e * Δs
-    weights = e * dists
+    weights = lambda_vals * dists
 
     if use_attenuation:
         if mu_vals is None:
@@ -303,8 +318,8 @@ def raw2outputs_emission(
         else:
             # µ nicht negativ werden lassen (physikalisch: keine Verstärkung)
             mu = torch.clamp(mu_vals, min=0.0)
-            if mu.shape != e.shape:
-                raise ValueError(f"CT samples have wrong shape {mu.shape}, expected {e.shape}.")
+            if mu.shape != lambda_vals.shape:
+                raise ValueError(f"CT samples have wrong shape {mu.shape}, expected {lambda_vals.shape}.")
 
             # µ * Δs → lineare Dämpfung pro Segment
             mu_dists = mu * dists                                # [N_rays, N_samples]
@@ -321,13 +336,13 @@ def raw2outputs_emission(
             transmission = torch.exp(-attenuation)               # [N_rays, N_samples]
 
             # Gewichte jetzt: e * T * Δs
-            weights = e * transmission * dists
+            weights = lambda_vals * transmission * dists
 
     # Line-Integral entlang des Strahls
     proj_map = torch.sum(weights, dim=-1)                        # [N_rays]
 
     if debug_prints and random.randint(0, 50) == 0:
-        lam_min, lam_max = e.min().item(), e.max().item()
+        lam_min, lam_max = lambda_vals.min().item(), lambda_vals.max().item()
         w_min, w_max = weights.min().item(), weights.max().item()
         mu_min = mu_max = float("nan")
         trans_min = trans_max = float("nan")
@@ -355,7 +370,7 @@ def raw2outputs_emission(
     debug_payload = None
     if attenuation_debug:
         debug_payload = {
-            "debug_lambda": e.detach(),
+            "debug_lambda": lambda_vals.detach(),
             "debug_dists": dists.detach(),
             "debug_weights": weights.detach(),
         }
@@ -364,7 +379,7 @@ def raw2outputs_emission(
         if transmission is not None:
             debug_payload["debug_transmission"] = transmission.detach()
 
-    return proj_map, disp_map, acc_map, debug_payload
+    return proj_map, disp_map, acc_map, debug_payload, tv_loss
 
 
 # ---------------------------
@@ -464,7 +479,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
 
     # Emissions-Pfad (SPECT)
     if emission:
-        proj_map, disp_map, acc_map, debug_payload = raw2outputs_emission(
+        proj_map, disp_map, acc_map, debug_payload, tv_loss = raw2outputs_emission(
             raw,
             z_vals,
             rays_d,
@@ -476,7 +491,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
             debug_prints=debug_prints,
         )
         # Standard-Outputs
-        ret = {'proj_map': proj_map, 'disp_map': disp_map, 'acc_map': acc_map}
+        ret = {'proj_map': proj_map, 'disp_map': disp_map, 'acc_map': acc_map, 'tv_loss': tv_loss}
         # Debug-Infos aus raw2outputs_emission übernehmen
         if debug_payload:
             ret.update(debug_payload)

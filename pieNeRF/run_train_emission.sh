@@ -35,12 +35,11 @@ srun python -u train_emission.py \
     --save-every 100 \
     --bg-weight 0.1 \
     --weight-threshold 0.0 \
-    --act-loss-weight 0.05 \
+    --act-loss-weight 0.15 \
     --act-samples 4096 \
     --ct-loss-weight 0.05 \
     --ct-threshold 0.05 \
     --ct-samples 8192 \
-    --z-reg-weight 1e-4
-#   --no-val \                # kommentieren, falls Valuation deaktiviert werden soll
-#   --max-steps 60 \          # kleiner setzen für schnelle Smoke-Tests
+    --z-reg-weight 1e-4 \
+    --tv-weight 0.005
 echo "✅ Training finished at: $(date)"

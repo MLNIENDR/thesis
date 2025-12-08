@@ -123,6 +123,12 @@ def parse_args():
         help="Anzahl CT-Segmentpaare pro Schritt für den Glättungs-Loss.",
     )
     parser.add_argument(
+        "--tv-weight",
+        type=float,
+        default=0.001,
+        help="Gewicht für den 1D-TV-Loss entlang der Rays (0 = deaktiviert).",
+    )
+    parser.add_argument(
         "--debug-zero-var",
         action="store_true",
         help="Aktiviere zusätzliche Diagnostik und speichere Zwischenergebnisse, sobald Vorhersagen konstante Werte liefern.",
@@ -322,6 +328,7 @@ def init_log_file(path: Path):
                 "loss_pa",
                 "loss_act",
                 "loss_ct",
+                "tv",
                 "mae_ap",
                 "mae_pa",
                 "psnr_ap",
@@ -817,6 +824,8 @@ def train():
     data_cfg.setdefault("ray_split_ratio", 0.8)
     training_cfg = config.setdefault("training", {})
     training_cfg.setdefault("val_interval", 0)
+    training_cfg.setdefault("tv_weight", 0.001)
+    training_cfg["tv_weight"] = args.tv_weight
 
     print(f"📂 CWD: {Path.cwd().resolve()}", flush=True)
     outdir = Path(config.get("training", {}).get("outdir", "./results_spect")).expanduser().resolve()
@@ -850,6 +859,7 @@ def train():
         print(f"[DEBUG] act_scale={act_global_scale}", flush=True)
     ray_split_ratio = float(data_cfg.get("ray_split_ratio", 0.8))
     val_interval = int(training_cfg.get("val_interval", 0) or 0)
+    tv_weight = float(training_cfg.get("tv_weight", 0.0))
 
     generator = build_models(config)
     generator.to(device)
@@ -1034,6 +1044,21 @@ def train():
                 loss_reg = z_latent.pow(2).mean()
                 loss = loss + args.z_reg_weight * loss_reg
 
+            tv_loss = torch.tensor(0.0, device=device)
+            loss_tv = torch.tensor(0.0, device=device)
+            if tv_weight != 0.0:
+                tv_terms = []
+                tv_ap = extras_ap.get("tv_loss") if isinstance(extras_ap, dict) else None
+                tv_pa = extras_pa.get("tv_loss") if isinstance(extras_pa, dict) else None
+                if tv_ap is not None:
+                    tv_terms.append(tv_ap)
+                if tv_pa is not None:
+                    tv_terms.append(tv_pa)
+                if tv_terms:
+                    tv_loss = torch.stack(tv_terms).mean()
+                    loss_tv = tv_weight * tv_loss
+                    loss = loss + loss_tv
+
         scaler.scale(loss).backward()
         torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
         scaler.step(optimizer)
@@ -1096,7 +1121,7 @@ def train():
 
         msg = (
             f"[step {step:05d}] loss={loss.item():.6f} | ap={loss_ap.item():.6f} | pa={loss_pa.item():.6f} "
-            f"| act={loss_act.item():.6f} | ct={loss_ct.item():.6f} | zreg={loss_reg.item():.6f} "
+            f"| act={loss_act.item():.6f} | ct={loss_ct.item():.6f} | tv={loss_tv.item():.6f} | zreg={loss_reg.item():.6f} "
             f"| mae_ap={mae_ap:.6f} | mae_pa={mae_pa:.6f} "
             f"| psnr_ap={psnr_ap:.2f} | psnr_pa={psnr_pa:.2f} "
             f"| predμ_raw=({pred_mean_raw[0]:.3e},{pred_mean_raw[1]:.3e}) predσ_raw=({pred_std_raw[0]:.3e},{pred_std_raw[1]:.3e}) "
@@ -1117,6 +1142,7 @@ def train():
                 loss_pa.item(),
                 loss_act.item(),
                 loss_ct.item(),
+                loss_tv.item(),
                 mae_ap,
                 mae_pa,
                 psnr_ap,

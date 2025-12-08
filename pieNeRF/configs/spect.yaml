@@ -98,6 +98,7 @@ training:
   # später ggf. verfeinern; kleinere Werte = weniger VRAM, langsamer.
   chunk: 8192                 # eig. wars 32768
   netchunk: 16384             # eig. wars 65536
+  tv_weight: 0.001            # Gewicht für 1D-TV-Regularisierung entlang der Rays
 
   # Optimierung (nur Generator, weil kein GAN)
   lr_g: 0.0005
@@ -133,3 +134,4 @@ training:
   backup_every: 0
   video_every: 0
   val_interval: 200           # alle N Schritte Test-Split evaluieren (<=0: deaktiviert)
+  tv_weight: 0.001            # Gewicht für 1D-TV entlang der Rays
