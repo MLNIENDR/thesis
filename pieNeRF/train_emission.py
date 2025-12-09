@@ -184,6 +184,17 @@ def parse_args():
         help="Gittergröße für die (Stub-)3D-TV-Berechnung.",
     )
     parser.add_argument(
+        "--mask-loss-weight",
+        type=float,
+        default=0.0,
+        help="Gewicht für den Organmasken-Constraint (0 = deaktiviert).",
+    )
+    parser.add_argument(
+        "--use-organ-mask",
+        action="store_true",
+        help="Aktiviert die Nutzung von mask.npy (Organmaske) für einen Masken-Loss.",
+    )
+    parser.add_argument(
         "--debug-zero-var",
         action="store_true",
         help="Aktiviere zusätzliche Diagnostik und speichere Zwischenergebnisse, sobald Vorhersagen konstante Werte liefern.",
@@ -387,6 +398,7 @@ def init_log_file(path: Path):
                 "tv_mu",
                 "mu_gate",
                 "tv3d",
+                "mask",
                 "mae_ap",
                 "mae_pa",
                 "psnr_ap",
@@ -861,7 +873,12 @@ def save_depth_profile(step, generator, z_latent, ct_vol, act_vol, outdir: Path,
     depth_axis = np.linspace(0.0, 1.0, D)
     import matplotlib.pyplot as plt
 
-    ray_indices = pick_ray_indices(num_zero=1, num_active=3)
+    # Ray-Auswahl stabil über den gesamten Lauf halten, indem wir sie beim ersten Aufruf cachen.
+    ray_indices = getattr(generator, "_depth_profile_indices", None)
+    if not ray_indices:
+        ray_indices = pick_ray_indices(num_zero=1, num_active=3)
+        generator._depth_profile_indices = ray_indices
+
     fig, axes = plt.subplots(1, len(ray_indices), figsize=(4 * len(ray_indices), 4), sharex=True, sharey=True)
     if not isinstance(axes, np.ndarray):
         axes = [axes]
@@ -1013,6 +1030,12 @@ def train():
     training_cfg.setdefault("val_interval", 0)
     training_cfg.setdefault("tv_weight", 0.001)
     training_cfg["tv_weight"] = args.tv_weight
+    training_cfg.setdefault("mask_loss_weight", 0.0)
+    training_cfg.setdefault("use_organ_mask", False)
+    training_cfg["mask_loss_weight"] = args.mask_loss_weight
+    training_cfg["use_organ_mask"] = bool(args.use_organ_mask or training_cfg.get("use_organ_mask", False))
+    data_cfg.setdefault("use_organ_mask", False)
+    data_cfg["use_organ_mask"] = bool(training_cfg["use_organ_mask"])
     training_cfg.setdefault("tv_weight_mu", 0.0)
     training_cfg.setdefault("tv_mu_sigma", 1.0)
     training_cfg["tv_weight_mu"] = args.tv_weight_mu
@@ -1081,6 +1104,8 @@ def train():
     mu_gate_width = float(training_cfg.get("mu_gate_width", 0.1))
     tv3d_weight = float(training_cfg.get("tv3d_weight", 0.0))
     tv3d_grid_size = int(training_cfg.get("tv3d_grid_size", 32))
+    mask_loss_weight = float(training_cfg.get("mask_loss_weight", 0.0))
+    use_organ_mask = bool(training_cfg.get("use_organ_mask", False))
 
     generator = build_models(config)
     generator.to(device)
@@ -1091,6 +1116,7 @@ def train():
         kwargs_render["mu_gate_mode"] = mu_gate_mode
         kwargs_render["mu_gate_center"] = mu_gate_center
         kwargs_render["mu_gate_width"] = mu_gate_width
+        kwargs_render["use_organ_mask"] = use_organ_mask
     if args.debug_attenuation_ray:
         generator.render_kwargs_train["attenuation_debug"] = True
         generator.render_kwargs_test["attenuation_debug"] = True
@@ -1183,10 +1209,41 @@ def train():
                 act_vol = None
             else:
                 act_vol = act_vol.to(device, non_blocking=True)
+        ct_att_vol = batch.get("ct_att")
+        if ct_att_vol is not None:
+            if ct_att_vol.numel() == 0:
+                ct_att_vol = None
+            else:
+                ct_att_vol = ct_att_vol.to(device, non_blocking=True).float()
+        spect_att_vol = batch.get("spect_att")
+        if spect_att_vol is not None:
+            if spect_att_vol.numel() == 0:
+                spect_att_vol = None
+            else:
+                spect_att_vol = spect_att_vol.to(device, non_blocking=True).float()
+        mask_vol = batch.get("mask")
+        if mask_vol is not None:
+            if mask_vol.numel() == 0:
+                mask_vol = None
+            else:
+                mask_vol = mask_vol.to(device, non_blocking=True).float()
+        if not use_organ_mask:
+            mask_vol = None
         ct_vol = batch.get("ct")
         if ct_vol is not None:
-            ct_vol = ct_vol.to(device, non_blocking=True).float()
-        ct_context = generator.build_ct_context(ct_vol) if ct_vol is not None else None
+            if ct_vol.numel() == 0:
+                ct_vol = None
+            else:
+                ct_vol = ct_vol.to(device, non_blocking=True).float()
+        # bevorzugt ct_att als CT-Basis nutzen, falls vorhanden
+        if ct_att_vol is not None:
+            ct_vol = ct_att_vol
+        ct_context = generator.build_ct_context(
+            ct_vol if ct_vol is not None else spect_att_vol or ct_att_vol,
+            mask_volume=mask_vol,
+            att_volume=ct_att_vol,
+            spect_att_volume=spect_att_vol,
+        )
 
         ap_flat = ap.view(batch_size, -1)
         pa_flat = pa.view(batch_size, -1)
@@ -1285,6 +1342,8 @@ def train():
             loss_tv = torch.tensor(0.0, device=device)
             loss_tv_mu = torch.tensor(0.0, device=device)
             loss_mu_gate = torch.tensor(0.0, device=device)
+            mask_loss = torch.tensor(0.0, device=device)
+            loss_mask = torch.tensor(0.0, device=device)
 
             tv_base_terms = []
             tv_mu_terms = []
@@ -1312,6 +1371,14 @@ def train():
                 tv_mu_loss = torch.stack(tv_mu_terms).mean()
             if mu_gate_terms:
                 mu_gate_loss = torch.stack(mu_gate_terms).mean()
+            if isinstance(extras_ap, dict) and extras_ap.get("mask_loss") is not None:
+                mask_loss = extras_ap["mask_loss"]
+            if isinstance(extras_pa, dict) and extras_pa.get("mask_loss") is not None:
+                # Mittelwert über AP/PA, falls beide vorhanden
+                if mask_loss.numel() == 0 or mask_loss.item() == 0.0:
+                    mask_loss = extras_pa["mask_loss"]
+                else:
+                    mask_loss = torch.stack([mask_loss, extras_pa["mask_loss"]]).mean()
 
             if tv_weight != 0.0:
                 loss_tv = tv_weight * tv_base_loss
@@ -1322,6 +1389,10 @@ def train():
             if mu_gate_weight != 0.0:
                 loss_mu_gate = mu_gate_weight * mu_gate_loss
                 loss = loss + loss_mu_gate
+            if mask_loss_weight != 0.0 and use_organ_mask:
+                # penalizes emission outside organ mask
+                loss_mask = mask_loss_weight * mask_loss
+                loss = loss + loss_mask
 
             loss_tv3d = torch.tensor(0.0, device=device)
             if tv3d_weight > 0.0:
@@ -1392,7 +1463,7 @@ def train():
         msg = (
             f"[step {step:05d}] loss={loss.item():.6f} | ap={loss_ap.item():.6f} | pa={loss_pa.item():.6f} "
             f"| act={loss_act.item():.6f} | ct={loss_ct.item():.6f} | tv={loss_tv.item():.6f} | tv_mu={loss_tv_mu.item():.6f} "
-            f"| mu_gate={loss_mu_gate.item():.6f} | tv3d={loss_tv3d.item():.6f} | zreg={loss_reg.item():.6f} "
+            f"| mu_gate={loss_mu_gate.item():.6f} | tv3d={loss_tv3d.item():.6f} | mask={loss_mask.item():.6f} | zreg={loss_reg.item():.6f} "
             f"| mae_ap={mae_ap:.6f} | mae_pa={mae_pa:.6f} "
             f"| psnr_ap={psnr_ap:.2f} | psnr_pa={psnr_pa:.2f} "
             f"| predμ_raw=({pred_mean_raw[0]:.3e},{pred_mean_raw[1]:.3e}) predσ_raw=({pred_std_raw[0]:.3e},{pred_std_raw[1]:.3e}) "
@@ -1417,6 +1488,7 @@ def train():
                 loss_tv_mu.item(),
                 loss_mu_gate.item(),
                 loss_tv3d.item(),
+                loss_mask.item(),
                 mae_ap,
                 mae_pa,
                 psnr_ap,

@@ -123,15 +123,16 @@ def load_bin_xyz(path: Path, shape_str: str, dtype: str = "float32", order: str 
 
 def build_activity_from_mask(mask_xyz: np.ndarray,
                              organ_ids_txt: Path,
-                             rng_seed: int = 1234) -> Tuple[np.ndarray, Dict]:
+                             rng_seed: int = 1234) -> Tuple[np.ndarray, np.ndarray, Dict]:
     """Baut ein Aktivitätskonzentrationsvolumen aus einer Organ-Maske.
 
     mask_xyz: Volumen mit Organ-IDs (gleiche Geometrie wie SPECT/CT), (x,y,z)
     organ_ids_txt: Textdatei mit Zeilen der Form 'name = id'
 
     Rückgabe:
-      act_xyz: Aktivitätskonzentration (kBq/mL), gleiche Shape wie Maske
-      info:    Dictionary mit den zugewiesenen Werten pro Organ
+      act_xyz:   Aktivitätskonzentration (kBq/mL), gleiche Shape wie Maske
+      mask_roi:  0/1-Maske aller 'relevanten' Organe (gleiche Shape)
+      info:      Dictionary mit den zugewiesenen Werten pro Organ
     """
     # 1) organ_ids.txt einlesen: name = id
     name_to_id: Dict[str, int] = {}
@@ -152,6 +153,8 @@ def build_activity_from_mask(mask_xyz: np.ndarray,
 
     # 2) Plausible Aktivitätskonzentrationen für Lu-177-PSMA (kBq/mL)
     #    grobe Bereiche um einen 24–48h SPECT-Zeitpunkt.
+    #    Alle Organe, die hier drin stehen UND in organ_ids.txt vorkommen,
+    #    gelten als "relevant" für die spätere 0/1-Maske.
     default_ranges_kBqml = {
         # Tumor/Prostata-Hotspot
         "prostate":     (2000.0, 6000.0),
@@ -167,6 +170,9 @@ def build_activity_from_mask(mask_xyz: np.ndarray,
     }
 
     act = np.zeros(mask_xyz.shape, dtype=np.float32)
+    # 0/1-Maske der "relevanten" Organe (ROI), gleiche Shape
+    mask_roi = np.zeros(mask_xyz.shape, dtype=np.float32)
+
     rng = np.random.default_rng(rng_seed)
     organ_activity_info: Dict[str, Dict] = {}
 
@@ -174,16 +180,25 @@ def build_activity_from_mask(mask_xyz: np.ndarray,
         if organ_name not in name_to_id:
             continue
         organ_id = name_to_id[organ_name]
+
         # homogene Zufallsaktivitätskonzentration aus [low, high] kBq/mL
         val_kBqml = float(rng.uniform(low, high))
-        act[mask_xyz == organ_id] = val_kBqml
+
+        organ_voxels = (mask_xyz == organ_id)
+        if not np.any(organ_voxels):
+            continue
+
+        act[organ_voxels] = val_kBqml
+        mask_roi[organ_voxels] = 1.0  # alle diese Voxeln sind Teil der relevanten Organe
+
         organ_activity_info[organ_name] = {
             "organ_id": int(organ_id),
             "range_kBq_per_ml": [float(low), float(high)],
             "assigned_value_kBq_per_ml": val_kBqml,
         }
 
-    return act, organ_activity_info
+    return act, mask_roi, organ_activity_info
+
 
 
 # -----------------
@@ -481,8 +496,8 @@ def main():
     else:
         rng_seed = args.activity_seed
 
-    # Aktivität aus Maske (kBq/mL)
-    act_xyz, organ_info = build_activity_from_mask(
+    # Aktivität aus Maske (kBq/mL) + 0/1-Organmaske der "relevanten" Organe
+    act_xyz, mask_roi_xyz, organ_info = build_activity_from_mask(
         mask_xyz=mask_xyz,
         organ_ids_txt=organ_ids_path,
         rng_seed=rng_seed,
@@ -581,6 +596,7 @@ def main():
     np.save(out_dir / "act.npy",       act_xyz.astype(np.float32))
     np.save(out_dir / "ap.npy",        ap_norm.astype(np.float32))
     np.save(out_dir / "pa.npy",        pa_norm.astype(np.float32))
+    np.save(out_dir / "mask.npy",      mask_roi_xyz.astype(np.float32))  # NEU: 0/1-Organmaske
 
     # Meta-Info
     meta = {
@@ -592,6 +608,8 @@ def main():
         "activity_unit": "kBq/mL",
         "lu177_psma_like": True,
         "organ_activity_info": organ_info,
+        "has_binary_roi_mask": True,
+        "roi_mask_file": "mask.npy",
         "mu_unit_in": args.mu_unit,
         "mu_unit_out": args.mu_target_unit,
         "sd_mm": float(args.sd_mm),

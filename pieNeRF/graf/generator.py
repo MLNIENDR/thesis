@@ -347,28 +347,50 @@ class Generator(object):
 
         return proj_flat, disp_flat, acc_flat, extras
 
-    def build_ct_context(self, ct_volume):
+    def build_ct_context(self, ct_volume, mask_volume=None, att_volume=None, spect_att_volume=None):
         """
         Bereitet ein CT-Volumen für das Attenuation-Rendering vor.
         Annahme: Das Volumen ist zentriert und teilt sich den Bounding Cube [-radius, radius]^3 mit dem NeRF.
         """
-        if ct_volume is None:                                           # CT als [D, H, W] --> wird zu [1,1,D,H,W] (Batch-Dimension, Channel-Dimension, D,H,W)
+        if ct_volume is None and att_volume is None and spect_att_volume is None:
+            # nichts vorhanden
             return None
-        if not torch.is_tensor(ct_volume):
-            raise TypeError("ct_volume must be a torch.Tensor")
-        if ct_volume.numel() == 0:
+        def prep(vol_tensor, name: str):
+            if vol_tensor is None:
+                return None
+            if not torch.is_tensor(vol_tensor):
+                raise TypeError(f"{name} must be a torch.Tensor")
+            if vol_tensor.numel() == 0:
+                return None
+            vol = vol_tensor.float()
+            if vol.dim() == 3:
+                vol = vol.unsqueeze(0)
+            if vol.dim() == 4:
+                vol = vol.unsqueeze(0)
+            if vol.dim() != 5:
+                raise ValueError(f"Expected {name} data with D/H/W axes, got shape {tuple(vol_tensor.shape)}")
+            vol = torch.flip(vol, dims=[-1])  # Align wie CT (x-Achse flippen)
+            return vol
+
+        vol_ct = prep(ct_volume, "ct_volume")
+        vol_att = prep(att_volume, "att_volume")
+        vol_spect_att = prep(spect_att_volume, "spect_att_volume")
+
+        # Auswahl für Attenuation: bevorzugt spect_att > att > ct
+        vol = vol_spect_att if vol_spect_att is not None else (vol_att if vol_att is not None else vol_ct)
+        if vol is None:
             return None
 
-        vol = ct_volume.float()
-        if vol.dim() == 3:
-            vol = vol.unsqueeze(0)
-        if vol.dim() == 4:
-            vol = vol.unsqueeze(0)
-        if vol.dim() != 5:
-            raise ValueError(f"Expected CT data with D/H/W axes, got shape {tuple(ct_volume.shape)}")
-
-        # Flip entlang der x-Achse, damit CT-Seitenlage zur AP/PA-Darstellung passt
-        vol = torch.flip(vol, dims=[-1])
+        mask_vol = None
+        if mask_volume is not None and mask_volume.numel() > 0:
+            mask_vol = mask_volume.float()
+            if mask_vol.dim() == 3:
+                mask_vol = mask_vol.unsqueeze(0)
+            if mask_vol.dim() == 4:
+                mask_vol = mask_vol.unsqueeze(0)
+            if mask_vol.dim() != 5:
+                raise ValueError(f"Expected mask data with D/H/W axes, got shape {tuple(mask_volume.shape)}")
+            mask_vol = torch.flip(mask_vol, dims=[-1])
 
         radius = self.radius
         if isinstance(radius, tuple):
@@ -382,8 +404,11 @@ class Generator(object):
         # μ-Werte werden hier unverändert (bis auf das vorab angewandte Skalieren, z. B. ×10) verwendet,
         # keine zusätzliche Normalisierung – value_range dient nur für Plausibilitätschecks.
         vol = vol.contiguous().to(self.device, non_blocking=True)
+        if mask_vol is not None:
+            mask_vol = mask_vol.contiguous().to(self.device, non_blocking=True)
         return {
             "volume": vol,
             "grid_radius": radius,
             "value_range": (vmin, vmax),
+            "mask_volume": mask_vol,
         }

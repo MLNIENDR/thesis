@@ -95,7 +95,7 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     """Wendet 'render_rays' blockweise auf große Ray-Mengen an. Nutzt Chunking, damit GPU verträglich"""
     all_ret = {}
     features = kwargs.get('features')
-    scalar_accum = {k: [] for k in ("tv_loss", "tv_base_loss", "tv_mu_loss", "mu_gate_loss")}
+    scalar_accum = {k: [] for k in ("tv_loss", "tv_base_loss", "tv_mu_loss", "mu_gate_loss", "mask_loss")}
     # blockweise über die Rays iterieren
     for i in range(0, rays_flat.shape[0], chunk):
         # z-Features passend mitschneiden
@@ -223,7 +223,7 @@ def render(H, W, focal, chunk=1024*32, rays=None, c2w=None,
     # Renderin in Chunks aufteilen
     # ---------------------------
     all_ret = batchify_rays(rays, chunk, **kwargs)
-    scalar_keys = ("tv_loss", "tv_base_loss", "tv_mu_loss", "mu_gate_loss")
+    scalar_keys = ("tv_loss", "tv_base_loss", "tv_mu_loss", "mu_gate_loss", "mask_loss")
     scalar_ret = {k: all_ret.pop(k, None) for k in scalar_keys}
     # zurück in Bildform [H, W, ...]
     for k in all_ret:
@@ -259,6 +259,7 @@ def raw2outputs_emission(
     raw_noise_std=0.0,
     pytest=False,
     mu_vals=None,
+    mask_vals=None,
     use_attenuation=False,
     attenuation_debug=False,
     debug_prints: bool = False,
@@ -342,6 +343,13 @@ def raw2outputs_emission(
             penalty = dist * dist * lambda_vals
             mu_gate_loss = penalty.mean()
 
+    # Organmasken-Loss: penalizes emission außerhalb der Maske
+    mask_loss = lambda_vals.new_tensor(0.0)
+    if mask_vals is not None:
+        mask_vals = torch.clamp(mask_vals, 0.0, 1.0)
+        violation = (1.0 - mask_vals) * lambda_vals
+        mask_loss = violation.mean()
+
     transmission = None
     # Grundfall: keine Attenuation → einfache Gewichte = e * Δs
     weights = lambda_vals * dists
@@ -414,7 +422,7 @@ def raw2outputs_emission(
         if transmission is not None:
             debug_payload["debug_transmission"] = transmission.detach()
 
-    return proj_map, disp_map, acc_map, debug_payload, tv_base, tv_mu, mu_gate_loss
+    return proj_map, disp_map, acc_map, debug_payload, tv_base, tv_mu, mu_gate_loss, mask_loss
 
 
 # ---------------------------
@@ -488,7 +496,9 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
     mu_gate_mode = kwargs.get("mu_gate_mode", "none")
     mu_gate_center = float(kwargs.get("mu_gate_center", 0.2))
     mu_gate_width = float(kwargs.get("mu_gate_width", 0.1))
+    use_organ_mask = bool(kwargs.get("use_organ_mask", False))
     mu_vals = None
+    mask_vals = None
 
     # Falls Attenuation aktiviert und CT-Context vorhanden: µ aus CT sampeln
     if use_attenuation and ct_context is not None:
@@ -516,15 +526,27 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
             warnings.warn("use_attenuation=True aber render() erhielt kein ct_context – deaktiviere Attenuation.")
             _ATTENUATION_WARNED = True
 
+    if use_organ_mask and ct_context is not None:
+        mask_volume = ct_context.get("mask_volume")
+        if mask_volume is not None:
+            mask_context = {
+                "volume": mask_volume,
+                "grid_radius": ct_context.get("grid_radius", 1.0),
+            }
+            mask_vals = sample_ct_volume(pts, mask_context)
+            if not torch.isfinite(mask_vals).all():
+                raise ValueError("Mask samples contain NaN/Inf values.")
+
     # Emissions-Pfad (SPECT)
     if emission:
-        proj_map, disp_map, acc_map, debug_payload, tv_base_loss, tv_mu_loss, mu_gate_loss = raw2outputs_emission(
+        proj_map, disp_map, acc_map, debug_payload, tv_base_loss, tv_mu_loss, mu_gate_loss, mask_loss = raw2outputs_emission(
             raw,
             z_vals,
             rays_d,
             raw_noise_std=raw_noise_std,
             pytest=pytest,
             mu_vals=mu_vals,
+            mask_vals=mask_vals,
             use_attenuation=use_attenuation,
             attenuation_debug=attenuation_debug,
             debug_prints=debug_prints,
@@ -542,6 +564,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
             'tv_base_loss': tv_base_loss,
             'tv_mu_loss': tv_mu_loss,
             'mu_gate_loss': mu_gate_loss,
+            'mask_loss': mask_loss,
         }
         # Debug-Infos aus raw2outputs_emission übernehmen
         if debug_payload:

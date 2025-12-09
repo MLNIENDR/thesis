@@ -19,6 +19,7 @@ data:
   # Projektionen werden pro Bild auf [0,1] normiert (wie im ursprünglichen Setup)
   projection_normalization: none
   act_scale: 1.0                                # globaler λ-Faktor (keine Normierung; für konsistente Skalen zu Projekten anpassen)
+  use_organ_mask: false                         # optionales Laden einer Organmaske (mask.npy) pro Phantom
 
 
   # radius & fov sind bei orthographic nicht so wichtig, können aber gesetzt bleiben
@@ -107,6 +108,8 @@ training:
   mu_gate_width: 0.1          # Breite/Toleranz der bevorzugten μ-Region
   tv3d_weight: 0.0            # 3D-TV über ein Hilfsgitter (Stub, 0 = aus)
   tv3d_grid_size: 32          # Gittergröße für 3D-TV-Stub
+  mask_loss_weight: 0.0       # Gewicht für Organmasken-Constraint (0 = aus)
+  use_organ_mask: false       # mask.npy berücksichtigen?
   act_samples: 16384          # Anzahl Voxel-Samples für den ACT-Loss
   act_pos_weight: 2.0         # Gewichtung für ACT>0 Samples im ACT-Loss
 

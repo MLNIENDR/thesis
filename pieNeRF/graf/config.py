@@ -53,6 +53,7 @@ def get_data(config):
         transform_img=None,
         transform_ct=None,
         act_scale=float(config["data"].get("act_scale", 1.0)),
+        use_organ_mask=bool(config["data"].get("use_organ_mask", False)),
     )
 
     # 2) H und W aus einem Beispiel-AP-Bild ableiten
