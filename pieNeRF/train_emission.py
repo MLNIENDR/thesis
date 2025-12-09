@@ -95,8 +95,14 @@ def parse_args():
     parser.add_argument(
         "--act-samples",
         type=int,
-        default=2048,
+        default=None,
         help="Anzahl zufälliger Voxels zur act-Supervision pro Schritt.",
+    )
+    parser.add_argument(
+        "--act-pos-weight",
+        type=float,
+        default=None,
+        help="Zusatzgewicht für den ACT-Loss in aktiven Voxeln (>0).",
     )
     parser.add_argument(
         "--z-reg-weight",
@@ -127,6 +133,55 @@ def parse_args():
         type=float,
         default=0.001,
         help="Gewicht für den 1D-TV-Loss entlang der Rays (0 = deaktiviert).",
+    )
+    parser.add_argument(
+        "--tv-weight-mu",
+        type=float,
+        default=0.0,
+        help="Gewicht für CT-gewichtete (edge-aware) TV entlang der Rays (0 = deaktiviert).",
+    )
+    parser.add_argument(
+        "--tv-mu-sigma",
+        type=float,
+        default=1.0,
+        help="Skalenparameter für μ-Differenzen im edge-aware TV-Weighting.",
+    )
+    parser.add_argument(
+        "--mu-gate-weight",
+        type=float,
+        default=0.0,
+        help="Gewicht für μ-basierten Emissions-Prior (0 = deaktiviert).",
+    )
+    parser.add_argument(
+        "--mu-gate-mode",
+        type=str,
+        default="none",
+        choices=["none", "bandpass", "lowpass", "highpass"],
+        help="μ-Prior-Modus: none | bandpass | lowpass | highpass.",
+    )
+    parser.add_argument(
+        "--mu-gate-center",
+        type=float,
+        default=0.2,
+        help="Zentrum der bevorzugten μ-Region für den μ-Prior.",
+    )
+    parser.add_argument(
+        "--mu-gate-width",
+        type=float,
+        default=0.1,
+        help="Breite/Toleranz der bevorzugten μ-Region für den μ-Prior.",
+    )
+    parser.add_argument(
+        "--tv3d-weight",
+        type=float,
+        default=0.0,
+        help="Gewicht für eine optionale 3D-TV-Hülle (Stub, 0 = deaktiviert).",
+    )
+    parser.add_argument(
+        "--tv3d-grid-size",
+        type=int,
+        default=32,
+        help="Gittergröße für die (Stub-)3D-TV-Berechnung.",
     )
     parser.add_argument(
         "--debug-zero-var",
@@ -329,6 +384,9 @@ def init_log_file(path: Path):
                 "loss_act",
                 "loss_ct",
                 "tv",
+                "tv_mu",
+                "mu_gate",
+                "tv3d",
                 "mae_ap",
                 "mae_pa",
                 "psnr_ap",
@@ -352,6 +410,22 @@ def append_log(path: Path, row):
     with path.open("a", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(row)
+
+
+def compute_tv3d_stub(*args, device=None, **kwargs):
+    """
+    Platzhalter für eine zukünftige 3D-TV-Regularisierung über ein Hilfsgitter.
+    Aktuell wird kein Volumen evaluiert – der Rückgabewert bleibt 0.
+    """
+    if device is None:
+        for arg in args:
+            if isinstance(arg, torch.Tensor):
+                device = arg.device
+                break
+    if device is None and "device" in kwargs and isinstance(kwargs["device"], torch.device):
+        device = kwargs["device"]
+    device = device or torch.device("cpu")
+    return torch.tensor(0.0, device=device)
 
 
 def save_checkpoint(step, generator, z_train, optimizer, scaler, ckpt_dir: Path):
@@ -453,8 +527,13 @@ def evaluate_split(
     }
 
 
-def sample_act_points(act: torch.Tensor, nsamples: int, radius: float) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Zufällige Voxel (coords, values) aus act.npy ziehen."""
+def sample_act_points(
+    act: torch.Tensor, nsamples: int, radius: float, pos_fraction: float = 0.5, pos_threshold: float = 1e-8
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Ziehe zufällige Voxel (coords, values) aus act.npy, halb aus aktiven Voxeln (ACT>0), halb global.
+    Gibt zusätzlich einen Bool-Flag pro Sample zurück, der anzeigt, ob es aus ACT>0 stammt.
+    """
     if act is None:
         raise ValueError("act tensor missing despite act-loss-weight > 0.")
     # Unterscheide (1,D,H,W) vs (D,H,W)
@@ -463,7 +542,37 @@ def sample_act_points(act: torch.Tensor, nsamples: int, radius: float) -> Tuple[
     D, H, W = act.shape[-3:]
     flat = act.view(-1)
     nsamples = min(nsamples, flat.numel())
-    idx = torch.randint(0, flat.numel(), (nsamples,), device=act.device)
+    if nsamples <= 0:
+        empty = torch.zeros((0,), device=act.device)
+        return empty.reshape(0, 3), empty, empty.bool()
+
+    # Split: pos_fraction aus ACT>pos_threshold, Rest uniform
+    num_pos = int(round(float(nsamples) * float(pos_fraction)))
+    num_pos = max(0, min(num_pos, nsamples))
+    num_all = nsamples - num_pos
+
+    pos_mask = flat > pos_threshold
+    pos_idx = pos_mask.nonzero(as_tuple=False).squeeze(-1)
+
+    idx_parts = []
+    flag_parts = []
+
+    if num_pos > 0 and pos_idx.numel() > 0:
+        perm = torch.randint(0, pos_idx.numel(), (num_pos,), device=act.device)
+        idx_pos = pos_idx[perm]
+        idx_parts.append(idx_pos)
+        flag_parts.append(torch.ones_like(idx_pos, dtype=torch.bool))
+    else:
+        # Fallback: keine aktiven Voxeln gefunden -> alles aus globalem Sampling ziehen
+        num_all = nsamples
+
+    if num_all > 0:
+        idx_all = torch.randint(0, flat.numel(), (num_all,), device=act.device)
+        idx_parts.append(idx_all)
+        flag_parts.append(torch.zeros_like(idx_all, dtype=torch.bool))
+
+    idx = torch.cat(idx_parts, dim=0)
+    pos_flags = torch.cat(flag_parts, dim=0)
     values = flat[idx]
 
     hw = H * W
@@ -479,7 +588,7 @@ def sample_act_points(act: torch.Tensor, nsamples: int, radius: float) -> Tuple[
         ),
         dim=1,
     )
-    return coords, values
+    return coords, values, pos_flags
 
 
 def query_emission_at_points(generator, z_latent, coords: torch.Tensor) -> torch.Tensor:
@@ -568,88 +677,166 @@ def save_depth_profile(step, generator, z_latent, ct_vol, act_vol, outdir: Path,
                 ct_depth_max = None
 
 
-    def pick_ray_indices(num: int = 2):
+    def pick_ray_indices(num_zero: int = 1, num_active: int = 3):
+        """Wählt Strahlen für das Depth-Profil: 1 Hintergrundstrahl + 3 aktive."""
         H, W = generator.H, generator.W
         chosen = []
+        target_total = max(num_zero + num_active, 1)
+        min_dist = max(1, int(0.05 * min(H, W)))  # verhindert, dass Strahlen direkt benachbart sind
+
+        def is_far_enough(idx):
+            if idx is None or not chosen:
+                return True
+            y, x = idx
+            for cy, cx in chosen:
+                if np.hypot(y - cy, x - cx) < min_dist:
+                    return False
+            return True
 
         def add_unique(idx):
-            if idx not in chosen:
+            if idx is None:
+                return False
+            if idx not in chosen and is_far_enough(idx):
                 chosen.append(idx)
+                return True
+            return False
 
-        # feste Strahlen (y,x), auf Bildgröße geclippt
-        fixed_coords = [(72, 428), (69, 336)]
-        for y_raw, x_raw in fixed_coords:
-            if len(chosen) >= num:
-                break
-            y = int(np.clip(y_raw, 0, H - 1))
-            x = int(np.clip(x_raw, 0, W - 1))
-            add_unique((y, x))
-        if len(chosen) >= num:
-            return chosen[:num]
-
-        def pick_from_mask(mask):
+        def pick_from_mask(mask, prefer_high=True):
             if mask is None:
                 return None
-            mask = mask.astype(bool)
+            mask = mask.astype(bool).copy()
             if mask.shape != (H, W) or not mask.any():
+                return None
+            for y, x in chosen:
+                if 0 <= y < H and 0 <= x < W:
+                    mask[y, x] = False
+            if not mask.any():
                 return None
             coords = np.argwhere(mask)
             if coords.size == 0:
                 return None
+
+            weight_map = None
             if ap_img is not None and pa_img is not None:
                 weight_map = ap_img + pa_img
-                weight_map = np.where(mask, weight_map, -np.inf)
-                y, x = np.unravel_index(np.nanargmax(weight_map), weight_map.shape)
+            if weight_map is not None:
+                weights = weight_map[mask]
+                if weights.size == 0:
+                    weights = None
+                else:
+                    if prefer_high:
+                        weights = weights - weights.min() + 1e-6
+                    else:
+                        weights = weights.max() - weights + 1e-6
+                    if not np.isfinite(weights).any() or np.sum(weights) <= 0:
+                        weights = None
+            if weights is None:
+                np.random.shuffle(coords)
+                for y, x in coords:
+                    if is_far_enough((int(y), int(x))):
+                        return int(y), int(x)
+                y, x = coords[0]
                 return int(y), int(x)
-            yx = coords[0]
-            return int(yx[0]), int(yx[1])
 
-        if act_data is not None:
-            # Falls act verfügbar ist, gezielt Null-/Nicht-Null-Strahlen auswählen
-            if act_masks is not None:
-                zero_mask, nonzero_mask = act_masks
-            else:
-                zero_mask = nonzero_mask = None
+            for _ in range(min(len(coords), 64)):
+                idx = np.random.choice(len(coords), p=weights / weights.sum())
+                y, x = coords[idx]
+                if is_far_enough((int(y), int(x))):
+                    return int(y), int(x)
+            y, x = coords[np.argmax(weights)]
+            return int(y), int(x)
 
-            ct_pos_mask = None
-            if ct_depth_max is not None:
-                ct_pos_mask = ct_depth_max > 1e-8
+        def pick_proj_extreme(func):
+            if ap_img is None or pa_img is None:
+                return None
+            combo = (ap_img + pa_img).copy()
+            for y, x in chosen:
+                if 0 <= y < H and 0 <= x < W:
+                    combo[y, x] = np.nan
+            try:
+                y, x = np.unravel_index(func(combo), combo.shape)
+            except ValueError:
+                return None
+            return int(y), int(x)
 
-            def combine(m_act, require_ct: bool):
-                if m_act is None:
-                    return None
-                if ct_pos_mask is not None and require_ct:
-                    combo = m_act & ct_pos_mask
-                    if combo.any():
-                        return combo
-                return m_act
+        ct_pos_mask = None
+        if ct_depth_max is not None:
+            ct_pos_mask = ct_depth_max > 1e-8
 
-            zero_idx = pick_from_mask(combine(zero_mask, require_ct=True))
-            nonzero_idx = pick_from_mask(combine(nonzero_mask, require_ct=True))
-            if zero_idx is None and zero_mask is not None:
-                zero_idx = pick_from_mask(zero_mask)
-            if nonzero_idx is None and nonzero_mask is not None:
-                nonzero_idx = pick_from_mask(nonzero_mask)
-            if zero_idx is not None:
-                add_unique(zero_idx)
-            if nonzero_idx is not None:
-                add_unique(nonzero_idx)
+        def combine_mask(base_mask, require_ct: bool):
+            if base_mask is None:
+                return None
+            mask = base_mask.astype(bool)
+            if ct_pos_mask is not None and require_ct:
+                mask = mask & ct_pos_mask
+            return mask
 
+        zero_mask = nonzero_mask = None
+        if act_data is not None and act_masks is not None:
+            zero_mask, nonzero_mask = act_masks
+
+        zero_needed = max(num_zero, 0)
+        active_needed = max(num_active, 0)
+
+        # (1) Gezielt Null- und Aktiv-Strahlen auswählen
+        if zero_needed > 0:
+            for mask in (combine_mask(zero_mask, True), zero_mask):
+                if zero_needed <= 0:
+                    break
+                if add_unique(pick_from_mask(mask, prefer_high=False)):
+                    zero_needed -= 1
+
+        if active_needed > 0:
+            for _ in range(active_needed):
+                idx = pick_from_mask(combine_mask(nonzero_mask, True), prefer_high=True)
+                if not add_unique(idx):
+                    break
+                active_needed -= 1
+            while active_needed > 0:
+                idx = pick_from_mask(nonzero_mask, prefer_high=True)
+                if idx is None:
+                    break
+                if add_unique(idx):
+                    active_needed -= 1
+
+        # (2) Fallback über Projektionen (Minimum für 0-Strahl, Maximum für Aktivität)
+        if zero_needed > 0:
+            if add_unique(pick_proj_extreme(np.nanargmin)):
+                zero_needed -= 1
+
+        while active_needed > 0:
+            idx = pick_proj_extreme(np.nanargmax)
+            if idx is None:
+                break
+            if add_unique(idx):
+                active_needed -= 1
+
+        # (3) Rest mit festen/relativen Koordinaten auffüllen
+        fixed_coords = [(72, 428), (69, 336)]
+        for y_raw, x_raw in fixed_coords:
+            if len(chosen) >= target_total:
+                break
+            y = int(np.clip(y_raw, 0, H - 1))
+            x = int(np.clip(x_raw, 0, W - 1))
+            add_unique((y, x))
         rel_coords = [(0.5, 0.5), (0.25, 0.75), (0.75, 0.25)]
         for ry, rx in rel_coords:
-            if len(chosen) >= num:
+            if len(chosen) >= target_total:
                 break
             y = int(np.clip(round((H - 1) * ry), 0, H - 1))
             x = int(np.clip(round((W - 1) * rx), 0, W - 1))
             add_unique((y, x))
-            if len(chosen) >= num:
-                break
 
-        if ap_img is not None and pa_img is not None and len(chosen) < num:
+        if ap_img is not None and pa_img is not None and len(chosen) < target_total:
             max_y, max_x = np.unravel_index(np.argmax(ap_img + pa_img), ap_img.shape)
             add_unique((int(max_y), int(max_x)))
 
-        return chosen[:num]
+        while len(chosen) < target_total:
+            y = int(np.random.randint(0, H))
+            x = int(np.random.randint(0, W))
+            add_unique((y, x))
+
+        return chosen[:target_total]
 
     def first_shape(vol_a, vol_b):
         for v in (vol_a, vol_b):
@@ -674,7 +861,7 @@ def save_depth_profile(step, generator, z_latent, ct_vol, act_vol, outdir: Path,
     depth_axis = np.linspace(0.0, 1.0, D)
     import matplotlib.pyplot as plt
 
-    ray_indices = pick_ray_indices(num=2)
+    ray_indices = pick_ray_indices(num_zero=1, num_active=3)
     fig, axes = plt.subplots(1, len(ray_indices), figsize=(4 * len(ray_indices), 4), sharex=True, sharey=True)
     if not isinstance(axes, np.ndarray):
         axes = [axes]
@@ -826,6 +1013,32 @@ def train():
     training_cfg.setdefault("val_interval", 0)
     training_cfg.setdefault("tv_weight", 0.001)
     training_cfg["tv_weight"] = args.tv_weight
+    training_cfg.setdefault("tv_weight_mu", 0.0)
+    training_cfg.setdefault("tv_mu_sigma", 1.0)
+    training_cfg["tv_weight_mu"] = args.tv_weight_mu
+    training_cfg["tv_mu_sigma"] = args.tv_mu_sigma
+    training_cfg.setdefault("mu_gate_weight", 0.0)
+    training_cfg.setdefault("mu_gate_mode", "none")
+    training_cfg.setdefault("mu_gate_center", 0.2)
+    training_cfg.setdefault("mu_gate_width", 0.1)
+    training_cfg["mu_gate_weight"] = args.mu_gate_weight
+    training_cfg["mu_gate_mode"] = args.mu_gate_mode
+    training_cfg["mu_gate_center"] = args.mu_gate_center
+    training_cfg["mu_gate_width"] = args.mu_gate_width
+    training_cfg.setdefault("tv3d_weight", 0.0)
+    training_cfg.setdefault("tv3d_grid_size", 32)
+    training_cfg["tv3d_weight"] = args.tv3d_weight
+    training_cfg["tv3d_grid_size"] = args.tv3d_grid_size
+    training_cfg.setdefault("act_samples", 16384)
+    training_cfg.setdefault("act_pos_weight", 2.0)
+    if args.act_samples is None:
+        args.act_samples = int(training_cfg.get("act_samples", 16384))
+    else:
+        training_cfg["act_samples"] = args.act_samples
+    if args.act_pos_weight is None:
+        args.act_pos_weight = float(training_cfg.get("act_pos_weight", 2.0))
+    else:
+        training_cfg["act_pos_weight"] = args.act_pos_weight
 
     print(f"📂 CWD: {Path.cwd().resolve()}", flush=True)
     outdir = Path(config.get("training", {}).get("outdir", "./results_spect")).expanduser().resolve()
@@ -860,11 +1073,24 @@ def train():
     ray_split_ratio = float(data_cfg.get("ray_split_ratio", 0.8))
     val_interval = int(training_cfg.get("val_interval", 0) or 0)
     tv_weight = float(training_cfg.get("tv_weight", 0.0))
+    tv_weight_mu = float(training_cfg.get("tv_weight_mu", 0.0))
+    tv_mu_sigma = float(training_cfg.get("tv_mu_sigma", 1.0))
+    mu_gate_weight = float(training_cfg.get("mu_gate_weight", 0.0))
+    mu_gate_mode = str(training_cfg.get("mu_gate_mode", "none")).lower()
+    mu_gate_center = float(training_cfg.get("mu_gate_center", 0.2))
+    mu_gate_width = float(training_cfg.get("mu_gate_width", 0.1))
+    tv3d_weight = float(training_cfg.get("tv3d_weight", 0.0))
+    tv3d_grid_size = int(training_cfg.get("tv3d_grid_size", 32))
 
     generator = build_models(config)
     generator.to(device)
     generator.train()
     generator.use_test_kwargs = False  # enforce training kwargs
+    for kwargs_render in (generator.render_kwargs_train, generator.render_kwargs_test):
+        kwargs_render["tv_mu_sigma"] = tv_mu_sigma
+        kwargs_render["mu_gate_mode"] = mu_gate_mode
+        kwargs_render["mu_gate_center"] = mu_gate_center
+        kwargs_render["mu_gate_width"] = mu_gate_width
     if args.debug_attenuation_ray:
         generator.render_kwargs_train["attenuation_debug"] = True
         generator.render_kwargs_test["attenuation_debug"] = True
@@ -1020,10 +1246,19 @@ def train():
                 if isinstance(radius, tuple):
                     radius = radius[1]
                 # Stichprobe aus act.npy und direkte Dichteabfrage im NeRF
-                coords, act_samples = sample_act_points(act_vol, args.act_samples, radius=radius)
+                coords, act_samples, pos_flags = sample_act_points(
+                    act_vol, args.act_samples, radius=radius, pos_fraction=0.5, pos_threshold=1e-8
+                )
                 pred_act = query_emission_at_points(generator, z_latent, coords)
-                loss_act = F.l1_loss(pred_act, act_samples)
-                loss = loss + args.act_loss_weight * loss_act
+                if pred_act.numel() > 0:
+                    weights_act = torch.where(
+                        pos_flags,
+                        torch.full_like(pred_act, args.act_pos_weight),
+                        torch.ones_like(pred_act),
+                    )
+                    diff = torch.abs(pred_act - act_samples)
+                    loss_act = torch.mean(weights_act * diff)
+                    loss = loss + args.act_loss_weight * loss_act
 
             loss_ct = torch.tensor(0.0, device=device)
             if args.ct_loss_weight > 0.0 and ct_vol is not None:
@@ -1044,20 +1279,55 @@ def train():
                 loss_reg = z_latent.pow(2).mean()
                 loss = loss + args.z_reg_weight * loss_reg
 
-            tv_loss = torch.tensor(0.0, device=device)
+            tv_base_loss = torch.tensor(0.0, device=device)
+            tv_mu_loss = torch.tensor(0.0, device=device)
+            mu_gate_loss = torch.tensor(0.0, device=device)
             loss_tv = torch.tensor(0.0, device=device)
+            loss_tv_mu = torch.tensor(0.0, device=device)
+            loss_mu_gate = torch.tensor(0.0, device=device)
+
+            tv_base_terms = []
+            tv_mu_terms = []
+            mu_gate_terms = []
+            if isinstance(extras_ap, dict):
+                base_val = extras_ap.get("tv_base_loss") or extras_ap.get("tv_loss")
+                if base_val is not None:
+                    tv_base_terms.append(base_val)
+                if extras_ap.get("tv_mu_loss") is not None:
+                    tv_mu_terms.append(extras_ap["tv_mu_loss"])
+                if extras_ap.get("mu_gate_loss") is not None:
+                    mu_gate_terms.append(extras_ap["mu_gate_loss"])
+            if isinstance(extras_pa, dict):
+                base_val = extras_pa.get("tv_base_loss") or extras_pa.get("tv_loss")
+                if base_val is not None:
+                    tv_base_terms.append(base_val)
+                if extras_pa.get("tv_mu_loss") is not None:
+                    tv_mu_terms.append(extras_pa["tv_mu_loss"])
+                if extras_pa.get("mu_gate_loss") is not None:
+                    mu_gate_terms.append(extras_pa["mu_gate_loss"])
+
+            if tv_base_terms:
+                tv_base_loss = torch.stack(tv_base_terms).mean()
+            if tv_mu_terms:
+                tv_mu_loss = torch.stack(tv_mu_terms).mean()
+            if mu_gate_terms:
+                mu_gate_loss = torch.stack(mu_gate_terms).mean()
+
             if tv_weight != 0.0:
-                tv_terms = []
-                tv_ap = extras_ap.get("tv_loss") if isinstance(extras_ap, dict) else None
-                tv_pa = extras_pa.get("tv_loss") if isinstance(extras_pa, dict) else None
-                if tv_ap is not None:
-                    tv_terms.append(tv_ap)
-                if tv_pa is not None:
-                    tv_terms.append(tv_pa)
-                if tv_terms:
-                    tv_loss = torch.stack(tv_terms).mean()
-                    loss_tv = tv_weight * tv_loss
-                    loss = loss + loss_tv
+                loss_tv = tv_weight * tv_base_loss
+                loss = loss + loss_tv
+            if tv_weight_mu != 0.0:
+                loss_tv_mu = tv_weight_mu * tv_mu_loss
+                loss = loss + loss_tv_mu
+            if mu_gate_weight != 0.0:
+                loss_mu_gate = mu_gate_weight * mu_gate_loss
+                loss = loss + loss_mu_gate
+
+            loss_tv3d = torch.tensor(0.0, device=device)
+            if tv3d_weight > 0.0:
+                tv3d_loss_unweighted = compute_tv3d_stub(generator, z_latent, grid_size=tv3d_grid_size, device=device)
+                loss_tv3d = tv3d_weight * tv3d_loss_unweighted
+                loss = loss + loss_tv3d
 
         scaler.scale(loss).backward()
         torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
@@ -1121,7 +1391,8 @@ def train():
 
         msg = (
             f"[step {step:05d}] loss={loss.item():.6f} | ap={loss_ap.item():.6f} | pa={loss_pa.item():.6f} "
-            f"| act={loss_act.item():.6f} | ct={loss_ct.item():.6f} | tv={loss_tv.item():.6f} | zreg={loss_reg.item():.6f} "
+            f"| act={loss_act.item():.6f} | ct={loss_ct.item():.6f} | tv={loss_tv.item():.6f} | tv_mu={loss_tv_mu.item():.6f} "
+            f"| mu_gate={loss_mu_gate.item():.6f} | tv3d={loss_tv3d.item():.6f} | zreg={loss_reg.item():.6f} "
             f"| mae_ap={mae_ap:.6f} | mae_pa={mae_pa:.6f} "
             f"| psnr_ap={psnr_ap:.2f} | psnr_pa={psnr_pa:.2f} "
             f"| predμ_raw=({pred_mean_raw[0]:.3e},{pred_mean_raw[1]:.3e}) predσ_raw=({pred_std_raw[0]:.3e},{pred_std_raw[1]:.3e}) "
@@ -1143,6 +1414,9 @@ def train():
                 loss_act.item(),
                 loss_ct.item(),
                 loss_tv.item(),
+                loss_tv_mu.item(),
+                loss_mu_gate.item(),
+                loss_tv3d.item(),
                 mae_ap,
                 mae_pa,
                 psnr_ap,

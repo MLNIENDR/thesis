@@ -99,6 +99,16 @@ training:
   chunk: 8192                 # eig. wars 32768
   netchunk: 16384             # eig. wars 65536
   tv_weight: 0.001            # Gewicht für 1D-TV-Regularisierung entlang der Rays
+  tv_weight_mu: 0.0           # zusätzlicher TV-Gewichtungsfaktor für CT-gewichtete TV (edge-aware)
+  tv_mu_sigma: 1.0            # Skalenparameter für μ-Differenzen im edge-aware TV-Weighting
+  mu_gate_weight: 0.0         # Gewicht für μ-basierten Emissions-Prior (0 = aus)
+  mu_gate_mode: none          # none|bandpass|lowpass|highpass
+  mu_gate_center: 0.2         # Zentrum der bevorzugten μ-Region
+  mu_gate_width: 0.1          # Breite/Toleranz der bevorzugten μ-Region
+  tv3d_weight: 0.0            # 3D-TV über ein Hilfsgitter (Stub, 0 = aus)
+  tv3d_grid_size: 32          # Gittergröße für 3D-TV-Stub
+  act_samples: 16384          # Anzahl Voxel-Samples für den ACT-Loss
+  act_pos_weight: 2.0         # Gewichtung für ACT>0 Samples im ACT-Loss
 
   # Optimierung (nur Generator, weil kein GAN)
   lr_g: 0.0005

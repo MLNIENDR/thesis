@@ -95,7 +95,7 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     """Wendet 'render_rays' blockweise auf große Ray-Mengen an. Nutzt Chunking, damit GPU verträglich"""
     all_ret = {}
     features = kwargs.get('features')
-    tv_vals = []
+    scalar_accum = {k: [] for k in ("tv_loss", "tv_base_loss", "tv_mu_loss", "mu_gate_loss")}
     # blockweise über die Rays iterieren
     for i in range(0, rays_flat.shape[0], chunk):
         # z-Features passend mitschneiden
@@ -103,9 +103,10 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
             kwargs['features'] = features[i:i+chunk]
         # rendern eines Blockes
         ret = render_rays(rays_flat[i:i+chunk], **kwargs)
-        tv_val = ret.pop("tv_loss", None)
-        if tv_val is not None:
-            tv_vals.append(tv_val)
+        for key in scalar_accum:
+            val = ret.pop(key, None)
+            if val is not None:
+                scalar_accum[key].append(val)
         # Ergebnisse sammeln
         for k in ret:
             if k not in all_ret:
@@ -113,8 +114,9 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
             all_ret[k].append(ret[k])
     # alle Blöcke wieder zu vollständigen Outputs zusammenfügen
     all_ret = {k: torch.cat(all_ret[k], 0) for k in all_ret}
-    if tv_vals:
-        all_ret["tv_loss"] = torch.stack(tv_vals).mean()
+    for key, vals in scalar_accum.items():
+        if vals:
+            all_ret[key] = torch.stack(vals).mean()
     return all_ret
 
 
@@ -221,13 +223,15 @@ def render(H, W, focal, chunk=1024*32, rays=None, c2w=None,
     # Renderin in Chunks aufteilen
     # ---------------------------
     all_ret = batchify_rays(rays, chunk, **kwargs)
-    tv_loss = all_ret.pop("tv_loss", None)
+    scalar_keys = ("tv_loss", "tv_base_loss", "tv_mu_loss", "mu_gate_loss")
+    scalar_ret = {k: all_ret.pop(k, None) for k in scalar_keys}
     # zurück in Bildform [H, W, ...]
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = torch.reshape(all_ret[k], k_sh)
-    if tv_loss is not None:
-        all_ret["tv_loss"] = tv_loss
+    for k, v in scalar_ret.items():
+        if v is not None:
+            all_ret[k] = v
 
     # ---------------------------
     # Projektion extrahieren
@@ -258,6 +262,10 @@ def raw2outputs_emission(
     use_attenuation=False,
     attenuation_debug=False,
     debug_prints: bool = False,
+    tv_mu_sigma: float = 1.0,
+    mu_gate_mode: str = "none",
+    mu_gate_center: float = 0.2,
+    mu_gate_width: float = 0.1,
 ):
     """
     Emissions-NeRF:
@@ -302,10 +310,37 @@ def raw2outputs_emission(
         lambda_vals = torch.clamp(lambda_vals + noise, min=0.0)
 
     # 1D-TV entlang der Samples (Charbonnier-Variante für stabile Gradienten)
-    diff = lambda_vals[..., 1:] - lambda_vals[..., :-1]
+    diff_lambda = lambda_vals[..., 1:] - lambda_vals[..., :-1]
     eps = 1e-6
-    tv_ray = torch.sqrt(diff * diff + eps)
-    tv_loss = tv_ray.mean()
+    tv_ray = torch.sqrt(diff_lambda * diff_lambda + eps)
+    tv_base = tv_ray.mean()
+
+    # Edge-aware TV, gewichtet mit μ-Differenzen (kleine Δμ => starke TV, große Δμ => schwächer)
+    if mu_vals is not None:
+        diff_mu = mu_vals[..., 1:] - mu_vals[..., :-1]
+    else:
+        diff_mu = torch.zeros_like(diff_lambda)
+    sigma = max(float(tv_mu_sigma), 1e-8)
+    w_mu = torch.exp(-torch.abs(diff_mu) / (sigma + 1e-8))
+    tv_mu = (w_mu * tv_ray).mean()
+
+    # μ-basierter Prior auf Emissionen (weiches Gate)
+    mu_gate_loss = lambda_vals.new_tensor(0.0)
+    gate_mode = (mu_gate_mode or "none").lower()
+    if gate_mode != "none" and mu_vals is not None:
+        center = float(mu_gate_center)
+        width = float(mu_gate_width)
+        if gate_mode == "bandpass":
+            dist = torch.clamp(torch.abs(mu_vals - center) - width, min=0.0)
+        elif gate_mode == "lowpass":
+            dist = torch.clamp(mu_vals - center, min=0.0)
+        elif gate_mode == "highpass":
+            dist = torch.clamp(center - mu_vals, min=0.0)
+        else:
+            dist = None
+        if dist is not None:
+            penalty = dist * dist * lambda_vals
+            mu_gate_loss = penalty.mean()
 
     transmission = None
     # Grundfall: keine Attenuation → einfache Gewichte = e * Δs
@@ -379,7 +414,7 @@ def raw2outputs_emission(
         if transmission is not None:
             debug_payload["debug_transmission"] = transmission.detach()
 
-    return proj_map, disp_map, acc_map, debug_payload, tv_loss
+    return proj_map, disp_map, acc_map, debug_payload, tv_base, tv_mu, mu_gate_loss
 
 
 # ---------------------------
@@ -449,6 +484,10 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
     use_attenuation = bool(kwargs.get("use_attenuation", False))
     attenuation_debug = bool(kwargs.get("attenuation_debug", False))
     debug_prints = bool(kwargs.get("debug_prints", False))
+    tv_mu_sigma = float(kwargs.get("tv_mu_sigma", 1.0))
+    mu_gate_mode = kwargs.get("mu_gate_mode", "none")
+    mu_gate_center = float(kwargs.get("mu_gate_center", 0.2))
+    mu_gate_width = float(kwargs.get("mu_gate_width", 0.1))
     mu_vals = None
 
     # Falls Attenuation aktiviert und CT-Context vorhanden: µ aus CT sampeln
@@ -479,7 +518,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
 
     # Emissions-Pfad (SPECT)
     if emission:
-        proj_map, disp_map, acc_map, debug_payload, tv_loss = raw2outputs_emission(
+        proj_map, disp_map, acc_map, debug_payload, tv_base_loss, tv_mu_loss, mu_gate_loss = raw2outputs_emission(
             raw,
             z_vals,
             rays_d,
@@ -489,9 +528,21 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
             use_attenuation=use_attenuation,
             attenuation_debug=attenuation_debug,
             debug_prints=debug_prints,
+            tv_mu_sigma=tv_mu_sigma,
+            mu_gate_mode=mu_gate_mode,
+            mu_gate_center=mu_gate_center,
+            mu_gate_width=mu_gate_width,
         )
         # Standard-Outputs
-        ret = {'proj_map': proj_map, 'disp_map': disp_map, 'acc_map': acc_map, 'tv_loss': tv_loss}
+        ret = {
+            'proj_map': proj_map,
+            'disp_map': disp_map,
+            'acc_map': acc_map,
+            'tv_loss': tv_base_loss,
+            'tv_base_loss': tv_base_loss,
+            'tv_mu_loss': tv_mu_loss,
+            'mu_gate_loss': mu_gate_loss,
+        }
         # Debug-Infos aus raw2outputs_emission übernehmen
         if debug_payload:
             ret.update(debug_payload)
