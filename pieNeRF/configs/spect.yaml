@@ -20,6 +20,9 @@ data:
   projection_normalization: none
   act_scale: 1.0                                # globaler λ-Faktor (keine Normierung; für konsistente Skalen zu Projekten anpassen)
   use_organ_mask: false                         # optionales Laden einer Organmaske (mask.npy) pro Phantom
+  act_flip_lr: false                             # optionaler LR-Flip für ACT (zur Orientierungskorrektur)
+  act_flip_si: true                            # optionaler SI-Flip für ACT (zur Orientierungskorrektur, axis=SI)
+  act_debug_marker: false                       # Marker + Assertion/Logs für ACT-Debug
 
 
   # radius & fov sind bei orthographic nicht so wichtig, können aber gesetzt bleiben

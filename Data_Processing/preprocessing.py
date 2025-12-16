@@ -3,7 +3,7 @@
 preprocessing.py
 
 Preprocessing-Schritt für XCAT-Phantome mit
-- physikalisch plausibler Aktivitätskonzentration (Lu-177-PSMA, kBq/mL)
+- physikalisch plausibler Intensitätsverteilung (Lu-177-PSMA, counts/voxel)
 - Gamma-Kamera-Forwardmodell (Scatter + Kollimator)
 - optionaler Poisson-Rauschsimulation in den Projektionen
 - rein RELATIVE Projektionen (AP/PA), global normalisiert
@@ -16,7 +16,7 @@ Erwartete Ordnerstruktur:
 Erzeugt im out/-Ordner:
   spect_att.npy   — SPECT-Attenuation-Volumen (z.B. bei 208 keV), (x,y,z)
   ct_att.npy      — CT-Attenuation-Volumen (z.B. bei 80 keV), (x,y,z)
-  act.npy         — Aktivitätskonzentration (kBq/mL), (x,y,z)
+  act.npy         — Intensitätsverteilung (counts/voxel), (x,y,z)
   ap.npy          — AP-Projektion, RELATIVE Intensität (0..1 oder ähnlich)
   pa.npy          — PA-Projektion, RELATIVE Intensität
   meta_simple.json — Meta-Infos inkl. Normalisierungsfaktor
@@ -118,7 +118,7 @@ def load_bin_xyz(path: Path, shape_str: str, dtype: str = "float32", order: str 
 
 
 # -----------------
-# Aktivität aus Maske (Lu-177-PSMA, kBq/mL)
+# Aktivität aus Maske (Lu-177-PSMA)
 # -----------------
 
 def build_activity_from_mask(mask_xyz: np.ndarray,
@@ -130,7 +130,7 @@ def build_activity_from_mask(mask_xyz: np.ndarray,
     organ_ids_txt: Textdatei mit Zeilen der Form 'name = id'
 
     Rückgabe:
-      act_xyz:   Aktivitätskonzentration (kBq/mL), gleiche Shape wie Maske
+      act_xyz:   Intensitätswerte, gleiche Shape wie Maske
       mask_roi:  0/1-Maske aller 'relevanten' Organe (gleiche Shape)
       info:      Dictionary mit den zugewiesenen Werten pro Organ
     """
@@ -151,22 +151,21 @@ def build_activity_from_mask(mask_xyz: np.ndarray,
     else:
         raise FileNotFoundError(f"organ_ids.txt nicht gefunden: {organ_ids_txt}")
 
-    # 2) Plausible Aktivitätskonzentrationen für Lu-177-PSMA (kBq/mL)
-    #    grobe Bereiche um einen 24–48h SPECT-Zeitpunkt.
+    # 2) Plausible Intensitätsverteilung für Lu-177-PSMA (Counts/Voxel; Range von VOI-Auswertung d. vorliegenden klin. SPECT übernommen)
     #    Alle Organe, die hier drin stehen UND in organ_ids.txt vorkommen,
     #    gelten als "relevant" für die spätere 0/1-Maske.
-    default_ranges_kBqml = {
-        # Tumor/Prostata-Hotspot
+    default_ranges_counts = {
+        # Prostata-Hotspot
         "prostate":     (2000.0, 6000.0),
         # Nieren (kritisches Organ, typ. hohe Aufnahme)
-        "lkidney":      (1000.0, 3000.0),
-        "rkidney":      (1000.0, 3000.0),
+        "lkidney":      (300.0, 3800.0),
+        "rkidney":      (300.0, 3800.0),
         # Milz (relativ hoher Uptake, aber unter Niere)
-        "spleen":       (400.0, 1000.0),
+        "spleen":       (250.0, 1800.0),
         # Leber (moderater Hintergrund)
-        "liver":        (200.0, 600.0),
+        "liver":        (50.0, 600.0),
         # Dünndarm / intestinale Aufnahme
-        "small_intest": (150.0, 400.0),
+        "small_intest": (0.0, 400.0),
     }
 
     act = np.zeros(mask_xyz.shape, dtype=np.float32)
@@ -176,25 +175,25 @@ def build_activity_from_mask(mask_xyz: np.ndarray,
     rng = np.random.default_rng(rng_seed)
     organ_activity_info: Dict[str, Dict] = {}
 
-    for organ_name, (low, high) in default_ranges_kBqml.items():
+    for organ_name, (low, high) in default_ranges_counts.items():
         if organ_name not in name_to_id:
             continue
         organ_id = name_to_id[organ_name]
 
-        # homogene Zufallsaktivitätskonzentration aus [low, high] kBq/mL
-        val_kBqml = float(rng.uniform(low, high))
+        # homogene Zufallsaktivitätsverteilung aus [low, high]
+        val_counts = float(rng.uniform(low, high))
 
         organ_voxels = (mask_xyz == organ_id)
         if not np.any(organ_voxels):
             continue
 
-        act[organ_voxels] = val_kBqml
+        act[organ_voxels] = val_counts
         mask_roi[organ_voxels] = 1.0  # alle diese Voxeln sind Teil der relevanten Organe
 
         organ_activity_info[organ_name] = {
             "organ_id": int(organ_id),
-            "range_kBq_per_ml": [float(low), float(high)],
-            "assigned_value_kBq_per_ml": val_kBqml,
+            "range_counts": [float(low), float(high)],
+            "assigned_value_counts": val_counts,
         }
 
     return act, mask_roi, organ_activity_info
@@ -369,7 +368,7 @@ def normalize_projections(ap_raw: np.ndarray,
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Converter: BIN -> spect_att.npy, ct_att.npy, act.npy (kBq/mL), ap.npy, pa.npy (relative, normalisiert)"
+        description="Converter: BIN -> spect_att.npy, ct_att.npy, act.npy (counts), ap.npy, pa.npy (relative, normalisiert)"
     )
     p.add_argument("--base", type=Path, required=True,
                    help="Basisordner des Phantoms (z.B. /pfad/zu/phantom_01)")
@@ -496,7 +495,7 @@ def main():
     else:
         rng_seed = args.activity_seed
 
-    # Aktivität aus Maske (kBq/mL) + 0/1-Organmaske der "relevanten" Organe
+    # Aktivität aus Maske (counts) + 0/1-Organmaske der "relevanten" Organe
     act_xyz, mask_roi_xyz, organ_info = build_activity_from_mask(
         mask_xyz=mask_xyz,
         organ_ids_txt=organ_ids_path,
@@ -504,8 +503,8 @@ def main():
     )
 
     print(f"[ACT] act_xyz: shape={act_xyz.shape}, "
-          f"min={act_xyz.min():.1f} kBq/mL, max={act_xyz.max():.1f} kBq/mL, "
-          f"mean={act_xyz.mean():.1f} kBq/mL")
+          f"min={act_xyz.min():.1f} counts/voxel, max={act_xyz.max():.1f} counts/voxel, "
+          f"mean={act_xyz.mean():.1f} counts/voxel")
 
     # SPECT-µ in Ziel-Einheit bringen
     mu_xyz = convert_mu_units(spect_xyz, args.mu_unit, args.mu_target_unit)
@@ -605,7 +604,7 @@ def main():
         "ct_bin":    str(ct_bin_path),
         "mask_bin":  str(mask_bin_path),
         "organ_ids": str(organ_ids_path),
-        "activity_unit": "kBq/mL",
+        "activity_unit": "counts/voxel",
         "lu177_psma_like": True,
         "organ_activity_info": organ_info,
         "has_binary_roi_mask": True,

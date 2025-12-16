@@ -234,9 +234,8 @@ class Generator(object):
 
         self.pose_ap = _pose_from_loc(loc_ap, up=up)
         self.pose_pa = _pose_from_loc(loc_pa, up=up)
-        # look_at(..., -z) kehrt die x-Achse um (diag[-1,1,-1]); dadurch wäre PA spiegelverkehrt
-        # zu den PA-GT-Projektionen. Durch Rückspiegeln der x-Achse stimmen die Pixelrichtungen wieder.
-        self.pose_pa[:, 0] *= -1.0                          # multipliziert die erste Spalte (x-Achse) mit -1 (korrigiert so die Spiegelung)
+        # Korrigiere Spiegelung nur für PA (AP bleibt unverändert, damit die Orientierung nicht gekippt ist).
+        self.pose_pa[:, 0] *= -1.0
 
         self.fixed_poses_enabled = True
         self._fixed_pose_toggle = 0                         # starte mit AP
@@ -246,7 +245,15 @@ class Generator(object):
             size = 2.0 * float(radius)
             self.ortho_size = (size, size)
 
-    def render_from_pose(self, z, pose, ct_context=None):
+    def render_from_pose(
+        self,
+        z,
+        pose,
+        ct_context=None,
+        debug_override=None,
+        return_rays=False,
+        force_disable_atten=False,
+    ):
         """
         Render eine komplette Projektion aus einer festen Kamerapose.
 
@@ -254,7 +261,7 @@ class Generator(object):
             proj_flat: [bs, H*W]  (synthetische Projektion, flach)
             disp_flat: [bs, H*W]
             acc_flat:  [bs, H*W]
-            extras:    dict (alles Weitere aus NeRF-Rendering)
+            extras:    dict (alles Weitere aus NeRF-Rendering; bei return_rays=True inkl. Roh-Rays)
         """
         bs = z.shape[0]
         device = self.device
@@ -276,6 +283,9 @@ class Generator(object):
 
         # Latente Codes als "features" übergeben
         render_kwargs["features"] = z
+
+        if debug_override:
+            render_kwargs.update(debug_override)
 
         # 3) Falls Radius als Intervall gegeben ist: near/far pro Ray anpassen (brauche ich eig. nicht)
         if isinstance(self.radius, tuple):
@@ -299,7 +309,7 @@ class Generator(object):
             render_kwargs["far"] = far
 
         # 4) Zusatz-Kontext (z. B. CT-Volumen) übergeben, falls vorhanden
-        if ct_context is not None:
+        if ct_context is not None and not force_disable_atten:
             render_kwargs["ct_context"] = ct_context
         elif render_kwargs.get("use_attenuation"):
             render_kwargs["use_attenuation"] = False
@@ -344,6 +354,13 @@ class Generator(object):
             disp_flat = disp.reshape(-1).view(bs, -1)
         if acc is not None:
             acc_flat = acc.reshape(-1).view(bs, -1)
+
+        if return_rays:
+            if not isinstance(extras, dict):
+                extras = {"extras": extras}
+            else:
+                extras = dict(extras)
+            extras["_rays"] = batch_rays.detach()
 
         return proj_flat, disp_flat, acc_flat, extras
 

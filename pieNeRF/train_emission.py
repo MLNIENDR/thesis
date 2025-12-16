@@ -204,6 +204,39 @@ def parse_args():
         action="store_true",
         help="Logge λ/μ/T für einen Beispielstrahl (benötigt nerf.attenuation_debug=True).",
     )
+    parser.add_argument(
+        "--preview-only",
+        action="store_true",
+        help="Rendert nur einen schnellen AP/PA-Preview (Step 0) mit aktuellen Orientierungen und beendet.",
+    )
+    parser.add_argument(
+        "--debug-ap-pa",
+        action="store_true",
+        help="Aktiviert Debug-Vergleich der ungeflippten AP/PA-Rohprojektionen im Preview-Step.",
+    )
+    parser.add_argument(
+        "--debug-ap-pa-save-npy",
+        action="store_true",
+        help="Speichert zusätzliche .npy-Dumps der AP/PA-Rohwerte und ihrer Differenz (nur mit --debug-ap-pa).",
+    )
+    parser.add_argument(
+        "--debug-ap-pa-every",
+        type=int,
+        default=50,
+        help="Speicher-Intervall (in Steps) für AP/PA-Debug-Assets (PNG/NPY/Hist) bei aktiviertem --debug-ap-pa.",
+    )
+    parser.add_argument(
+        "--debug-ap-pa-assets",
+        type=str,
+        default="images+hists",
+        choices=["none", "images", "images+hists", "all"],
+        help="Welche AP/PA-Debug-Assets gespeichert werden (PNG/NPY/Histogramme), wenn --debug-ap-pa aktiv ist.",
+    )
+    parser.add_argument(
+        "--debug-final-no-atten",
+        action="store_true",
+        help="Render finale AP/PA zusätzlich ohne Attenuation und vergleiche RMSE/STD.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     return parser.parse_args()
 
@@ -250,6 +283,304 @@ def adjust_projection(arr: np.ndarray, view: str) -> np.ndarray:
     flipped = np.flipud(arr)
     rotated = np.rot90(flipped, k=-1)
     return rotated
+
+
+def save_img_linear(arr: np.ndarray, path: Path, vmin=None, vmax=None, symmetric=False, cmap="gray", title=None):
+    """Save image with linear scaling and optional symmetric range (debug helper)."""
+    import matplotlib.pyplot as plt
+
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    if vmin is None:
+        vmin = float(np.min(arr))
+    if vmax is None:
+        vmax = float(np.max(arr))
+    if symmetric:
+        m = max(abs(vmin), abs(vmax))
+        vmin, vmax = -m, m
+    if np.isclose(vmin, vmax):
+        img = np.zeros_like(arr)
+    else:
+        clipped = np.clip(arr, vmin, vmax)
+        img = (clipped - vmin) / (vmax - vmin + 1e-8)
+
+    plt.figure(figsize=(6, 4))
+    plt.imshow(img, cmap=cmap, vmin=0.0, vmax=1.0)
+    if title:
+        plt.title(title)
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+
+
+def _pose_summary(pose: torch.Tensor) -> str:
+    """Short, human-readable pose summary for AP/PA debug."""
+    if pose is None:
+        return "pose=None"
+    pose_cpu = pose.detach().cpu()
+    pos = pose_cpu[:3, 3] if pose_cpu.shape[-1] >= 4 else pose_cpu[:3, -1]
+    z_axis = pose_cpu[:3, 2] if pose_cpu.shape[-1] >= 3 else torch.zeros(3)
+    return (
+        f"t=({pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f}) "
+        f"z=({z_axis[0]:.3f},{z_axis[1]:.3f},{z_axis[2]:.3f})"
+    )
+
+
+def _safe_corrcoef_np(a: np.ndarray, b: np.ndarray) -> float:
+    """Numerically safe correlation on flattened arrays."""
+    a_flat = a.reshape(-1).astype(np.float64)
+    b_flat = b.reshape(-1).astype(np.float64)
+    a_c = a_flat - a_flat.mean()
+    b_c = b_flat - b_flat.mean()
+    denom = np.linalg.norm(a_c) * np.linalg.norm(b_c) + 1e-12
+    if denom == 0.0:
+        return float("nan")
+    corr = float(np.clip(np.dot(a_c, b_c) / denom, -1.0, 1.0))
+    return corr
+
+
+def debug_compare_ap_pa(
+    pred_ap_raw: torch.Tensor,
+    pred_pa_raw: torch.Tensor,
+    extras_ap,
+    extras_pa,
+    generator,
+    step: int,
+    tag: str,
+    debug_save_npy: bool,
+    out_dir: Path,
+    save_assets: bool,
+    asset_mode: str,
+):
+    """
+    AP/PA Debug:
+    This comparison decides whether AP/PA similarity is caused by geometry / transmission / view-switch bugs
+    or by visualization / normalization artifacts.
+    """
+    # Vergleich erfolgt auf den Rohprojektionen (ohne Rotate/Flip/Normierung)
+    assert pred_ap_raw.shape == pred_pa_raw.shape
+    assert pred_ap_raw.data_ptr() != pred_pa_raw.data_ptr()
+
+    debug_dir = out_dir / "ap_pa_debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    ap_np_raw = pred_ap_raw.detach().float().cpu().numpy()
+    pa_np_raw = pred_pa_raw.detach().float().cpu().numpy()
+
+    ap_flat = pred_ap_raw.detach().float().cpu()
+    pa_flat = pred_pa_raw.detach().float().cpu()
+    diff_flat = ap_flat - pa_flat
+    std_ap = torch.std(ap_flat).item()
+    std_pa = torch.std(pa_flat).item()
+    std_diff = torch.std(diff_flat).item()
+    max_abs = torch.max(torch.abs(diff_flat)).item()
+    mean_abs = torch.mean(torch.abs(diff_flat)).item()
+    rmse = torch.sqrt(torch.mean(diff_flat * diff_flat)).item()
+    ap_abs_max = torch.max(torch.abs(ap_flat)).item()
+    corr = _safe_corrcoef_np(ap_flat.numpy(), pa_flat.numpy())
+    ap0 = ap_flat - ap_flat.mean()
+    pa0 = pa_flat - pa_flat.mean()
+    diff0 = ap0 - pa0
+    corr_centered = _safe_corrcoef_np(ap0.numpy(), pa0.numpy())
+    rmse_centered = torch.sqrt(torch.mean(diff0 * diff0)).item()
+    practically_equal = (max_abs < 1e-6) or (max_abs / (ap_abs_max + 1e-8) < 1e-6)
+    print(
+        f"[debug ap/pa] eq={practically_equal} max_abs={max_abs:.3e} mean_abs={mean_abs:.3e} rmse={rmse:.3e} corr={corr:.3f} "
+        f"| corr_centered={corr_centered:.3f} rmse_centered={rmse_centered:.3e} "
+        f"| std_ap={std_ap:.3e} std_pa={std_pa:.3e} std_diff={std_diff:.3e}",
+        flush=True,
+    )
+    if debug_save_npy and save_assets:
+        np.save(debug_dir / f"step_{step:05d}_{tag}_ap_raw.npy", ap_np_raw)
+        np.save(debug_dir / f"step_{step:05d}_{tag}_pa_raw.npy", pa_np_raw)
+        np.save(debug_dir / f"step_{step:05d}_{tag}_ap_pa_diff.npy", ap_np_raw - pa_np_raw)
+
+    if save_assets:
+        # Zusätzliche Visualisierungen, um kleine Unterschiede sichtbar zu machen
+        shared_vmin = float(min(ap_np_raw.min(), pa_np_raw.min()))
+        shared_vmax = float(max(ap_np_raw.max(), pa_np_raw.max()))
+        diff_np = ap_np_raw - pa_np_raw
+        abs_diff_np = np.abs(diff_np)
+        p_signed = float(np.percentile(abs_diff_np, 99.5))
+        p_abs = float(np.percentile(abs_diff_np, 99.0))
+        if asset_mode in ("images", "images+hists", "all"):
+            save_img_linear(
+                ap_np_raw,
+                debug_dir / f"step_{step:05d}_{tag}_AP_shared.png",
+                vmin=shared_vmin,
+                vmax=shared_vmax,
+                title=f"AP shared scale @ step {step} ({tag})",
+            )
+            save_img_linear(
+                pa_np_raw,
+                debug_dir / f"step_{step:05d}_{tag}_PA_shared.png",
+                vmin=shared_vmin,
+                vmax=shared_vmax,
+                title=f"PA shared scale @ step {step} ({tag})",
+            )
+            save_img_linear(
+                diff_np,
+                debug_dir / f"step_{step:05d}_{tag}_DIFF_signed.png",
+                vmin=-p_signed,
+                vmax=+p_signed,
+                symmetric=True,
+                cmap="seismic",
+                title=f"AP-PA signed diff @ step {step} ({tag})",
+            )
+            save_img_linear(
+                abs_diff_np,
+                debug_dir / f"step_{step:05d}_{tag}_DIFF_abs.png",
+                vmin=0.0,
+                vmax=p_abs,
+                symmetric=False,
+                cmap="hot",
+                title=f"AP-PA abs diff @ step {step} ({tag})",
+            )
+        if asset_mode in ("images+hists", "all"):
+            # Histogramme für AP, PA, Diff
+            try:
+                import matplotlib.pyplot as plt
+
+                plt.figure(figsize=(9, 3))
+                plt.subplot(1, 3, 1)
+                plt.hist(ap_np_raw.ravel(), bins=50, color="blue", alpha=0.7)
+                plt.title("AP")
+                plt.subplot(1, 3, 2)
+                plt.hist(pa_np_raw.ravel(), bins=50, color="orange", alpha=0.7)
+                plt.title("PA")
+                plt.subplot(1, 3, 3)
+                plt.hist(diff_np.ravel(), bins=50, color="red", alpha=0.7)
+                plt.title("AP-PA")
+                plt.tight_layout()
+                plt.savefig(debug_dir / f"step_{step:05d}_{tag}_hists.png", dpi=150)
+                plt.close()
+            except Exception as exc:  # pragma: no cover - best effort
+                print(f"[debug ap/pa] histogram generation failed: {exc}", flush=True)
+
+    if practically_equal:
+        # --- View-Switch / Transmission Debug ---
+        rays_ap = extras_ap.get("_rays") if isinstance(extras_ap, dict) else None
+        rays_pa = extras_pa.get("_rays") if isinstance(extras_pa, dict) else None
+
+        def _ensure_rays(pose):
+            focal_or_size = generator.ortho_size if generator.orthographic else generator.focal
+            rays_full, _, _ = generator.val_ray_sampler(generator.H, generator.W, focal_or_size, pose)
+            return rays_full
+
+        if rays_ap is None:
+            rays_ap = _ensure_rays(generator.pose_ap)
+        if rays_pa is None:
+            rays_pa = _ensure_rays(generator.pose_pa)
+
+        rays_ap_cpu = rays_ap.detach().cpu()
+        rays_pa_cpu = rays_pa.detach().cpu()
+        num_rays = rays_ap_cpu.shape[1]
+        sample_idx = torch.randperm(num_rays)[: min(3, num_rays)]
+        print(f"[debug ap/pa][pose] AP {_pose_summary(generator.pose_ap)} | PA {_pose_summary(generator.pose_pa)}", flush=True)
+        for i, idx in enumerate(sample_idx.tolist()):
+            o_ap, d_ap = rays_ap_cpu[0, idx], rays_ap_cpu[1, idx]
+            o_pa, d_pa = rays_pa_cpu[0, idx], rays_pa_cpu[1, idx]
+            print(
+                f"[debug ap/pa][rays] #{i} idx={idx} "
+                f"AP o=({o_ap[0]:.3f},{o_ap[1]:.3f},{o_ap[2]:.3f}) d=({d_ap[0]:.3f},{d_ap[1]:.3f},{d_ap[2]:.3f}) | "
+                f"PA o=({o_pa[0]:.3f},{o_pa[1]:.3f},{o_pa[2]:.3f}) d=({d_pa[0]:.3f},{d_pa[1]:.3f},{d_pa[2]:.3f})",
+                flush=True,
+            )
+
+        if torch.allclose(rays_ap_cpu, rays_pa_cpu, atol=1e-6, rtol=0):
+            print("⚠️ [debug ap/pa] POTENTIAL BUG: AP/PA rays identical.", flush=True)
+
+        def _log_attenuation(label: str, extras):
+            if not isinstance(extras, dict):
+                print(f"[debug ap/pa][atten] {label}: extras missing.", flush=True)
+                return
+            mu_vals = extras.get("debug_mu")
+            dists_vals = extras.get("debug_dists")
+            transmission_vals = extras.get("debug_transmission")
+            if mu_vals is None or dists_vals is None:
+                print(f"[debug ap/pa][atten] {label}: no mu/dists in extras.", flush=True)
+                return
+            mu_clamped = torch.clamp(mu_vals, min=0.0)
+            mu_min, mu_mean, mu_max = mu_clamped.min().item(), mu_clamped.mean().item(), mu_clamped.max().item()
+            mu_dists = mu_clamped * dists_vals
+            tau = torch.cumsum(mu_dists, dim=-1)
+            tau = F.pad(tau[..., :-1], (1, 0), mode="constant", value=0.0)
+            atten = transmission_vals if transmission_vals is not None else torch.exp(-tau)
+            tau_min, tau_mean, tau_max = tau.min().item(), tau.mean().item(), tau.max().item()
+            att_min, att_mean, att_max = atten.min().item(), atten.mean().item(), atten.max().item()
+            print(
+                f"[debug ap/pa][atten] {label}: mu(min/mean/max)={mu_min:.3e}/{mu_mean:.3e}/{mu_max:.3e} "
+                f"| tau(min/mean/max)={tau_min:.3e}/{tau_mean:.3e}/{tau_max:.3e} "
+                f"| atten(min/mean/max)={att_min:.3e}/{att_mean:.3e}/{att_max:.3e}",
+                flush=True,
+            )
+
+        _log_attenuation("AP", extras_ap)
+        _log_attenuation("PA", extras_pa)
+    else:
+        vmin_ap, vmax_ap = float(ap_np_raw.min()), float(ap_np_raw.max())
+        vmin_pa, vmax_pa = float(pa_np_raw.min()), float(pa_np_raw.max())
+        shared_vmin = min(vmin_ap, vmin_pa)
+        shared_vmax = max(vmax_ap, vmax_pa)
+        print(
+            f"[debug ap/pa][vmin/vmax] ap=({vmin_ap:.3e},{vmax_ap:.3e}) | pa=({vmin_pa:.3e},{vmax_pa:.3e}) | shared=({shared_vmin:.3e},{shared_vmax:.3e})",
+            flush=True,
+        )
+        ap_np_vis = adjust_projection(ap_np_raw, "ap")
+        pa_np_vis = adjust_projection(pa_np_raw, "pa")
+        save_img_linear(
+            ap_np_vis,
+            debug_dir / f"step_{step:05d}_{tag}_AP_shared.png",
+            vmin=shared_vmin,
+            vmax=shared_vmax,
+            title=f"AP shared scale @ step {step} ({tag})",
+        )
+        save_img_linear(
+            pa_np_vis,
+            debug_dir / f"step_{step:05d}_{tag}_PA_shared.png",
+            vmin=shared_vmin,
+            vmax=shared_vmax,
+            title=f"PA shared scale @ step {step} ({tag})",
+        )
+        diff_vis = ap_np_vis - pa_np_vis
+        save_img_linear(
+            diff_vis,
+            debug_dir / f"step_{step:05d}_{tag}_AP_PA_diff.png",
+            symmetric=True,
+            cmap="seismic",
+            title=f"AP-PA diff @ step {step} ({tag})",
+        )
+        best_transform, best_rmse, best_corr = _find_best_pa_transform(pa_np_raw, ap_np_raw)
+        print(
+            f"[debug ap/pa][transform] best={best_transform} best_rmse={best_rmse:.3e} best_corr={best_corr:.3f} | outputs highly similar; narrow dynamic range may make previews look identical",
+            flush=True,
+        )
+
+
+
+def _find_best_pa_transform(pa_raw: np.ndarray, ap_raw: np.ndarray):
+    """Try 8 simple 2D transforms to align PA to AP and report best RMSE/corr."""
+    transforms = [
+        ("identity", lambda x: x),
+        ("flip_ud", np.flipud),
+        ("flip_lr", np.fliplr),
+        ("rot90", lambda x: np.rot90(x, 1)),
+        ("rot180", lambda x: np.rot90(x, 2)),
+        ("rot270", lambda x: np.rot90(x, 3)),
+        ("transpose", lambda x: np.transpose(x)),
+        ("transpose_flip_lr", lambda x: np.fliplr(np.transpose(x))),
+    ]
+    best = ("none", float("inf"), float("nan"))
+    for name, fn in transforms:
+        cand = fn(pa_raw)
+        if cand.shape != ap_raw.shape:
+            continue
+        diff = cand - ap_raw
+        rmse = float(np.sqrt(np.mean(diff * diff)))
+        corr = _safe_corrcoef_np(cand, ap_raw)
+        if rmse < best[1]:
+            best = (name, rmse, corr)
+    return best
 
 
 def poisson_nll(
@@ -343,6 +674,10 @@ def render_minibatch(generator, z_latent, rays_subset, need_raw: bool = False, c
     return proj_map.view(z_latent.shape[0], -1), extras
 
 
+# Preview renderers:
+# - maybe_render_preview: periodic previews during training / preview_only (step-based).
+# - Smoke-test preview before training loop (quick AP/PA render for NaN check).
+# - Final preview block at end of train(): writes final_AP.png / final_PA.png after the training loop.
 def maybe_render_preview(
     step,
     args,
@@ -353,31 +688,111 @@ def maybe_render_preview(
     act_volume=None,
     ct_context=None,
 ):
-    # Volle AP/PA-Renderings sind teuer; nur alle N Schritte ausführen
-    if args.preview_every <= 0 or (step % args.preview_every) != 0:
+    debug_ap_pa = bool(getattr(args, "debug_ap_pa", False))
+    debug_save_npy = debug_ap_pa and bool(getattr(args, "debug_ap_pa_save_npy", False))
+    debug_every = max(1, int(getattr(args, "debug_ap_pa_every", 50)))
+    asset_mode = getattr(args, "debug_ap_pa_assets", "images+hists")
+    debug_final_no_atten = bool(getattr(args, "debug_final_no_atten", False))
+    do_preview = args.preview_every > 0 and (step % args.preview_every) == 0
+
+    # Volle AP/PA-Renderings sind teuer; ohne Debug nur zu den geplanten Intervallen rendern.
+    if not (do_preview or debug_ap_pa):
         return
+    if debug_ap_pa:
+        print(f"[debug ap/pa] ENTER preview path (preview) at step {step}", flush=True)
+
     prev_flag = generator.use_test_kwargs
     generator.eval()
     generator.use_test_kwargs = True
+
     ctx = ct_context or generator.build_ct_context(ct_volume)
+
+    debug_override = None
+    return_rays = False
+    if debug_ap_pa:
+        debug_override = {
+            "attenuation_debug": True,
+            "retraw": True,
+        }
+        if DEBUG_PRINTS:
+            debug_override["debug_prints"] = True
+        return_rays = True
+
     with torch.no_grad():
-        proj_ap, _, _, _ = generator.render_from_pose(z_eval, generator.pose_ap, ct_context=ctx)
-        proj_pa, _, _, _ = generator.render_from_pose(z_eval, generator.pose_pa, ct_context=ctx)
+        proj_ap, _, _, extras_ap = generator.render_from_pose(
+            z_eval, generator.pose_ap, ct_context=ctx, debug_override=debug_override, return_rays=return_rays
+        )
+        proj_pa, _, _, extras_pa = generator.render_from_pose(
+            z_eval, generator.pose_pa, ct_context=ctx, debug_override=debug_override, return_rays=return_rays
+        )
+
+    # ursprünglichen Modus wiederherstellen
     generator.train()
     generator.use_test_kwargs = prev_flag or False
+
     H, W = generator.H, generator.W
-    ap_np = proj_ap[0].reshape(H, W).detach().cpu().numpy()
-    pa_np = proj_pa[0].reshape(H, W).detach().cpu().numpy()
-    ap_np = adjust_projection(ap_np, "ap")
-    pa_np = adjust_projection(pa_np, "pa")
+
+    pred_ap_raw = proj_ap[0].reshape(H, W)
+    pred_pa_raw = proj_pa[0].reshape(H, W)
+    ap_np_raw = pred_ap_raw.detach().cpu().numpy()
+    pa_np_raw = pred_pa_raw.detach().cpu().numpy()
+
     out_dir = outdir / "preview"
     out_dir.mkdir(parents=True, exist_ok=True)
-    save_img(ap_np, out_dir / f"step_{step:05d}_AP.png", title=f"AP @ step {step}")
-    save_img(pa_np, out_dir / f"step_{step:05d}_PA.png", title=f"PA @ step {step}")
-    save_depth_profile(step, generator, z_eval, ct_volume, act_volume, out_dir, proj_ap=proj_ap, proj_pa=proj_pa)
-    print("🖼️ Preview gespeichert:", flush=True)
-    print("   ", (out_dir / f"step_{step:05d}_AP.png").resolve(), flush=True)
-    print("   ", (out_dir / f"step_{step:05d}_PA.png").resolve(), flush=True)
+
+    print(
+        f"[preview step {step:05d}] "
+        f"AP min/max={ap_np_raw.min():.3e}/{ap_np_raw.max():.3e} | "
+        f"PA min/max={pa_np_raw.min():.3e}/{pa_np_raw.max():.3e}",
+        flush=True,
+    )
+    if args.debug_ap_pa:
+        save_assets = (step % debug_every) == 0
+        debug_compare_ap_pa(
+            pred_ap_raw,
+            pred_pa_raw,
+            extras_ap,
+            extras_pa,
+            generator,
+            step,
+            tag="preview",
+            debug_save_npy=debug_save_npy,
+            out_dir=out_dir,
+            save_assets=save_assets,
+            asset_mode=asset_mode,
+        )
+
+    if do_preview:
+        # -------- VIS (mit adjust_projection) --------
+        ap_np_vis = adjust_projection(ap_np_raw, "ap")
+        pa_np_vis = adjust_projection(pa_np_raw, "pa")
+
+        save_img(
+            ap_np_vis,
+            out_dir / f"step_{step:05d}_AP.png",
+            title=f"AP @ step {step}",
+        )
+        save_img(
+            pa_np_vis,
+            out_dir / f"step_{step:05d}_PA.png",
+            title=f"PA @ step {step}",
+        )
+
+        # Depth-Profile wieder mitspeichern (teilt Rendering mit den Previews).
+        save_depth_profile(
+            step,
+            generator,
+            z_eval,
+            ct_volume,
+            act_volume,
+            out_dir,
+            proj_ap=proj_ap,
+            proj_pa=proj_pa,
+        )
+
+        print("🖼️ Preview gespeichert:", flush=True)
+        print("   ", (out_dir / f"step_{step:05d}_AP.png").resolve(), flush=True)
+        print("   ", (out_dir / f"step_{step:05d}_PA.png").resolve(), flush=True)
 
 
 def init_log_file(path: Path):
@@ -438,6 +853,167 @@ def compute_tv3d_stub(*args, device=None, **kwargs):
         device = kwargs["device"]
     device = device or torch.device("cpu")
     return torch.tensor(0.0, device=device)
+
+
+def save_algorithm_orientation_debug(
+    outdir: Path,
+    H: int,
+    W: int,
+    ap: Optional[torch.Tensor],
+    pa: Optional[torch.Tensor],
+    ct_context: Optional[dict],
+    ct_vol: Optional[torch.Tensor] = None,
+    spect_att_vol: Optional[torch.Tensor] = None,
+    act_vol: Optional[torch.Tensor] = None,
+    mask_vol: Optional[torch.Tensor] = None,
+    prefix: str = "",
+):
+    """
+    Speichere die Daten exakt im Layout, das der Algorithmus nutzt (keine Orientierungs-Kosmetik).
+    - Projektionen: wie sie in ap_flat/pa_flat in die Losses gehen.
+    - Volumina: nach denselben Flips/Unsqueezes wie build_ct_context, MIP entlang der CT-Dimension.
+    """
+    debug_dir = outdir / "debug_algorithm_orientation"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    def log_and_save(name: str, arr: np.ndarray):
+        print(f"[algo-orient] {name} shape={arr.shape} min/max={arr.min():.3e}/{arr.max():.3e}", flush=True)
+        save_img(arr, debug_dir / f"{prefix}{name}.png", title=name)
+
+    def prep_volume(vol: Optional[torch.Tensor]) -> Optional[np.ndarray]:
+        if vol is None or not torch.is_tensor(vol) or vol.numel() == 0:
+            return None
+        arr = vol.detach().cpu()
+        if arr.dim() == 3:
+            arr = arr.unsqueeze(0)
+        if arr.dim() == 4:
+            arr = arr.unsqueeze(0)
+        if arr.dim() != 5:
+            return None
+        arr = torch.flip(arr, dims=[-1])
+        return arr.squeeze(0).squeeze(0).numpy()  # -> (D,H,W)
+
+    # Projektionen im Loss-Layout
+    if ap is not None and ap.numel() > 0:
+        ap_flat = ap.view(ap.shape[0], -1)
+        ap_used = ap_flat[0].detach().cpu().view(H, W).numpy()
+        log_and_save("ap_used", ap_used)
+    if pa is not None and pa.numel() > 0:
+        pa_flat = pa.view(pa.shape[0], -1)
+        pa_used = pa_flat[0].detach().cpu().view(H, W).numpy()
+        log_and_save("pa_used", pa_used)
+
+    # Volumina nach build_ct_context-Logik (Flip letzter Achse, Unsqueeze zu [1,1,D,H,W])
+    vol_ct_used = prep_volume(ct_vol)
+    vol_spect_used = prep_volume(spect_att_vol)
+    vol_mask_used = None
+    if ct_context is not None and isinstance(ct_context, dict):
+        ctx_vol = ct_context.get("volume")
+        if ctx_vol is not None and ctx_vol.numel() > 0:
+            vol_ct_used = ctx_vol.detach().cpu().squeeze(0).squeeze(0).numpy()
+        ctx_mask = ct_context.get("mask_volume")
+        if ctx_mask is not None and ctx_mask.numel() > 0:
+            vol_mask_used = ctx_mask.detach().cpu().squeeze(0).squeeze(0).numpy()
+    if vol_mask_used is None:
+        vol_mask_used = prep_volume(mask_vol)
+
+    def save_mip(name: str, vol_np: Optional[np.ndarray]):
+        if vol_np is None or vol_np.size == 0 or vol_np.ndim != 3:
+            return
+        mip = vol_np.max(axis=0)  # MIP entlang der Sampling-Dimension (D)
+        log_and_save(name, mip)
+
+    save_mip("ct_used_mip", vol_ct_used)
+    save_mip("spect_att_used_mip", vol_spect_used)
+
+    # ACT wird unverändert genutzt (keine Flips in build_ct_context) -> MIP über erste Achse
+    if act_vol is not None and torch.is_tensor(act_vol) and act_vol.numel() > 0:
+        act_arr = act_vol.detach().cpu()
+        if act_arr.dim() == 5:
+            act_arr = act_arr.squeeze(0).squeeze(0)
+        elif act_arr.dim() == 4:
+            act_arr = act_arr.squeeze(0)
+        if act_arr.dim() == 3:
+            act_np = act_arr.numpy()
+            act_mip = act_np.max(axis=0)
+            log_and_save("act_used_mip", act_mip)
+
+    if vol_mask_used is not None:
+        save_mip("mask_used_mip", vol_mask_used)
+    else:
+        print("[algo-orient] mask_used_mip skipped (no mask_volume present)", flush=True)
+
+
+def save_orientation_debug_sample(dataset, outdir: Path):
+    """
+    Speichere einmalig alle Eingaben (AP, PA, CT, ACT, Masken, Attenuation) in derselben
+    Anzeige-Orientierung wie die Previews, inklusive zusätzlichem flipud für Volumina.
+    """
+
+    def orient_projection(tensor: torch.Tensor, view: str) -> Optional[np.ndarray]:
+        if tensor is None or tensor.numel() == 0:
+            return None
+        arr = tensor.squeeze().detach().cpu().numpy()
+        return adjust_projection(arr, view=view)
+
+    def orient_volume(vol: torch.Tensor, name: str = "") -> Optional[np.ndarray]:
+        if vol is None or vol.numel() == 0:
+            return None
+        arr = vol.detach().cpu().numpy()
+        if arr.ndim == 4 and arr.shape[0] == 1:
+            arr = arr[0]
+        if arr.ndim != 3:
+            return None
+        mip = arr.max(axis=0)  # (LR, SI) – gleiche Achse wie orientation_preview (Dataset liefert bereits AP,LR,SI)
+        img = adjust_projection(mip, view="ap")  # gleiche Orientierung wie AP-Projektion
+        img = np.flipud(img)  # zusätzlicher Flip wie in orientation_preview validiert
+        if name == "act":
+            img = np.fliplr(img)  # ACT braucht zusätzlich flip LR für korrekte Anzeige
+        return img
+
+    try:
+        sample = dataset[0]
+    except Exception as exc:  # pragma: no cover - defensive logging
+        print(f"[WARN] Orientierungsvorschau übersprungen (Dataset-Access): {exc}", flush=True)
+        return
+
+    # Falls die Maske nicht aus dem Dataset geladen wurde, versuche sie direkt neben ap/ct zu laden (nur Debug/Preview).
+    if (sample.get("mask") is None or sample.get("mask").numel() == 0) and hasattr(dataset, "entries"):
+        try:
+            entry0 = dataset.entries[0]
+            base = Path(entry0.get("ct_path") or entry0.get("ap_path", "")).resolve().parent
+            mask_path = base / "mask.npy"
+            if mask_path.exists():
+                mask_np = np.load(mask_path).astype(np.float32)
+                # im Loader wird (1,0,2) transponiert → (AP, LR, SI)
+                mask_np = np.transpose(mask_np, (1, 0, 2))
+                sample["mask"] = torch.from_numpy(mask_np)
+        except Exception:
+            pass
+
+    orient_dir = outdir / "preview" / "orientation_debug"
+    orient_dir.mkdir(parents=True, exist_ok=True)
+
+    items = {
+        "ap": orient_projection(sample.get("ap"), view="ap"),
+        "pa": orient_projection(sample.get("pa"), view="pa"),
+        "ct_att": orient_volume(sample.get("ct"), name="ct"),
+        "spect_att": orient_volume(sample.get("spect_att"), name="spect_att"),
+        "act": orient_volume(sample.get("act"), name="act"),
+        "mask": orient_volume(sample.get("mask"), name="mask"),
+    }
+    for name, img in items.items():
+        if img is None:
+            continue
+        # Falls Bild im (W,H)-Layout kommt → nach (H,W) bringen
+        if img.ndim == 2 and img.shape[0] > img.shape[1]:
+            img = img.T
+        print(
+            f"[orientation] {name} min/max={np.min(img):.3e}/{np.max(img):.3e} shape={img.shape}",
+            flush=True,
+        )
+        save_img(img, orient_dir / f"{name}.png", title=name)
+    print(f"[orientation] Debug-PNGs gespeichert unter {orient_dir}", flush=True)
 
 
 def save_checkpoint(step, generator, z_train, optimizer, scaler, ckpt_dir: Path):
@@ -1074,6 +1650,7 @@ def train():
 
     dataset, hwfr, _ = get_data(config)
     config["data"]["hwfr"] = hwfr
+    save_orientation_debug_sample(dataset, outdir)
 
     batch_size = config["training"]["batch_size"]
     if batch_size != 1:
@@ -1128,22 +1705,120 @@ def train():
     z_train = torch.nn.Parameter(torch.zeros(1, z_dim, device=device))
     torch.nn.init.normal_(z_train, mean=0.0, std=1.0)
 
+    # Optional: Nur einen schnellen Preview rendern und beenden (kein Training).
+    if args.preview_only:
+        sample = dataset[0]
+        ct_vol = sample.get("ct")
+        act_vol = sample.get("act")
+        ct_att_vol = sample.get("ct_att")
+        spect_att_vol = sample.get("spect_att")
+        mask_vol_raw = sample.get("mask")
+        mask_vol = mask_vol_raw if use_organ_mask else None
+        ct_vol = ct_vol.to(device, non_blocking=True).float() if ct_vol is not None and ct_vol.numel() > 0 else None
+        act_vol = act_vol.to(device, non_blocking=True).float() if act_vol is not None and act_vol.numel() > 0 else None
+        ct_att_vol = ct_att_vol.to(device, non_blocking=True).float() if ct_att_vol is not None and ct_att_vol.numel() > 0 else None
+        spect_att_vol = (
+            spect_att_vol.to(device, non_blocking=True).float()
+            if spect_att_vol is not None and spect_att_vol.numel() > 0
+            else None
+        )
+        mask_vol = mask_vol.to(device, non_blocking=True).float() if mask_vol is not None and mask_vol.numel() > 0 else None
+        if bool(config["data"].get("act_debug_marker", False)) and act_vol is not None and act_vol.numel() > 0:
+            act_min = act_vol.min().item()
+            act_max = act_vol.max().item()
+            print(f"[ACT DEBUG][preview_before_ct_context] min/max/shape {act_min:.3e}/{act_max:.3e} {tuple(act_vol.shape)}", flush=True)
+        ct_context = generator.build_ct_context(
+            ct_vol if ct_vol is not None else spect_att_vol or ct_att_vol,
+            mask_volume=mask_vol,
+            att_volume=ct_att_vol,
+            spect_att_volume=spect_att_vol,
+        )
+        if bool(config["data"].get("act_debug_marker", False)) and ct_context is not None:
+            ctx_vol = ct_context.get("volume")
+            if ctx_vol is not None and ctx_vol.numel() > 0:
+                ctx_min = ctx_vol.min().item()
+                ctx_max = ctx_vol.max().item()
+                print(f"[ACT DEBUG][preview_ct_context_volume] min/max/shape {ctx_min:.3e}/{ctx_max:.3e} {tuple(ctx_vol.shape)}", flush=True)
+        save_algorithm_orientation_debug(
+            outdir,
+            generator.H,
+            generator.W,
+            sample.get("ap"),
+            sample.get("pa"),
+            ct_context,
+            ct_vol=ct_vol,
+            spect_att_vol=spect_att_vol,
+            act_vol=act_vol,
+            mask_vol=mask_vol_raw,
+            prefix="step0_",
+        )
+        maybe_render_preview(
+            0,
+            args,
+            generator,
+            z_train.detach(),
+            outdir,
+            ct_vol,
+            act_vol,
+            ct_context,
+        )
+        print("✅ Preview-only Modus: AP/PA-Previews für Step 0 gespeichert, Training übersprungen.", flush=True)
+        return
+
     # --- Sofortiger Smoke-Test ---
-    # Einmal vor dem eigentlichen Training rendern, um Setup/NaNs zu prüfen
+    # Preview-Pfad: schneller AP/PA-Render vor dem eigentlichen Training (Setup/NaN-Check)
+    debug_ap_pa = bool(getattr(args, "debug_ap_pa", False))
+    debug_save_npy = debug_ap_pa and bool(getattr(args, "debug_ap_pa_save_npy", False))
+    debug_every = max(1, int(getattr(args, "debug_ap_pa_every", 50)))
+    asset_mode = getattr(args, "debug_ap_pa_assets", "images+hists")
+    if debug_ap_pa:
+        print(f"[debug ap/pa] ENTER preview path (smoke) at step 0", flush=True)
     with torch.no_grad():
         generator.eval()
         generator.use_test_kwargs = True
         z_smoke = z_train.detach()
-        proj_ap, _, _, _ = generator.render_from_pose(z_smoke, generator.pose_ap)
-        proj_pa, _, _, _ = generator.render_from_pose(z_smoke, generator.pose_pa)
+        debug_override = None
+        return_rays = False
+        if debug_ap_pa:
+            debug_override = {
+                "attenuation_debug": True,
+                "retraw": True,
+            }
+            if DEBUG_PRINTS:
+                debug_override["debug_prints"] = True
+            return_rays = True
+        proj_ap, _, _, extras_ap = generator.render_from_pose(
+            z_smoke, generator.pose_ap, debug_override=debug_override, return_rays=return_rays
+        )
+        proj_pa, _, _, extras_pa = generator.render_from_pose(
+            z_smoke, generator.pose_pa, debug_override=debug_override, return_rays=return_rays
+        )
         generator.train()
         generator.use_test_kwargs = False
 
     H, W = generator.H, generator.W
-    ap_np = proj_ap[0].reshape(H, W).detach().cpu().numpy()
-    pa_np = proj_pa[0].reshape(H, W).detach().cpu().numpy()
+    pred_ap_raw = proj_ap[0].reshape(H, W)
+    pred_pa_raw = proj_pa[0].reshape(H, W)
+    ap_np_raw = pred_ap_raw.detach().cpu().numpy()
+    pa_np_raw = pred_pa_raw.detach().cpu().numpy()
     smoke_dir = outdir / "preview"
     smoke_dir.mkdir(parents=True, exist_ok=True)
+    if debug_ap_pa:
+        debug_compare_ap_pa(
+            pred_ap_raw,
+            pred_pa_raw,
+            extras_ap,
+            extras_pa,
+            generator,
+            tag="smoke",
+            debug_save_npy=debug_save_npy,
+            out_dir=smoke_dir,
+            step=0,
+            save_assets=False,
+            asset_mode=asset_mode,
+        )
+    ap_np = adjust_projection(ap_np_raw, "ap")
+    pa_np = adjust_projection(pa_np_raw, "pa")
     save_img(ap_np, smoke_dir / "smoke_AP.png", title="Smoke AP")
     save_img(pa_np, smoke_dir / "smoke_PA.png", title="Smoke PA")
     print("✅ Smoke-Test gespeichert:", flush=True)
@@ -1188,6 +1863,8 @@ def train():
 
     data_iter = iter(dataloader)
     ct_context = None
+    orientation_dump_done = False
+    final_debug_done = False
 
     print(
         f"🚀 Starting emission-NeRF training | steps={args.max_steps} | rays/proj={rays_per_proj} "
@@ -1221,7 +1898,8 @@ def train():
                 spect_att_vol = None
             else:
                 spect_att_vol = spect_att_vol.to(device, non_blocking=True).float()
-        mask_vol = batch.get("mask")
+        mask_vol_raw = batch.get("mask")
+        mask_vol = mask_vol_raw
         if mask_vol is not None:
             if mask_vol.numel() == 0:
                 mask_vol = None
@@ -1238,12 +1916,41 @@ def train():
         # bevorzugt ct_att als CT-Basis nutzen, falls vorhanden
         if ct_att_vol is not None:
             ct_vol = ct_att_vol
+
+        if bool(config["data"].get("act_debug_marker", False)) and act_vol is not None and act_vol.numel() > 0:
+            act_min = act_vol.min().item()
+            act_max = act_vol.max().item()
+            print(f"[ACT DEBUG][before_ct_context] min/max/shape {act_min:.3e}/{act_max:.3e} {tuple(act_vol.shape)}", flush=True)
+
         ct_context = generator.build_ct_context(
             ct_vol if ct_vol is not None else spect_att_vol or ct_att_vol,
             mask_volume=mask_vol,
             att_volume=ct_att_vol,
             spect_att_volume=spect_att_vol,
         )
+        if bool(config["data"].get("act_debug_marker", False)) and ct_context is not None:
+            ctx_vol = ct_context.get("volume")
+            if ctx_vol is not None and ctx_vol.numel() > 0:
+                ctx_min = ctx_vol.min().item()
+                ctx_max = ctx_vol.max().item()
+                print(f"[ACT DEBUG][ct_context_volume] min/max/shape {ctx_min:.3e}/{ctx_max:.3e} {tuple(ctx_vol.shape)}", flush=True)
+        if not orientation_dump_done:
+            save_algorithm_orientation_debug(
+                outdir,
+                generator.H,
+                generator.W,
+                ap,
+                pa,
+                ct_context,
+                ct_vol=ct_vol,
+                spect_att_vol=spect_att_vol,
+                act_vol=act_vol,
+                mask_vol=mask_vol_raw,
+            )
+            if bool(config["data"].get("act_debug_marker", False)) and act_vol is not None and act_vol.numel() > 0:
+                if bool(config["data"].get("act_flip_lr", False)) or bool(config["data"].get("act_flip_si", False)):
+                    assert act_vol.max().item() > 100, "ACT marker missing → wrong ACT tensor used"
+            orientation_dump_done = True
 
         ap_flat = ap.view(batch_size, -1)
         pa_flat = pa.view(batch_size, -1)
@@ -1519,22 +2226,91 @@ def train():
             ct_context,
         )
 
+    debug_ap_pa = bool(getattr(args, "debug_ap_pa", False))
+    debug_save_npy = debug_ap_pa and bool(getattr(args, "debug_ap_pa_save_npy", False))
+    debug_every = max(1, int(getattr(args, "debug_ap_pa_every", 50)))
+    asset_mode = getattr(args, "debug_ap_pa_assets", "images+hists")
+
     prev_flag = generator.use_test_kwargs
     generator.eval()
     generator.use_test_kwargs = True
     with torch.no_grad():
-        proj_ap, _, _, _ = generator.render_from_pose(z_train.detach(), generator.pose_ap, ct_context=ct_context)
-        proj_pa, _, _, _ = generator.render_from_pose(z_train.detach(), generator.pose_pa, ct_context=ct_context)
+        debug_override = None
+        return_rays = False
+        if debug_ap_pa:
+            debug_override = {
+                "attenuation_debug": True,
+                "retraw": True,
+            }
+            if DEBUG_PRINTS:
+                debug_override["debug_prints"] = True
+            return_rays = True
+        proj_ap, _, _, extras_ap = generator.render_from_pose(
+            z_train.detach(), generator.pose_ap, ct_context=ct_context, debug_override=debug_override, return_rays=return_rays
+        )
+        proj_pa, _, _, extras_pa = generator.render_from_pose(
+            z_train.detach(), generator.pose_pa, ct_context=ct_context, debug_override=debug_override, return_rays=return_rays
+        )
     generator.train()
     generator.use_test_kwargs = prev_flag or False
 
     H, W = generator.H, generator.W
-    ap_np = proj_ap[0].reshape(H, W).detach().cpu().numpy()
-    pa_np = proj_pa[0].reshape(H, W).detach().cpu().numpy()
-    ap_np = adjust_projection(ap_np, "ap")
-    pa_np = adjust_projection(pa_np, "pa")
+    pred_ap_raw = proj_ap[0].reshape(H, W)
+    pred_pa_raw = proj_pa[0].reshape(H, W)
+    ap_np_raw = pred_ap_raw.detach().cpu().numpy()
+    pa_np_raw = pred_pa_raw.detach().cpu().numpy()
     fp = outdir / "preview"
     fp.mkdir(parents=True, exist_ok=True)
+    if debug_ap_pa and not final_debug_done:
+        print(f"[debug ap/pa] ENTER preview path (final) at step {args.max_steps}", flush=True)
+        debug_compare_ap_pa(
+            pred_ap_raw,
+            pred_pa_raw,
+            extras_ap,
+            extras_pa,
+            generator,
+            tag="final",
+            debug_save_npy=debug_save_npy,
+            out_dir=fp,
+            step=args.max_steps,
+            save_assets=True,
+            asset_mode=asset_mode,
+        )
+        final_debug_done = True
+
+    if debug_final_no_atten:
+        with torch.no_grad():
+            proj_ap_no_att, _, _, _ = generator.render_from_pose(
+                z_train.detach(),
+                generator.pose_ap,
+                ct_context=ct_context,
+                debug_override=debug_override,
+                return_rays=False,
+                force_disable_atten=True,
+            )
+            proj_pa_no_att, _, _, _ = generator.render_from_pose(
+                z_train.detach(),
+                generator.pose_pa,
+                ct_context=ct_context,
+                debug_override=debug_override,
+                return_rays=False,
+                force_disable_atten=True,
+            )
+        ap_no_att = proj_ap_no_att[0].reshape(H, W)
+        pa_no_att = proj_pa_no_att[0].reshape(H, W)
+        rmse_ap = torch.sqrt(torch.mean((pred_ap_raw - ap_no_att) ** 2)).item()
+        rmse_pa = torch.sqrt(torch.mean((pred_pa_raw - pa_no_att) ** 2)).item()
+        std_ap_att = pred_ap_raw.std().item()
+        std_ap_no = ap_no_att.std().item()
+        std_pa_att = pred_pa_raw.std().item()
+        std_pa_no = pa_no_att.std().item()
+        print(
+            f"[debug atten] AP rmse={rmse_ap:.3e} std_with={std_ap_att:.3e} std_no={std_ap_no:.3e} | "
+            f"PA rmse={rmse_pa:.3e} std_with={std_pa_att:.3e} std_no={std_pa_no:.3e}",
+            flush=True,
+        )
+    ap_np = adjust_projection(ap_np_raw, "ap")
+    pa_np = adjust_projection(pa_np_raw, "pa")
     save_img(ap_np, fp / "final_AP.png", "AP final")
     save_img(pa_np, fp / "final_PA.png", "PA final")
     print("🖼️ Finale Previews gespeichert.", flush=True)
