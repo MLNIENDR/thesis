@@ -47,6 +47,14 @@ from typing import Dict, Tuple
 import json
 import hashlib
 import numpy as np
+try:
+    import imageio.v2 as imageio
+except Exception:
+    imageio = None
+try:
+    from PIL import Image
+except Exception:
+    Image = None
 
 # optionale SciPy-Teile für Gamma-Kamera-Modell
 try:
@@ -77,6 +85,33 @@ def ensure_dirs(base: Path) -> Tuple[Path, Path]:
         raise FileNotFoundError(f"src-Ordner nicht gefunden: {src}")
     out.mkdir(parents=True, exist_ok=True)
     return src, out
+
+
+def _ensure_image_backend():
+    """Stellt sicher, dass wir PNGs schreiben können."""
+    if imageio is None and Image is None:
+        raise RuntimeError("Weder imageio noch Pillow verfügbar – PNG-Export nicht möglich.")
+
+
+def save_png(arr2d: np.ndarray, path: Path):
+    """Speichert ein 2D-Array als PNG (0-255 skaliert)."""
+    _ensure_image_backend()
+    arr = np.asarray(arr2d)
+    finite_mask = np.isfinite(arr)
+    if not finite_mask.any():
+        scaled = np.zeros_like(arr, dtype=np.uint8)
+    else:
+        valid = arr[finite_mask]
+        vmin = valid.min()
+        vmax = valid.max()
+        if vmax > vmin:
+            scaled = (np.clip((arr - vmin) / (vmax - vmin), 0.0, 1.0) * 255.0).astype(np.uint8)
+        else:
+            scaled = np.zeros_like(arr, dtype=np.uint8)
+    if imageio is not None:
+        imageio.imwrite(path, scaled)
+    else:
+        Image.fromarray(scaled).save(path)
 
 
 def resolve_path(base: Path, src_dir: Path, p: Path) -> Path:
@@ -575,12 +610,38 @@ def main():
           "PA norm:", pa_norm.min(), pa_norm.max())
     print(f"[INFO] verwendeter Normalisierungsfaktor (Perzentil {args.percentile}): {scale_auto:.4e}")
 
+    # Kein zusätzlicher globaler LR-Flip mehr: orient_patch in gamma_camera_core liefert bereits das korrekte
+    # Detektor-Koordinatensystem. Ein weiterer Flip hätte die AP/PA-Projektionen gegenüber den Volumina gespiegelt.
+    ap_out = ap_norm
+    pa_out = pa_norm
+
+    # Global 90° CCW rotation applied to all modalities to align
+    # detector orientation with the network/world coordinate system.
+    # Volumina sind in Shape (x, y, z) = (LR, AP/Depth, SI);
+    # die coronal-Ebene ist (x, z), daher rotieren wir nur in axes=(0, 2) und lassen AP/Depth (y) unangetastet.
+    rot_axes = (0, 2)
+    spect_xyz = np.rot90(spect_xyz, k=1, axes=rot_axes)
+    ct_xyz = np.rot90(ct_xyz, k=1, axes=rot_axes)
+    act_xyz = np.rot90(act_xyz, k=1, axes=rot_axes)
+    ap_out = np.rot90(ap_out, k=1)
+    pa_out = np.rot90(pa_out, k=1)
+
     # Speichern als .npy im out-Ordner
     np.save(out_dir / "spect_att.npy", spect_xyz.astype(np.float32))
     np.save(out_dir / "ct_att.npy",    ct_xyz.astype(np.float32))
     np.save(out_dir / "act.npy",       act_xyz.astype(np.float32))
-    np.save(out_dir / "ap.npy",        ap_norm.astype(np.float32))
-    np.save(out_dir / "pa.npy",        pa_norm.astype(np.float32))
+    np.save(out_dir / "ap.npy",        ap_out.astype(np.float32))
+    np.save(out_dir / "pa.npy",        pa_out.astype(np.float32))
+
+    # Orientierungskontrolle als PNGs (keine zusätzlichen Flips)
+    orientation_dir = out_dir / "orientation_check"
+    orientation_dir.mkdir(parents=True, exist_ok=True)
+    mid_y = spect_xyz.shape[1] // 2
+    save_png(spect_xyz[:, mid_y, :], orientation_dir / "spect_att_coronal_mid.png")
+    save_png(ct_xyz[:, mid_y, :],    orientation_dir / "ct_att_coronal_mid.png")
+    save_png(act_xyz[:, mid_y, :],   orientation_dir / "act_coronal_mid.png")
+    save_png(ap_out, orientation_dir / "ap.png")
+    save_png(pa_out, orientation_dir / "pa.png")
 
     # Meta-Info
     meta = {

@@ -160,6 +160,8 @@ def get_rays_ortho(H, W, c2w, size_h, size_w):
         grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
     except TypeError:  # older torch without indexing kwarg
         grid_y, grid_x = torch.meshgrid(ys, xs)
+    # Invertiere die Detektor-x-Achse, damit Bildkoordinaten (links→rechts) mit Weltkoordinaten übereinstimmen.
+    grid_x = -grid_x
     zeros = torch.zeros_like(grid_x)
     rays_o_cam = torch.stack([grid_x, grid_y, zeros], dim=-1)
 

@@ -72,7 +72,6 @@ Funktionen/Konstanten:
 - `parse_args()`: CLI-Parser (Config-Pfad, Steps, Rays/Step, Preview/Save-Intervalle, Normalisierung, bg-/act-/ct-/z-Reg-Flags, Debug-Optionen, Seed).  
 - `set_seed(seed)`: Setzt Seeds für Torch/NumPy/CUDA.  
 - `save_img(arr, path, title=None)`: Robust PNG-Speicherer mit Log-Stretch; nimmt NumPy-Array, schreibt Datei.  
-- `adjust_projection(arr, view)`: Flip+Rotate zur Anzeige wie `data_check.py`; Input 2D-Array, Output gedrehtes Array.  
 - `poisson_nll(pred, target, eps, clamp_max, weight)`: Poisson-NLL über Strahlen, optional gewichtet; Inputs `pred/target` (Tensor ≥0), Output Skalar-Loss.  
 - `normalize_counts(x, return_params=False)`: Per-Bild-Min/Max-Normierung; Input Tensor, Output normiertes Tensor (und Min/Max/Flag).  
 - `build_loss_weights(target, bg_weight, threshold)`: Optional Strahl-Gewichte für Hintergrund-Dämpfung; gibt Weight-Tensor oder `None` zurück.  
@@ -96,7 +95,7 @@ Nutzung: CLI-Einstiegspunkt (`if __name__ == "__main__": train()`), läuft auf G
 
 **test_dataset.py**  
 Hilfsskript zum Laden/Visualisieren des Datensatzes.  
-- `main(config_path)`: Lädt YAML, ruft `get_data`, druckt Shapes/Stats, erzeugt einfache Plots für AP/PA/CT (mit Flip/Rot), speichert `data_check.png`. CPU-basiert; zum schnellen Datencheck.
+- `main(config_path)`: Lädt YAML, ruft `get_data`, druckt Shapes/Stats, erzeugt einfache Plots für AP/PA/CT (roh, ohne Orientierungs-Transforms), speichert `data_check.png`. CPU-basiert; zum schnellen Datencheck.
 
 ### Konfiguration & Datenzugriff (`graf/`)
 
@@ -111,7 +110,7 @@ Device: Generator und Netze auf CUDA.
 
 **graf/datasets.py**  
 Dataset-Implementierung für SPECT-Phantome/Patienten.  
-- `SpectDataset(manifest_path, imsize=None, transform_img=None, transform_ct=None)`: Liest CSV (patient_id, ap_path, pa_path, ct_path, optional act_path), lädt `.npy`-Dateien. AP/PA werden auf Max=1 normiert, CT permutiert nach (D,H,W) und skaliert, ACT permutiert und normiert. Returns in `__getitem__`: Dict mit `ap` [1,H,W], `pa` [1,H,W], `ct` [D,H,W] (oder leerer Tensor), `act` (oder leer), `meta`.  
+- `SpectDataset(manifest_path, imsize=None, transform_img=None, transform_ct=None)`: Liest CSV (patient_id, ap_path, pa_path, ct_path, optional act_path), lädt `.npy`-Dateien. AP/PA werden auf Max=1 normiert, CT/ACT werden layout-bereinigt zu (AP,LR,SI)=(D,H,W) und gescaled (keine Spiegelung/Rotation). Returns in `__getitem__`: Dict mit `ap` [1,H,W], `pa` [1,H,W], `ct` [D,H,W] (oder leerer Tensor), `act` (oder leer), `meta`.  
 Device: Daten werden als CPU-Tensoren geliefert, Training verschiebt sie auf CUDA.
 
 **graf/generator.py**  
@@ -124,7 +123,7 @@ Wrapper um NeRF-Rendering und Ray-Sampling.
   - `to(device)`, `train()`, `eval()`: Gerät/Mode-Handling für coarse/fine Netze.  
   - `set_fixed_ap_pa(radius, up)`: Definiert AP(+Z)/PA(-Z)-Posen, korrigiert Spiegelung, setzt ortho_size=2*radius.  
   - `render_from_pose(z, pose, ct_context)`: Rendert volles Bild aus gegebener Pose, flatten proj/disp/acc; erlaubt CT-Kontext (sonst Attenuation-Off).  
-  - `build_ct_context(ct_volume)`: Formatiert CT zu [1,1,D,H,W], flipt x-Achse, speichert radius und value_range; legt Tensor auf Generator-Device.  
+  - `build_ct_context(ct_volume)`: Formatiert CT zu [1,1,D,H,W], speichert radius und value_range; legt Tensor auf Generator-Device.  
 Inputs/Outputs: arbeitet auf CUDA, erwartet `z` Batch-Shape [B, feat_dim], Rays von Samplern.
 
 **graf/transforms.py**  
@@ -192,8 +191,8 @@ In diesem Repository gibt es keine Datei mit diesem Namen; falls benötigt, müs
 
 ### Datenverarbeitung (Kurzreferenz)
 - AP/PA aus `SpectDataset`: `.npy` werden als float32 geladen und pro Bild auf Max=1 normiert; optional per-Bild-Min/Max-Normierung zur Stabilisierung (`--normalize-targets`).  
-- CT (`ct.npy`): permutiert zu (D,H,W), ggf. x-Achse geflippt; in `build_ct_context` zu [1,1,D,H,W] auf GPU, Wertebereich gemerkt; bei Attenuation trilinear gesampelt, µ auf ≥0 geklemmt.  
-- ACT (`act.npy`): permutiert zu (D,H,W), auf Max=1 normiert; optional zufällige Voxel werden gesampelt, Koordinaten via `idx_to_coord` nach [-radius,radius] skaliert.  
+- CT (`ct.npy`): Layout (LR,AP,SI) → permutiert zu (AP,LR,SI)=(D,H,W); in `build_ct_context` zu [1,1,D,H,W] auf GPU, Wertebereich gemerkt; bei Attenuation trilinear gesampelt, µ auf ≥0 geklemmt.  
+- ACT (`act.npy`): Layout (LR,AP,SI) → permutiert zu (AP,LR,SI)=(D,H,W), auf Max=1 normiert; optional zufällige Voxel werden gesampelt, Koordinaten via `idx_to_coord` nach [-radius,radius] skaliert.  
 - Rays: Orthografisch, fixe AP/PA-Posen; Trainings-Patches via `FlexGridRaySampler` (Grid in [-1,1], Zufallsscale/-shift), Eval volle Raster. Pixel-Indizes → Weltkoordinaten über NeRF-Ray-Sampling.  
 - Emission MLP-Output: Softplus → ≥0; Segmentlängen Δs berücksichtigen Ray-Länge.  
 - Attenuation: µ·Δs kumuliert, Transmission T=exp(-∑µΔs) multipliziert Emission; Debug kann λ/µ/T/Dists speichern.  

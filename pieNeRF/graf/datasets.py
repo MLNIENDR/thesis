@@ -30,6 +30,7 @@ class SpectDataset(torch.utils.data.Dataset):
         self.transform_img = transform_img                                      # optionale Transformationsfunktionen für AP/PA und CT
         self.transform_ct = transform_ct                                        # "
         self.act_scale = float(act_scale)                                       # globaler Faktor für ACT/λ (keine Normierung)
+        self._logged_debug = False                                               # sorgt dafür, dass Debug-Ausgabe nur einmal erfolgt
 
         self.entries = []                                                       # Liste in der für jeden Fall ein kleines Dict mit Pfaden & ID steht
         with open(self.manifest_path, newline="") as f:                         # CSV öffnen
@@ -67,9 +68,8 @@ class SpectDataset(torch.utils.data.Dataset):
         if path is None:
             return torch.empty(0)
         
-        vol = np.load(path).astype(np.float32)                                  # Original gespeichert als (LR, AP, SI)
-
-        vol = np.transpose(vol, (1, 2, 0))                                      # korrekt in (AP, SI, LR) = (D,H,W) permutieren
+        vol = np.load(path).astype(np.float32)                                  # Original gespeichert als (LR, AP/Depth, SI)
+        vol = np.transpose(vol, (1, 0, 2))                                      # Layout: (AP, LR, SI) = (D,H,W) für Renderer
 
         vol *= 10.0                                                             # optionaler scale-factor
 
@@ -81,8 +81,7 @@ class SpectDataset(torch.utils.data.Dataset):
             return torch.empty(0)
 
         vol = np.load(path).astype(np.float32)
-
-        vol = np.transpose(vol, (1, 2, 0))                                      # selbe Permutation wie CT!
+        vol = np.transpose(vol, (1, 0, 2))                                      # Layout-Anpassung wie CT: (AP, LR, SI) = (D,H,W)
 
         # Kein Min/Max-Scaling mehr – optional nur globaler Faktor, damit λ im festen Maßstab bleibt.
         vol = vol * self.act_scale
@@ -106,8 +105,8 @@ class SpectDataset(torch.utils.data.Dataset):
         if self.transform_ct is not None:
             ct = self.transform_ct(ct)
 
-        # Debug-Ausgabe nur beim ersten Item, um Skalen zu prüfen (kein Einfluss auf Verhalten).
-        if idx == 0:
+        # Debug-Ausgabe nur einmal pro Dataset-Instanz, um Skalen zu prüfen (kein Einfluss auf Verhalten).
+        if not self._logged_debug:
             print(
                 f"[DEBUG][datasets] AP min/max: {ap.min().item():.3e}/{ap.max().item():.3e} | "
                 f"PA min/max: {pa.min().item():.3e}/{pa.max().item():.3e} | "
@@ -116,6 +115,12 @@ class SpectDataset(torch.utils.data.Dataset):
                 f"{(act.max().item() if act.numel()>0 else float('nan')):.3e}",
                 flush=True,
             )
+            print(
+                f"[DEBUG][datasets] Shapes after layout permute: AP {tuple(ap.shape)}, PA {tuple(pa.shape)}, "
+                f"CT {tuple(ct.shape)} (depth axis=0), ACT {tuple(act.shape)}",
+                flush=True,
+            )
+            self._logged_debug = True
 
         return {                                                                # Rückgabe ist ein Dictionary   
             "ap": ap,
@@ -125,6 +130,10 @@ class SpectDataset(torch.utils.data.Dataset):
             "meta": {
                 "patient_id": e["patient_id"],
                 "act_scale": self.act_scale,
+                "ap_path": str(e["ap_path"]),
+                "pa_path": str(e["pa_path"]),
+                "ct_path": str(e["ct_path"]),
+                "act_path": str(e["act_path"]) if e["act_path"] is not None else None,
             },
         }
 

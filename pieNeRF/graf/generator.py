@@ -367,9 +367,6 @@ class Generator(object):
         if vol.dim() != 5:
             raise ValueError(f"Expected CT data with D/H/W axes, got shape {tuple(ct_volume.shape)}")
 
-        # Flip entlang der x-Achse, damit CT-Seitenlage zur AP/PA-Darstellung passt
-        vol = torch.flip(vol, dims=[-1])
-
         radius = self.radius
         if isinstance(radius, tuple):
             radius = radius[1]

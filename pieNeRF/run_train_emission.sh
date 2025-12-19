@@ -33,14 +33,15 @@ srun python -u train_emission.py \
     --log-every 10 \
     --preview-every 50 \
     --save-every 100 \
-    --bg-weight 0.1 \
+    --bg-weight 1.0 \
     --weight-threshold 0.0 \
-    --act-loss-weight 0.03 \
+    --act-loss-weight 0.01 \
     --act-samples 4096 \
     --act-pos-weight 1.0 \
-    --ct-loss-weight 0.05 \
+    --ct-loss-weight 0.005 \
     --ct-threshold 0.05 \
-    --ct-samples 8192 \
-    --z-reg-weight 1e-4 \
-    --tv-weight 0.001
+    --ct-samples 4096 \
+    --z-reg-weight 1e-3 \
+    --tv-weight 0.0005 \
+    --grad-stats-every 10 
 echo "✅ Training finished at: $(date)"

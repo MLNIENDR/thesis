@@ -105,6 +105,8 @@ def build_models(config):
         config_nerf.use_attenuation = False                                                                 # Wenn True: Emission wird mit CT-basiertem μ moduliert 
     if not hasattr(config_nerf, "attenuation_debug"):
         config_nerf.attenuation_debug = False
+    if not hasattr(config_nerf, "atten_scale"):
+        config_nerf.atten_scale = 25.0
 
     render_kwargs_train, render_kwargs_test, params, named_parameters = create_nerf(config_nerf)            # Erstellung des eigentlichen NeRFs (alles in render_kwargs_*, die später vom Generator benutzt werden)
     render_kwargs_train['emission'] = True
@@ -114,6 +116,9 @@ def build_models(config):
     debug_flag = bool(getattr(config_nerf, "attenuation_debug", False))
     render_kwargs_train['attenuation_debug'] = debug_flag
     render_kwargs_test['attenuation_debug'] = debug_flag
+    atten_scale = float(getattr(config_nerf, "atten_scale", 25.0))
+    render_kwargs_train['atten_scale'] = atten_scale
+    render_kwargs_test['atten_scale'] = atten_scale
 
     bds_dict = {"near": config["data"]["near"], "far": config["data"]["far"]}                               # near / far als z-Grenzen entlang der Rays, in denen gesampelt wird (near: Start, far: Ende)
     render_kwargs_train.update(bds_dict)

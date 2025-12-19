@@ -261,6 +261,7 @@ def raw2outputs_emission(
     mu_vals=None,
     use_attenuation=False,
     attenuation_debug=False,
+    atten_scale: float = 25.0,
     debug_prints: bool = False,
     tv_mu_sigma: float = 1.0,
     mu_gate_mode: str = "none",
@@ -280,6 +281,7 @@ def raw2outputs_emission(
       mu_vals    : [N_rays, N_samples]       CT-basiertes µ (optional, für Attenuation)
       use_attenuation  : bool                Ob Attenuation einbezogen wird
       attenuation_debug: bool                Extra Debug-Infos für Attenuation
+      atten_scale      : float               Globaler Längenskalenfaktor für ∫ μ ds
 
     Rückgaben:
       proj_map : [N_rays]   Intensität der Projektion (Line-Integral)
@@ -360,7 +362,10 @@ def raw2outputs_emission(
             mu_dists = mu * dists                                # [N_rays, N_samples]
 
             # Kumulative Attenuation ∫ µ ds (diskret: kumulierte Summe)
-            attenuation = torch.cumsum(mu_dists, dim=-1)         # [N_rays, N_samples]
+            # Attenuation scaling:
+            # mu is given in 1/cm, while dists integrate over a normalized bounding box (~1).
+            # atten_scale approximates the physical path length through the object (in cm).
+            attenuation = torch.cumsum(mu_dists, dim=-1) * float(atten_scale)  # [N_rays, N_samples]
             # Für Segment i soll die Attenuation nur bis Sample i-1 gehen → ein Sample nach links verschieben
             attenuation = F.pad(attenuation[..., :-1], (1, 0), mode="constant", value=0.0)
 
@@ -488,6 +493,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
     mu_gate_mode = kwargs.get("mu_gate_mode", "none")
     mu_gate_center = float(kwargs.get("mu_gate_center", 0.2))
     mu_gate_width = float(kwargs.get("mu_gate_width", 0.1))
+    atten_scale = float(kwargs.get("atten_scale", 25.0))
     mu_vals = None
 
     # Falls Attenuation aktiviert und CT-Context vorhanden: µ aus CT sampeln
@@ -527,6 +533,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
             mu_vals=mu_vals,
             use_attenuation=use_attenuation,
             attenuation_debug=attenuation_debug,
+            atten_scale=atten_scale,
             debug_prints=debug_prints,
             tv_mu_sigma=tv_mu_sigma,
             mu_gate_mode=mu_gate_mode,

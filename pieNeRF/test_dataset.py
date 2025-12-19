@@ -35,18 +35,14 @@ def main(config_path="configs/spect.yaml"):
     # 4️⃣ Zu NumPy konvertieren
     ap_raw = ap.squeeze().numpy()      # [H,W]
     pa_raw = pa.squeeze().numpy()
-    ct_vol = ct.numpy()                # [D,H,W] = [z,y,x]
+    ct_vol = ct.numpy()                # rohes Volumen (Shape wie gespeichert)
 
-    # 🔄 AP & PA: erst vertikal flippen (oben/unten tauschen), dann 90° CW
-    ap_img = np.rot90(np.flipud(ap_raw), k=-1)
-    pa_img = np.rot90(np.flipud(pa_raw), k=-1)
+    # Rohdaten ohne zusätzliche Orientierungstransformationen visualisieren
+    ap_img = ap_raw
+    pa_img = pa_raw
 
-    # 🔄 CT: coronal Slice → 90° CW → vertikal + horizontal flippen
     mid_y = ct_vol.shape[1] // 2
-    ct_coronal = ct_vol[:, mid_y, :]       # [D,W]
-    ct_img = np.rot90(ct_coronal, k=-1)    # 90° CW
-    ct_img = np.flipud(ct_img)             # vertikal
-    ct_img = np.fliplr(ct_img)             # horizontal (Längsachse)
+    ct_img = ct_vol[:, mid_y, :]       # coronal slice (roh)
 
     # 5️⃣ Visualisierung
     fig, axs = plt.subplots(1, 3, figsize=(12, 4))

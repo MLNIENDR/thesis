@@ -4,7 +4,7 @@ import csv
 import math
 import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 import numpy as np
 import torch
@@ -17,6 +17,7 @@ from graf.config import get_data, build_models
 
 __VERSION__ = "emission-train v0.3"
 DEBUG_PRINTS = False  # Nur Debug-Ausgaben, keine Änderung am Verhalten
+ATTEN_SCALE_DEFAULT = 25.0
 
 
 def parse_args():
@@ -45,6 +46,11 @@ def parse_args():
         type=int,
         default=50,
         help="If >0 renders and stores full AP/PA previews every N steps (slow, full-frame render).",
+    )
+    parser.add_argument(
+        "--preview-only",
+        action="store_true",
+        help="Optionaler Preview-Only-Lauf (aktiviert nur Debug-Dumps, beeinflusst das Training nicht).",
     )
     parser.add_argument(
         "--save-every",
@@ -79,6 +85,11 @@ def parse_args():
         "--debug-prints",
         action="store_true",
         help="Aktiviert verbosere Debug-Ausgaben (keine Verhaltensänderung).",
+    )
+    parser.add_argument(
+        "--debug-proj-alignment",
+        action="store_true",
+        help="Einmaliger Dump für AP/PA/CT/ACT-Alignment (debug_algorithm_orientation).",
     )
     parser.add_argument(
         "--weight-threshold",
@@ -193,6 +204,18 @@ def parse_args():
         action="store_true",
         help="Logge λ/μ/T für einen Beispielstrahl (benötigt nerf.attenuation_debug=True).",
     )
+    parser.add_argument(
+        "--atten-scale",
+        type=float,
+        default=ATTEN_SCALE_DEFAULT,
+        help="Globaler Längenskalenfaktor für die Attenuation (μ in 1/cm, Bounding Box ~1).",
+    )
+    parser.add_argument(
+        "--grad-stats-every",
+        type=int,
+        default=0,
+        help="Falls >0: Gradienten-Normen je Loss-Term alle N Schritte (nur z-Latent, retain_graph).",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     return parser.parse_args()
 
@@ -231,16 +254,6 @@ def save_img(arr, path, title=None):
     plt.close()
 
 
-def adjust_projection(arr: np.ndarray, view: str) -> np.ndarray:
-    """
-    Bringe die Projektionen in dieselbe Orientierung wie data_check.py:
-    erst vertikal flippen, dann 90° im Uhrzeigersinn drehen.
-    """
-    flipped = np.flipud(arr)
-    rotated = np.rot90(flipped, k=-1)
-    return rotated
-
-
 def poisson_nll(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -263,10 +276,12 @@ def poisson_nll(
     return nll.mean()
 
 
-def build_ray_split(num_pixels: int, split_ratio: float, device: torch.device):
+def build_ray_split(num_pixels: int, split_ratio: float, device: torch.device) -> Dict[str, torch.Tensor]:
     """
     Erzeuge einen festen Train/Test-Split über alle Rays einer Ansicht.
     Split ist reproduzierbar, weil der globale Seed (set_seed) bereits gesetzt wurde.
+
+    Rückgabe: {"train": train_idx, "test": test_idx} (jeweils torch.long auf device)
     """
     ratio = float(split_ratio)
     ratio = 0.0 if ratio < 0 else (1.0 if ratio > 1.0 else ratio)
@@ -283,6 +298,18 @@ def sample_split_indices(split_tensor: torch.Tensor, count: int) -> torch.Tensor
         return split_tensor
     rand_idx = torch.randint(0, split_tensor.numel(), (count,), device=split_tensor.device)
     return split_tensor[rand_idx]
+
+
+def grad_norm_of(loss_term: torch.Tensor, params) -> float:
+    """L2-Norm der Gradienten eines Loss-Terms bezogen auf gegebene Parameter (z. B. z_latent)."""
+    if loss_term is None or not loss_term.requires_grad:
+        return 0.0
+    grads = torch.autograd.grad(loss_term, params, retain_graph=True, allow_unused=True)
+    grads = [g for g in grads if g is not None]
+    if not grads:
+        return 0.0
+    flat = torch.cat([g.reshape(-1) for g in grads])
+    return float(flat.norm().detach().cpu().item())
 
 
 def build_loss_weights(target: torch.Tensor, bg_weight: float, threshold: float) -> Optional[torch.Tensor]:
@@ -357,8 +384,6 @@ def maybe_render_preview(
     H, W = generator.H, generator.W
     ap_np = proj_ap[0].reshape(H, W).detach().cpu().numpy()
     pa_np = proj_pa[0].reshape(H, W).detach().cpu().numpy()
-    ap_np = adjust_projection(ap_np, "ap")
-    pa_np = adjust_projection(pa_np, "pa")
     out_dir = outdir / "preview"
     out_dir.mkdir(parents=True, exist_ok=True)
     save_img(ap_np, out_dir / f"step_{step:05d}_AP.png", title=f"AP @ step {step}")
@@ -630,10 +655,6 @@ def save_depth_profile(step, generator, z_latent, ct_vol, act_vol, outdir: Path,
         if data.ndim != 3:
             return None, None
         D, H, W = data.shape
-        # Falls H/W vertauscht sind (z. B. 651x256 statt 256x651), tauschen.
-        if H == generator.W and W == generator.H:
-            data = np.transpose(data, (0, 2, 1))
-            D, H, W = data.shape
         y_idx = int(np.clip(y_idx, 0, H - 1))
         x_idx = int(np.clip(x_idx, 0, W - 1))
         return data[:, y_idx, x_idx], (D, H, W)
@@ -653,12 +674,8 @@ def save_depth_profile(step, generator, z_latent, ct_vol, act_vol, outdir: Path,
         if act_data.ndim != 3:
             act_data = None
         else:
-            if act_data.shape[1] == generator.W and act_data.shape[2] == generator.H:
-                act_data = np.transpose(act_data, (0, 2, 1))
             depth_max = act_data.max(axis=0)
-            if depth_max.shape == (generator.W, generator.H):
-                depth_max = depth_max.T
-            elif depth_max.shape != (generator.H, generator.W):
+            if depth_max.shape != (generator.H, generator.W):
                 depth_max = None
             if depth_max is not None:
                 act_masks = (depth_max <= 1e-8, depth_max > 1e-8)
@@ -668,12 +685,8 @@ def save_depth_profile(step, generator, z_latent, ct_vol, act_vol, outdir: Path,
     if ct_vol is not None:
         ct_data = ct_vol.squeeze(0).detach().cpu().numpy() if ct_vol.dim() == 4 else ct_vol.detach().cpu().numpy()
         if ct_data.ndim == 3:
-            if ct_data.shape[1] == generator.W and ct_data.shape[2] == generator.H:
-                ct_data = np.transpose(ct_data, (0, 2, 1))
             ct_depth_max = ct_data.max(axis=0)
-            if ct_depth_max.shape == (generator.W, generator.H):
-                ct_depth_max = ct_depth_max.T
-            elif ct_depth_max.shape != (generator.H, generator.W):
+            if ct_depth_max.shape != (generator.H, generator.W):
                 ct_depth_max = None
 
 
@@ -856,12 +869,37 @@ def save_depth_profile(step, generator, z_latent, ct_vol, act_vol, outdir: Path,
     if isinstance(radius, tuple):
         radius = radius[1]
 
+    # Strahlen je Lauf fixieren, damit Profile über die Trainingsschritte vergleichbar bleiben
+    num_zero, num_active = 1, 3
+    target_total = max(num_zero + num_active, 1)
+    cache_attr = "_depth_profile_rays_cache"
+    cache = getattr(generator, cache_attr, None)
+    ray_indices_cache = None
+    if isinstance(cache, dict):
+        cached_indices = cache.get("indices")
+        cached_shape = cache.get("shape")
+        cached_total = cache.get("total")
+        if (
+            cached_indices
+            and cached_shape == (generator.H, generator.W)
+            and cached_total == target_total
+        ):
+            ray_indices_cache = cached_indices
+
     depth_idx = torch.arange(D, device=generator.device)
     z_coords = idx_to_coord(depth_idx, D, radius)
     depth_axis = np.linspace(0.0, 1.0, D)
     import matplotlib.pyplot as plt
 
-    ray_indices = pick_ray_indices(num_zero=1, num_active=3)
+    if ray_indices_cache is None:
+        ray_indices = pick_ray_indices(num_zero=num_zero, num_active=num_active)
+        setattr(
+            generator,
+            cache_attr,
+            {"indices": list(ray_indices), "shape": (generator.H, generator.W), "total": target_total},
+        )
+    else:
+        ray_indices = ray_indices_cache
     fig, axes = plt.subplots(1, len(ray_indices), figsize=(4 * len(ray_indices), 4), sharex=True, sharey=True)
     if not isinstance(axes, np.ndarray):
         axes = [axes]
@@ -946,6 +984,47 @@ def log_attenuation_profile(step: int, view: str, extras: dict):
     )
 
 
+def save_raw_png_and_npy(array: np.ndarray, png_path: Path):
+    """Speichert ein Array ohne Layout-Änderungen als .npy und PNG."""
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(png_path.with_suffix(".npy"), array)
+    import matplotlib.pyplot as plt
+    plt.imsave(png_path, array, cmap="gray")
+
+
+def dump_algorithm_orientation(debug_dir: Path, generator, ap_flat_proc, pa_flat_proc, act_vol, ct_context, mask_tensor=None):
+    # debug_algorithm_orientation:
+    # Stores tensors exactly as used in the network / loss (no visualization transforms).
+    H, W = generator.H, generator.W
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    ap_arr = ap_flat_proc[0].detach().view(H, W).cpu().numpy()
+    pa_arr = pa_flat_proc[0].detach().view(H, W).cpu().numpy()
+    save_raw_png_and_npy(ap_arr, debug_dir / "ap_used.png")
+    save_raw_png_and_npy(pa_arr, debug_dir / "pa_used.png")
+
+    if act_vol is not None and act_vol.numel() > 0:
+        act_3d = act_vol.detach()
+        if act_3d.dim() == 4:
+            act_3d = act_3d.squeeze(0)
+        act_mip = act_3d.max(dim=0).values.cpu().numpy()
+        save_raw_png_and_npy(act_mip, debug_dir / "act_used_mip.png")
+
+    if ct_context is not None and isinstance(ct_context, dict) and ct_context.get("volume") is not None:
+        vol = ct_context["volume"].detach().cpu()
+        if vol.dim() == 5:
+            vol = vol[0, 0]  # [D, H, W]
+        if vol.dim() == 3 and vol.shape[0] > 0:
+            mid = vol.shape[0] // 2
+            slice_mid = vol[mid].numpy()
+            save_raw_png_and_npy(slice_mid, debug_dir / "ct_att_slice_mid.png")
+            save_raw_png_and_npy(slice_mid, debug_dir / "spect_att_slice_mid.png")
+
+    if mask_tensor is not None and mask_tensor.numel() > 0:
+        mask_arr = mask_tensor.detach().view(H, W).cpu().numpy()
+        save_raw_png_and_npy(mask_arr, debug_dir / "mask_used.png")
+
+
 def sample_ct_pairs(ct: torch.Tensor, nsamples: int, thresh: float, radius: float):
     """Wählt Voxel-Paare (z,z+1) mit geringer CT-Änderung entlang der Tiefe."""
     if ct.dim() == 4:
@@ -998,6 +1077,11 @@ def train():
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
 
+    nerf_cfg = config.setdefault("nerf", {})
+    nerf_cfg.setdefault("atten_scale", ATTEN_SCALE_DEFAULT)
+    if args.atten_scale != ATTEN_SCALE_DEFAULT:
+        nerf_cfg["atten_scale"] = float(args.atten_scale)
+
     data_cfg = config.setdefault("data", {})
     if args.normalize_targets:
         print("⚠️ --normalize-targets ist veraltet – Projektionen werden bereits im Loader auf [0,1] normiert.", flush=True)
@@ -1048,6 +1132,9 @@ def train():
     log_path = outdir / "train_log.csv"
     init_log_file(log_path)
     debug_dir = outdir / "debug_dump"
+    orientation_debug_dir = outdir / "debug_algorithm_orientation"
+    orientation_dump_enabled = bool(args.debug_proj_alignment or args.preview_only)
+    orientation_dump_done = False
 
     dataset, hwfr, _ = get_data(config)
     config["data"]["hwfr"] = hwfr
@@ -1193,6 +1280,18 @@ def train():
         ap_flat_proc = ap_flat
         pa_flat_proc = pa_flat
 
+        if orientation_dump_enabled and not orientation_dump_done:
+            dump_algorithm_orientation(
+                orientation_debug_dir,
+                generator,
+                ap_flat_proc,
+                pa_flat_proc,
+                act_vol,
+                ct_context,
+                batch.get("mask"),
+            )
+            orientation_dump_done = True
+
         z_latent = z_train
 
         optimizer.zero_grad(set_to_none=True)
@@ -1203,6 +1302,7 @@ def train():
 
         ray_batch_ap = slice_rays(rays_cache["ap"], idx_ap)
         ray_batch_pa = slice_rays(rays_cache["pa"], idx_pa)
+
 
         with torch.cuda.amp.autocast(enabled=amp_enabled):
             pred_ap, extras_ap = render_minibatch(
@@ -1329,6 +1429,21 @@ def train():
                 loss_tv3d = tv3d_weight * tv3d_loss_unweighted
                 loss = loss + loss_tv3d
 
+        grad_stats = None
+        if args.grad_stats_every > 0 and (step % args.grad_stats_every) == 0:
+            grad_stats = {
+                "proj": grad_norm_of(loss_ap + loss_pa, [z_latent]),
+                "act": grad_norm_of(args.act_loss_weight * loss_act, [z_latent]) if args.act_loss_weight > 0 else 0.0,
+                "ct": grad_norm_of(args.ct_loss_weight * loss_ct, [z_latent]) if args.ct_loss_weight > 0 else 0.0,
+                "zreg": grad_norm_of(args.z_reg_weight * loss_reg, [z_latent]) if args.z_reg_weight > 0 else 0.0,
+            }
+            print(
+                f"[grad][step {step:05d}] ||g_proj||={grad_stats['proj']:.3e} "
+                f"| ||g_act||={grad_stats['act']:.3e} | ||g_ct||={grad_stats['ct']:.3e} "
+                f"| ||g_zreg||={grad_stats['zreg']:.3e}",
+                flush=True,
+            )
+
         scaler.scale(loss).backward()
         torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
         scaler.step(optimizer)
@@ -1363,25 +1478,25 @@ def train():
                     weight_threshold=args.weight_threshold,
                     ct_context=ct_context,
                 )
-            if args.debug_zero_var:
-                targ_std = (target_ap.std().item(), target_pa.std().item())
-                if pred_std[0] < 1e-7 or pred_std[1] < 1e-7:
-                    print("⚠️ Zero-Var Vorhersage erkannt – dumppe Debug-Daten ...", flush=True)
-                    dump_debug_tensor(debug_dir / f"step_{step:05d}_pred_ap.pt", pred_ap)
-                    dump_debug_tensor(debug_dir / f"step_{step:05d}_pred_pa.pt", pred_pa)
-                    dump_debug_tensor(debug_dir / f"step_{step:05d}_target_ap.pt", target_ap)
-                    dump_debug_tensor(debug_dir / f"step_{step:05d}_target_pa.pt", target_pa)
-                    dump_debug_tensor(debug_dir / f"step_{step:05d}_rays_ap.pt", ray_batch_ap)
-                    dump_debug_tensor(debug_dir / f"step_{step:05d}_rays_pa.pt", ray_batch_pa)
-                    if extras_ap.get("raw") is not None:
-                        dump_debug_tensor(debug_dir / f"step_{step:05d}_raw_ap.pt", extras_ap["raw"])
-                    if extras_pa.get("raw") is not None:
-                        dump_debug_tensor(debug_dir / f"step_{step:05d}_raw_pa.pt", extras_pa["raw"])
-                    print(
-                        f"   targetσ=({targ_std[0]:.3e},{targ_std[1]:.3e}) "
-                        f"| predμ=({pred_mean[0]:.3e},{pred_mean[1]:.3e})",
-                        flush=True,
-                    )
+        if args.debug_zero_var:
+            targ_std = (target_ap.std().item(), target_pa.std().item())
+            if pred_std[0] < 1e-7 or pred_std[1] < 1e-7:
+                print("⚠️ Zero-Var Vorhersage erkannt – dumppe Debug-Daten ...", flush=True)
+                dump_debug_tensor(debug_dir / f"step_{step:05d}_pred_ap.pt", pred_ap)
+                dump_debug_tensor(debug_dir / f"step_{step:05d}_pred_pa.pt", pred_pa)
+                dump_debug_tensor(debug_dir / f"step_{step:05d}_target_ap.pt", target_ap)
+                dump_debug_tensor(debug_dir / f"step_{step:05d}_target_pa.pt", target_pa)
+                dump_debug_tensor(debug_dir / f"step_{step:05d}_rays_ap.pt", ray_batch_ap)
+                dump_debug_tensor(debug_dir / f"step_{step:05d}_rays_pa.pt", ray_batch_pa)
+                if extras_ap.get("raw") is not None:
+                    dump_debug_tensor(debug_dir / f"step_{step:05d}_raw_ap.pt", extras_ap["raw"])
+                if extras_pa.get("raw") is not None:
+                    dump_debug_tensor(debug_dir / f"step_{step:05d}_raw_pa.pt", extras_pa["raw"])
+                print(
+                    f"   targetσ=({targ_std[0]:.3e},{targ_std[1]:.3e}) "
+                    f"| predμ=({pred_mean[0]:.3e},{pred_mean[1]:.3e})",
+                    flush=True,
+                )
 
         val_loss = val_stats["loss"] if val_stats is not None else None
         val_psnr_ap = val_stats["psnr_ap"] if val_stats is not None else None
@@ -1459,8 +1574,6 @@ def train():
     H, W = generator.H, generator.W
     ap_np = proj_ap[0].reshape(H, W).detach().cpu().numpy()
     pa_np = proj_pa[0].reshape(H, W).detach().cpu().numpy()
-    ap_np = adjust_projection(ap_np, "ap")
-    pa_np = adjust_projection(pa_np, "pa")
     fp = outdir / "preview"
     fp.mkdir(parents=True, exist_ok=True)
     save_img(ap_np, fp / "final_AP.png", "AP final")
