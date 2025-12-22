@@ -2,6 +2,7 @@
 import argparse
 import csv
 import math
+import logging
 import time
 from pathlib import Path
 from typing import Optional, Tuple, Dict
@@ -14,10 +15,26 @@ import yaml
 from torch.utils.data import DataLoader
 
 from graf.config import get_data, build_models
+try:
+    from pieNeRF.utils.ray_split import PixelSplit, make_pixel_split_from_ap_pa, sample_train_indices
+except ModuleNotFoundError:
+    # Fallback for running as a script from the repo root
+    from utils.ray_split import PixelSplit, make_pixel_split_from_ap_pa, sample_train_indices
 
 __VERSION__ = "emission-train v0.3"
 DEBUG_PRINTS = False  # Nur Debug-Ausgaben, keine Änderung am Verhalten
 ATTEN_SCALE_DEFAULT = 25.0
+
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    val = str(v).strip().lower()
+    if val in {"yes", "true", "t", "1"}:
+        return True
+    if val in {"no", "false", "f", "0"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Boolean value expected, got '{v}'.")
 
 
 def parse_args():
@@ -216,6 +233,58 @@ def parse_args():
         default=0,
         help="Falls >0: Gradienten-Normen je Loss-Term alle N Schritte (nur z-Latent, retain_graph).",
     )
+    parser.add_argument(
+        "--ray-split",
+        type=float,
+        default=0.8,
+        help="Anteil der Rays pro Bild für das Training (Rest = Test) beim stratifizierten Split.",
+    )
+    parser.add_argument(
+        "--ray-split-seed",
+        type=int,
+        default=123,
+        help="Seed für den stratifizierten Ray-Split.",
+    )
+    parser.add_argument(
+        "--ray-split-tile",
+        type=int,
+        default=32,
+        help="Tile-Kantenlänge in Pixeln für den Ray-Split.",
+    )
+    parser.add_argument(
+        "--ray-fg-thr",
+        type=str,
+        default="0.0",
+        help="Schwellwert für Vordergrund (target>thr). Zahl oder 'quantile'.",
+    )
+    parser.add_argument(
+        "--ray-fg-quantile",
+        type=float,
+        default=0.2,
+        help="Quantil q, falls --ray-fg-thr=quantile gewählt wird.",
+    )
+    parser.add_argument(
+        "--ray-train-fg-frac",
+        type=float,
+        default=0.5,
+        help="Anteil Vordergrund-Rays beim Training-Sampling (Rest Hintergrund, mit Fallback).",
+    )
+    parser.add_argument(
+        "--ray-split-enable",
+        type=str2bool,
+        default=True,
+        nargs="?",
+        const=True,
+        help="Aktiviere stratifizierten Ray-Split (False => Legacy-Uniform-Split).",
+    )
+    parser.add_argument(
+        "--pa-xflip",
+        type=str2bool,
+        default=False,
+        nargs="?",
+        const=True,
+        help="Spiegle PA in x-Richtung, um Pixel zu AP zu mappen.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     return parser.parse_args()
 
@@ -298,6 +367,14 @@ def sample_split_indices(split_tensor: torch.Tensor, count: int) -> torch.Tensor
         return split_tensor
     rand_idx = torch.randint(0, split_tensor.numel(), (count,), device=split_tensor.device)
     return split_tensor[rand_idx]
+
+
+def map_pa_indices_torch(idx: torch.Tensor, W: int, do_flip: bool) -> torch.Tensor:
+    if not do_flip:
+        return idx
+    y = idx // W
+    x = idx % W
+    return y * W + (W - 1 - x)
 
 
 def grad_norm_of(loss_term: torch.Tensor, params) -> float:
@@ -420,11 +497,15 @@ def init_log_file(path: Path):
                 "pred_mean_pa",
                 "pred_std_ap",
                 "pred_std_pa",
-                "loss_test",
-                "psnr_ap_test",
-                "psnr_pa_test",
-                "mae_ap_test",
-                "mae_pa_test",
+                "loss_test_all",
+                "psnr_test_all",
+                "mae_test_all",
+                "loss_test_fg",
+                "psnr_test_fg",
+                "mae_test_fg",
+                "loss_test_top10",
+                "psnr_test_top10",
+                "mae_test_top10",
                 "iter_ms",
                 "lr",
             ]
@@ -483,73 +564,73 @@ def compute_psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
     return -10.0 * math.log10(mse + 1e-12)
 
 
-def evaluate_split(
+def evaluate_pixel_subsets(
     generator,
     z_latent,
     rays_cache,
-    ray_indices,
-    split: str,
+    subsets: Dict[str, Optional[torch.Tensor]],
     ap_flat_proc: torch.Tensor,
     pa_flat_proc: torch.Tensor,
-    rays_per_proj_eval: int,
+    rays_per_eval: Optional[int],
     bg_weight: float,
     weight_threshold: float,
+    pa_xflip: bool,
     ct_context=None,
+    W: int = None,
 ):
-    """Evaluiert Poisson-NLL/PSNR auf einem festen Split (train/test) ohne Gradienten."""
-    idx_ap_all = ray_indices["ap"].get(split)
-    idx_pa_all = ray_indices["pa"].get(split)
-    if idx_ap_all is None or idx_pa_all is None or idx_ap_all.numel() == 0 or idx_pa_all.numel() == 0:
-        return None
-
-    n_ap = min(idx_ap_all.numel(), rays_per_proj_eval)
-    n_pa = min(idx_pa_all.numel(), rays_per_proj_eval)
-    idx_ap = sample_split_indices(idx_ap_all, n_ap)
-    idx_pa = sample_split_indices(idx_pa_all, n_pa)
-
+    """Evaluiert Loss/PSNR/MAE auf gemeinsamen Pixel-Indizes für AP+PA (Loss gemittelt über Views)."""
     prev_flag = generator.use_test_kwargs
-    # Eval-Mode aktivieren (kein Grad, festes Test-Split)
     generator.eval()
     generator.use_test_kwargs = True
+    results = {}
     with torch.no_grad():
-        ray_batch_ap = slice_rays(rays_cache["ap"], idx_ap)
-        ray_batch_pa = slice_rays(rays_cache["pa"], idx_pa)
+        for name, idx_all in subsets.items():
+            if idx_all is None or idx_all.numel() == 0:
+                results[name] = None
+                continue
+            n_sel = idx_all.numel() if rays_per_eval is None else min(idx_all.numel(), rays_per_eval)
+            idx_ap = idx_all if rays_per_eval is None else sample_split_indices(idx_all, n_sel)
+            idx_pa = map_pa_indices_torch(idx_ap, W, pa_xflip)
 
-        pred_ap, _ = render_minibatch(generator, z_latent, ray_batch_ap, need_raw=False, ct_context=ct_context)
-        pred_pa, _ = render_minibatch(generator, z_latent, ray_batch_pa, need_raw=False, ct_context=ct_context)
+            ray_batch_ap = slice_rays(rays_cache["ap"], idx_ap)
+            ray_batch_pa = slice_rays(rays_cache["pa"], idx_pa)
 
-        target_ap = ap_flat_proc[0, idx_ap].unsqueeze(0)
-        target_pa = pa_flat_proc[0, idx_pa].unsqueeze(0)
+            pred_ap, _ = render_minibatch(generator, z_latent, ray_batch_ap, need_raw=False, ct_context=ct_context)
+            pred_pa, _ = render_minibatch(generator, z_latent, ray_batch_pa, need_raw=False, ct_context=ct_context)
 
-        pred_ap = pred_ap.clamp_min(1e-8)
-        pred_pa = pred_pa.clamp_min(1e-8)
+            target_ap = ap_flat_proc[0, idx_ap].unsqueeze(0)
+            target_pa = pa_flat_proc[0, idx_pa].unsqueeze(0)
 
-        weight_ap = build_loss_weights(target_ap, bg_weight, weight_threshold)
-        weight_pa = build_loss_weights(target_pa, bg_weight, weight_threshold)
-        loss_ap = poisson_nll(pred_ap, target_ap, weight=weight_ap)
-        loss_pa = poisson_nll(pred_pa, target_pa, weight=weight_pa)
-        loss_total = loss_ap + loss_pa
+            pred_ap = pred_ap.clamp_min(1e-8)
+            pred_pa = pred_pa.clamp_min(1e-8)
 
-        psnr_ap = compute_psnr(pred_ap, target_ap)
-        psnr_pa = compute_psnr(pred_pa, target_pa)
-        mae_ap = torch.mean(torch.abs(pred_ap - target_ap)).item()
-        mae_pa = torch.mean(torch.abs(pred_pa - target_pa)).item()
+            weight_ap = build_loss_weights(target_ap, bg_weight, weight_threshold)
+            weight_pa = build_loss_weights(target_pa, bg_weight, weight_threshold)
+            loss_ap = poisson_nll(pred_ap, target_ap, weight=weight_ap)
+            loss_pa = poisson_nll(pred_pa, target_pa, weight=weight_pa)
+            loss_total = 0.5 * (loss_ap + loss_pa)
 
-    # Ursprünglichen Modus wiederherstellen (Train/Eval + use_test_kwargs)
+            psnr_ap = compute_psnr(pred_ap, target_ap)
+            psnr_pa = compute_psnr(pred_pa, target_pa)
+            mae_ap = torch.mean(torch.abs(pred_ap - target_ap)).item()
+            mae_pa = torch.mean(torch.abs(pred_pa - target_pa)).item()
+
+            results[name] = {
+                "loss": loss_total.item(),
+                "loss_ap": loss_ap.item(),
+                "loss_pa": loss_pa.item(),
+                "psnr": 0.5 * (psnr_ap + psnr_pa),
+                "mae": 0.5 * (mae_ap + mae_pa),
+                "pred_mean": ((float(pred_ap.mean()), float(pred_pa.mean()))),
+                "target_mean": ((float(target_ap.mean()), float(target_pa.mean()))),
+            }
+
     if prev_flag:
         generator.eval()
     else:
         generator.train()
 
-    return {
-        "loss": loss_total.item(),
-        "loss_ap": loss_ap.item(),
-        "loss_pa": loss_pa.item(),
-        "psnr_ap": psnr_ap,
-        "psnr_pa": psnr_pa,
-        "mae_ap": mae_ap,
-        "mae_pa": mae_pa,
-    }
+    return results
 
 
 def sample_act_points(
@@ -1092,7 +1173,7 @@ def train():
         print("⚠️ projection_normalization != 'none' wird ignoriert – Loader normiert jedes Bild einzeln.", flush=True)
         data_cfg["projection_normalization"] = "none"
     data_cfg.setdefault("act_scale", 1.0)
-    data_cfg.setdefault("ray_split_ratio", 0.8)
+    data_cfg["ray_split_ratio"] = float(args.ray_split)
     training_cfg = config.setdefault("training", {})
     training_cfg.setdefault("val_interval", 0)
     training_cfg.setdefault("tv_weight", 0.001)
@@ -1158,6 +1239,13 @@ def train():
     if DEBUG_PRINTS:
         print(f"[DEBUG] act_scale={act_global_scale}", flush=True)
     ray_split_ratio = float(data_cfg.get("ray_split_ratio", 0.8))
+    ray_split_enabled = bool(args.ray_split_enable)
+    ray_split_seed = int(args.ray_split_seed)
+    ray_split_tile = int(max(1, args.ray_split_tile))
+    ray_fg_thr = args.ray_fg_thr
+    ray_fg_quantile = float(args.ray_fg_quantile)
+    pa_xflip = bool(args.pa_xflip)
+    ray_train_fg_frac = float(np.clip(args.ray_train_fg_frac, 0.0, 1.0))
     val_interval = int(training_cfg.get("val_interval", 0) or 0)
     tv_weight = float(training_cfg.get("tv_weight", 0.0))
     tv_weight_mu = float(training_cfg.get("tv_weight_mu", 0.0))
@@ -1215,22 +1303,130 @@ def train():
     }
     # Gesamtzahl der Pixel bestimmt die Maximalzahl möglicher Strahlen
     num_pixels = generator.H * generator.W
-    # Fester Train/Test-Split pro View (reproduzierbar via globalem Seed).
-    ray_indices = {
-        "ap": build_ray_split(num_pixels, ray_split_ratio, device),
-        "pa": build_ray_split(num_pixels, ray_split_ratio, device),
-    }
-    print(
-        f"🔀 Ray-Split (AP/PA): train={ray_indices['ap']['train'].numel()} / test={ray_indices['ap']['test'].numel()} "
-        f"(ratio={ray_split_ratio})",
-        flush=True,
-    )
-    if DEBUG_PRINTS:
+    pixel_split_np: Optional[PixelSplit] = None
+    ray_indices: Dict[str, Dict[str, Optional[torch.Tensor]]] = {}
+
+    def parse_fg_threshold(raw_thr) -> float:
+        try:
+            return float(raw_thr)
+        except Exception:
+            if isinstance(raw_thr, str) and raw_thr.strip().lower() == "quantile":
+                return -abs(args.ray_fg_quantile)
+            raise
+
+    ray_fg_thr_value = parse_fg_threshold(ray_fg_thr)
+
+    def map_pa_indices_torch(idx: torch.Tensor, W: int, do_flip: bool) -> torch.Tensor:
+        if not do_flip:
+            return idx
+        y = idx // W
+        x = idx % W
+        return y * W + (W - 1 - x)
+
+    def _to_torch(arr: Optional[np.ndarray]):
+        if arr is None:
+            return None
+        return torch.from_numpy(arr.astype(np.int64)).long().to(device, non_blocking=True)
+
+    def _log_split(split: PixelSplit, score_img: np.ndarray):
+        fg_total = split.train_idx_fg.size + split.test_idx_fg.size
+        bg_total = split.train_idx_bg.size + split.test_idx_bg.size
+        fg_ratio = fg_total / float(num_pixels) if num_pixels > 0 else 0.0
+        bg_ratio = bg_total / float(num_pixels) if num_pixels > 0 else 0.0
+        test_total = float(split.test_idx_all.size or 1)
+        test_fg_ratio = split.test_idx_fg.size / test_total if test_total > 0 else 0.0
+        test_bg_ratio = split.test_idx_bg.size / test_total if test_total > 0 else 0.0
+        top10_count = split.test_idx_top10.size if split.test_idx_top10 is not None else 0
         print(
-            f"[DEBUG] AP train rays: {len(ray_indices['ap']['train'])} | AP test rays: {len(ray_indices['ap']['test'])} | "
-            f"PA train rays: {len(ray_indices['pa']['train'])} | PA test rays: {len(ray_indices['pa']['test'])}",
+            f"🔀 Pixel split: train={split.train_idx_all.size} | test={split.test_idx_all.size} "
+            f"| fg={fg_total} ({fg_ratio:.3f}) | bg={bg_total} ({bg_ratio:.3f}) "
+            f"| test_fg={split.test_idx_fg.size} ({test_fg_ratio:.3f}) | test_bg={split.test_idx_bg.size} ({test_bg_ratio:.3f}) "
+            f"| test_top10={top10_count} | tile={ray_split_tile} | thr={split.thr_used:.3e} | seed={ray_split_seed}",
             flush=True,
         )
+        if split.test_idx_fg.size > 0:
+            rng_dbg = np.random.default_rng(ray_split_seed + 11)
+            sample_dbg = rng_dbg.choice(split.test_idx_fg, size=min(5, split.test_idx_fg.size), replace=False)
+            score_flat = score_img.reshape(-1)
+            dbg_entries = []
+            for idx in sample_dbg:
+                y = int(idx // W)
+                x = int(idx % W)
+                dbg_entries.append(f"({x},{y},{score_flat[idx]:.3e})")
+            print(f"   [pixel-split-debug] FG samples (x,y,score): " + ", ".join(dbg_entries), flush=True)
+
+    if ray_split_enabled:
+        ref_sample = dataset[0]
+        ap_target_np = ref_sample["ap"].squeeze(0).numpy()
+        pa_target_np = ref_sample["pa"].squeeze(0).numpy()
+        if ap_target_np.shape != (H, W) or pa_target_np.shape != (H, W):
+            raise ValueError(f"Unexpected target shape: AP {ap_target_np.shape}, PA {pa_target_np.shape}, expected {(H, W)}")
+
+        pixel_split_np = make_pixel_split_from_ap_pa(
+            ap_target_np,
+            pa_target_np,
+            train_frac=ray_split_ratio,
+            tile=ray_split_tile,
+            thr=ray_fg_thr_value,
+            seed=ray_split_seed,
+            pa_xflip=pa_xflip,
+            topk_frac=0.10,
+        )
+        score_img = np.maximum(ap_target_np, pa_target_np[:, ::-1] if pa_xflip else pa_target_np)
+        _log_split(pixel_split_np, score_img)
+
+        np.savez(
+            outdir / "pixel_split.npz",
+            train_idx_all=pixel_split_np.train_idx_all,
+            test_idx_all=pixel_split_np.test_idx_all,
+            train_idx_fg=pixel_split_np.train_idx_fg,
+            train_idx_bg=pixel_split_np.train_idx_bg,
+            test_idx_fg=pixel_split_np.test_idx_fg,
+            test_idx_bg=pixel_split_np.test_idx_bg,
+            test_idx_top10=pixel_split_np.test_idx_top10 if pixel_split_np.test_idx_top10 is not None else np.array([], dtype=np.int64),
+            meta=np.array(
+                [
+                    {
+                        "H": H,
+                        "W": W,
+                        "train_frac": ray_split_ratio,
+                        "tile": ray_split_tile,
+                        "seed": ray_split_seed,
+                        "threshold": pixel_split_np.thr_used,
+                        "pa_xflip": pa_xflip,
+                    }
+                ],
+                dtype=object,
+            ),
+        )
+
+        ray_indices["pixel"] = {
+            "train_idx_all": _to_torch(pixel_split_np.train_idx_all),
+            "test_idx_all": _to_torch(pixel_split_np.test_idx_all),
+            "train_idx_fg": _to_torch(pixel_split_np.train_idx_fg),
+            "train_idx_bg": _to_torch(pixel_split_np.train_idx_bg),
+            "test_idx_fg": _to_torch(pixel_split_np.test_idx_fg),
+            "test_idx_bg": _to_torch(pixel_split_np.test_idx_bg),
+            "test_idx_top10": _to_torch(pixel_split_np.test_idx_top10) if pixel_split_np.test_idx_top10 is not None else None,
+        }
+    else:
+        split_uniform = build_ray_split(num_pixels, ray_split_ratio, device)
+        ray_indices["pixel"] = {
+            "train_idx_all": split_uniform["train"],
+            "test_idx_all": split_uniform["test"],
+            "train_idx_fg": None,
+            "train_idx_bg": None,
+            "test_idx_fg": None,
+            "test_idx_bg": None,
+            "test_idx_top10": None,
+        }
+        print(
+            f"🔀 Legacy Pixel-Split: train={ray_indices['pixel']['train_idx_all'].numel()} / "
+            f"test={ray_indices['pixel']['test_idx_all'].numel()} (ratio={ray_split_ratio})",
+            flush=True,
+        )
+
+    rng_train = np.random.default_rng(ray_split_seed + 12345) if ray_split_enabled else None
 
     rays_per_proj = args.rays_per_step or config["training"]["chunk"]
     if rays_per_proj <= 0:
@@ -1275,6 +1471,8 @@ def train():
             ct_vol = ct_vol.to(device, non_blocking=True).float()
         ct_context = generator.build_ct_context(ct_vol) if ct_vol is not None else None
 
+        # Wichtig: Flatten-Order ist (y * W + x), identisch zu den Ray-Indizes aus make_stratified_tile_split.
+        # Keine permute/transpose zwischen (H, W) und reshape(-1), damit Target/Predict exakt die gleiche Reihenfolge teilen.
         ap_flat = ap.view(batch_size, -1)
         pa_flat = pa.view(batch_size, -1)
         ap_flat_proc = ap_flat
@@ -1297,8 +1495,13 @@ def train():
         optimizer.zero_grad(set_to_none=True)
         t0 = time.perf_counter()
 
-        idx_ap = sample_split_indices(ray_indices["ap"]["train"], rays_per_proj)
-        idx_pa = sample_split_indices(ray_indices["pa"]["train"], rays_per_proj)
+        if ray_split_enabled and pixel_split_np is not None and rng_train is not None:
+            idx_np = sample_train_indices(pixel_split_np, rays_per_proj, ray_train_fg_frac, rng_train)
+            idx_ap = torch.from_numpy(idx_np).long().to(device, non_blocking=True)
+            idx_pa = map_pa_indices_torch(idx_ap, W, pa_xflip)
+        else:
+            idx_ap = sample_split_indices(ray_indices["pixel"]["train_idx_all"], rays_per_proj)
+            idx_pa = map_pa_indices_torch(idx_ap, W, pa_xflip)
 
         ray_batch_ap = slice_rays(rays_cache["ap"], idx_ap)
         ray_batch_pa = slice_rays(rays_cache["pa"], idx_pa)
@@ -1327,7 +1530,7 @@ def train():
 
             loss_ap = poisson_nll(pred_ap, target_ap, weight=weight_ap)
             loss_pa = poisson_nll(pred_pa, target_pa, weight=weight_pa)
-            loss = loss_ap + loss_pa
+            loss = 0.5 * (loss_ap + loss_pa)
             if DEBUG_PRINTS and (step % 50 == 0):
                 print(
                     f"[DEBUG][step {step}] TARGET AP min/max: {target_ap.min().item():.3e}/{target_ap.max().item():.3e} | "
@@ -1431,8 +1634,9 @@ def train():
 
         grad_stats = None
         if args.grad_stats_every > 0 and (step % args.grad_stats_every) == 0:
+            proj_loss_for_grad = 0.5 * (loss_ap + loss_pa)
             grad_stats = {
-                "proj": grad_norm_of(loss_ap + loss_pa, [z_latent]),
+                "proj": grad_norm_of(proj_loss_for_grad, [z_latent]),
                 "act": grad_norm_of(args.act_loss_weight * loss_act, [z_latent]) if args.act_loss_weight > 0 else 0.0,
                 "ct": grad_norm_of(args.ct_loss_weight * loss_ct, [z_latent]) if args.ct_loss_weight > 0 else 0.0,
                 "zreg": grad_norm_of(args.z_reg_weight * loss_reg, [z_latent]) if args.z_reg_weight > 0 else 0.0,
@@ -1463,20 +1667,31 @@ def train():
             psnr_pa = compute_psnr(pred_pa, target_pa)
             val_stats = None
             if val_interval > 0 and (step % val_interval) == 0 and (not args.no_val):
-                # Test-Split evaluiert strikt auf den fixen Test-Rays, Gradienten bleiben aus.
-                rays_eval = rays_per_proj
-                val_stats = evaluate_split(
+                rays_eval = None if ray_split_enabled else rays_per_proj
+                # Testmetriken:
+                # test_all  → gesamter Test-Split (dominiert von BG, kann “zu gut” aussehen)
+                # test_fg   → nur Vordergrund-Rays, misst eigentliche Rekonstruktionsqualität
+                # test_top10→ oberste 10% Test-Intensitäten, fokussiert auf stärkste Aktivität
+                subsets = {
+                    "test_all": ray_indices["pixel"]["test_idx_all"],
+                }
+                if ray_split_enabled:
+                    subsets["test_fg"] = ray_indices["pixel"]["test_idx_fg"]
+                    subsets["test_top10"] = ray_indices["pixel"]["test_idx_top10"]
+                    subsets["test_bg"] = ray_indices["pixel"]["test_idx_bg"]
+                val_stats = evaluate_pixel_subsets(
                     generator,
                     z_latent.detach(),
                     rays_cache,
-                    ray_indices,
-                    split="test",
+                    subsets=subsets,
                     ap_flat_proc=ap_flat_proc,
                     pa_flat_proc=pa_flat_proc,
-                    rays_per_proj_eval=rays_eval,
+                    rays_per_eval=rays_eval,
                     bg_weight=args.bg_weight,
                     weight_threshold=args.weight_threshold,
+                    pa_xflip=pa_xflip,
                     ct_context=ct_context,
+                    W=W,
                 )
         if args.debug_zero_var:
             targ_std = (target_ap.std().item(), target_pa.std().item())
@@ -1498,11 +1713,27 @@ def train():
                     flush=True,
                 )
 
-        val_loss = val_stats["loss"] if val_stats is not None else None
-        val_psnr_ap = val_stats["psnr_ap"] if val_stats is not None else None
-        val_psnr_pa = val_stats["psnr_pa"] if val_stats is not None else None
-        val_mae_ap = val_stats["mae_ap"] if val_stats is not None else None
-        val_mae_pa = val_stats["mae_pa"] if val_stats is not None else None
+        val_all = val_stats.get("test_all") if isinstance(val_stats, dict) else None
+        val_fg = val_stats.get("test_fg") if isinstance(val_stats, dict) else None
+        val_top10 = val_stats.get("test_top10") if isinstance(val_stats, dict) else None
+        val_bg = val_stats.get("test_bg") if isinstance(val_stats, dict) else None
+
+        val_loss = val_all["loss"] if val_all is not None else None
+        val_psnr = val_all["psnr"] if val_all is not None else None
+        val_mae = val_all["mae"] if val_all is not None else None
+
+        val_loss_fg = val_fg["loss"] if val_fg is not None else None
+        val_psnr_fg = val_fg["psnr"] if val_fg is not None else None
+        val_mae_fg = val_fg["mae"] if val_fg is not None else None
+        val_loss_bg = val_bg["loss"] if val_bg is not None else None
+        val_psnr_bg = val_bg["psnr"] if val_bg is not None else None
+        val_mae_bg = val_bg["mae"] if val_bg is not None else None
+        val_pred_mean_bg = val_bg.get("pred_mean") if val_bg is not None else None
+        val_target_mean_bg = val_bg.get("target_mean") if val_bg is not None else None
+
+        val_loss_top10 = val_top10["loss"] if val_top10 is not None else None
+        val_psnr_top10 = val_top10["psnr"] if val_top10 is not None else None
+        val_mae_top10 = val_top10["mae"] if val_top10 is not None else None
 
         msg = (
             f"[step {step:05d}] loss={loss.item():.6f} | ap={loss_ap.item():.6f} | pa={loss_pa.item():.6f} "
@@ -1513,10 +1744,28 @@ def train():
             f"| predμ_raw=({pred_mean_raw[0]:.3e},{pred_mean_raw[1]:.3e}) predσ_raw=({pred_std_raw[0]:.3e},{pred_std_raw[1]:.3e}) "
             f"| predμ=({pred_mean[0]:.3e},{pred_mean[1]:.3e}) predσ=({pred_std[0]:.3e},{pred_std[1]:.3e})"
         )
-        if val_stats is not None:
+        if val_all is not None:
             msg += (
-                f" | test_loss={val_loss:.6f} | test_psnr_ap={val_psnr_ap:.2f} | test_psnr_pa={val_psnr_pa:.2f} "
-                f"| test_mae_ap={val_mae_ap:.6f} | test_mae_pa={val_mae_pa:.6f}"
+                f" | test_all_loss={val_loss:.6f} | test_all_psnr={val_psnr:.2f} | test_all_mae={val_mae:.6f}"
+            )
+        if val_fg is not None:
+            msg += (
+                f" | test_fg_loss={val_loss_fg:.6f} | test_fg_psnr={val_psnr_fg:.2f} | test_fg_mae={val_mae_fg:.6f}"
+            )
+        if val_top10 is not None:
+            msg += (
+                f" | test_top10_loss={val_loss_top10:.6f} | test_top10_psnr={val_psnr_top10:.2f} "
+                f"| test_top10_mae={val_mae_top10:.6f}"
+            )
+        if val_bg is not None:
+            msg += (
+                f" | test_bg_loss={val_loss_bg:.6f} | test_bg_psnr={val_psnr_bg:.2f} | test_bg_mae={val_mae_bg:.6f}"
+            )
+        if val_pred_mean_bg is not None and val_target_mean_bg is not None:
+            print(
+                f"[ray-split-bg-check] mean target={val_target_mean_bg[0]:.3e}/{val_target_mean_bg[1]:.3e} "
+                f"mean pred={val_pred_mean_bg[0]:.3e}/{val_pred_mean_bg[1]:.3e}",
+                flush=True,
             )
         print(msg, flush=True)
         append_log(
@@ -1541,10 +1790,14 @@ def train():
                 pred_std[0],
                 pred_std[1],
                 val_loss,
-                val_psnr_ap,
-                val_psnr_pa,
-                val_mae_ap,
-                val_mae_pa,
+                val_psnr,
+                val_mae,
+                val_loss_fg,
+                val_psnr_fg,
+                val_mae_fg,
+                val_loss_top10,
+                val_psnr_top10,
+                val_mae_top10,
                 iter_ms,
                 optimizer.param_groups[0]["lr"],
             ],
