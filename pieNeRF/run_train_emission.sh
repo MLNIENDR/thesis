@@ -28,7 +28,7 @@ nvidia-smi
 echo "🏋️ Running train_emission.py..."
 srun python -u train_emission.py \
     --config configs/spect.yaml \
-    --max-steps 2000 \
+    --max-steps 1000 \
     --rays-per-step 16384 \
     --log-every 10 \
     --preview-every 50 \
@@ -49,5 +49,5 @@ srun python -u train_emission.py \
     --ray-split-seed 123 \
     --ray-split-tile 32 \
     --ray-fg-thr 0.0 \
-    --ray-train-fg-frac 0.5
+    --ray-train-fg-frac 0.7
 echo "✅ Training finished at: $(date)"

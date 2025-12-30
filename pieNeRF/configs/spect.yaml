@@ -46,8 +46,9 @@ nerf:
   multires_views: 0                             # wird bei use_viewdirs=False sowieso ignoriert
 
   # Sampling entlang der Strahlen
-  N_samples: 32                                 # eig. 128, aber für schnelles Training erstmal runter
-  N_importance: 0                               # kein hierarchisches Fine-Sampling für den Anfang
+  # Increased depth sampling to reduce discretization-induced lamella artifacts.
+  N_samples: 48                                 # eig. 128, aber für schnelles Training erstmal runter
+  N_importance: 64                              # aktiviert hierarchisches Fine-Sampling mit höherer Auflösung
 
   # MLP-Größe
   netdepth: 8
@@ -56,7 +57,7 @@ nerf:
   netwidth_fine: 256
 
   # Kein Jitter → deterministische Rays (ist zum Debuggen angenehmer)
-  perturb: 0.0
+  perturb: 1.0
 
   # Rauschen direkt in den NeRF-Rohwerten anfänglich nicht
   raw_noise_std: 0.0
