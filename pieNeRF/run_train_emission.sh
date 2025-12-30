@@ -28,10 +28,10 @@ nvidia-smi
 echo "🏋️ Running train_emission.py..."
 srun python -u train_emission.py \
     --config configs/spect.yaml \
-    --max-steps 1000 \
+    --max-steps 2000 \
     --rays-per-step 16384 \
     --log-every 10 \
-    --preview-every 50 \
+    --preview-every 100 \
     --save-every 100 \
     --bg-weight 1.0 \
     --weight-threshold 0.0 \
@@ -43,6 +43,8 @@ srun python -u train_emission.py \
     --ct-samples 4096 \
     --z-reg-weight 5e-4 \
     --tv-weight 0.0002 \
+    --tv-z-weight 1e-4 \
+    --debug-tv-z-check \
     --grad-stats-every 10 \
     --ray-split-enable \
     --ray-split 0.8 \

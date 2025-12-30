@@ -175,6 +175,12 @@ def parse_args():
         help="Skalenparameter für μ-Differenzen im edge-aware TV-Weighting.",
     )
     parser.add_argument(
+        "--tv-z-weight",
+        type=float,
+        default=0.0,
+        help="Depth-wise TV along rays to encourage contiguous activity and reduce lamella artifacts (0 = off; start around 1e-4, then 3e-4 or 1e-3 if needed).",
+    )
+    parser.add_argument(
         "--mu-gate-weight",
         type=float,
         default=0.0,
@@ -215,6 +221,11 @@ def parse_args():
         "--debug-zero-var",
         action="store_true",
         help="Aktiviere zusätzliche Diagnostik und speichere Zwischenergebnisse, sobald Vorhersagen konstante Werte liefern.",
+    )
+    parser.add_argument(
+        "--debug-tv-z-check",
+        action="store_true",
+        help="Einmal pro Preview: Debug-Ausgaben für z-Sortierung und tv_z (nur wenn tv_z_weight > 0).",
     )
     parser.add_argument(
         "--debug-attenuation-ray",
@@ -418,7 +429,7 @@ def slice_rays(rays_full: torch.Tensor, ray_idx: torch.Tensor) -> torch.Tensor:
     )
 
 
-def render_minibatch(generator, z_latent, rays_subset, need_raw: bool = False, ct_context=None):
+def render_minibatch(generator, z_latent, rays_subset, need_raw: bool = False, ct_context=None, need_act_samples: bool = False):
     """Render a mini-batch of rays from a fixed pose while keeping training kwargs."""
     # train/test kwargs werden durch use_test_kwargs umgeschaltet
     render_kwargs = generator.render_kwargs_train if not generator.use_test_kwargs else generator.render_kwargs_test
@@ -426,6 +437,8 @@ def render_minibatch(generator, z_latent, rays_subset, need_raw: bool = False, c
     render_kwargs["features"] = z_latent
     if need_raw:
         render_kwargs["retraw"] = True
+    if need_act_samples:
+        render_kwargs["return_act_samples"] = True
     if ct_context is not None:
         render_kwargs["ct_context"] = ct_context
     elif render_kwargs.get("use_attenuation"):
@@ -487,6 +500,8 @@ def init_log_file(path: Path):
                 "loss_ct",
                 "tv",
                 "tv_mu",
+                "tv_z",
+                "tv_z_w",
                 "mu_gate",
                 "tv3d",
                 "mae_ap",
@@ -1182,6 +1197,8 @@ def train():
     training_cfg.setdefault("tv_mu_sigma", 1.0)
     training_cfg["tv_weight_mu"] = args.tv_weight_mu
     training_cfg["tv_mu_sigma"] = args.tv_mu_sigma
+    training_cfg.setdefault("tv_z_weight", 0.0)
+    training_cfg["tv_z_weight"] = args.tv_z_weight
     training_cfg.setdefault("mu_gate_weight", 0.0)
     training_cfg.setdefault("mu_gate_mode", "none")
     training_cfg.setdefault("mu_gate_center", 0.2)
@@ -1250,12 +1267,14 @@ def train():
     tv_weight = float(training_cfg.get("tv_weight", 0.0))
     tv_weight_mu = float(training_cfg.get("tv_weight_mu", 0.0))
     tv_mu_sigma = float(training_cfg.get("tv_mu_sigma", 1.0))
+    tv_z_weight = float(training_cfg.get("tv_z_weight", 0.0))
     mu_gate_weight = float(training_cfg.get("mu_gate_weight", 0.0))
     mu_gate_mode = str(training_cfg.get("mu_gate_mode", "none")).lower()
     mu_gate_center = float(training_cfg.get("mu_gate_center", 0.2))
     mu_gate_width = float(training_cfg.get("mu_gate_width", 0.1))
     tv3d_weight = float(training_cfg.get("tv3d_weight", 0.0))
     tv3d_grid_size = int(training_cfg.get("tv3d_grid_size", 32))
+    need_act_samples_for_tvz = tv_z_weight > 0.0
 
     generator = build_models(config)
     generator.to(device)
@@ -1509,10 +1528,10 @@ def train():
 
         with torch.cuda.amp.autocast(enabled=amp_enabled):
             pred_ap, extras_ap = render_minibatch(
-                generator, z_latent, ray_batch_ap, need_raw=args.debug_zero_var, ct_context=ct_context
+                generator, z_latent, ray_batch_ap, need_raw=args.debug_zero_var, ct_context=ct_context, need_act_samples=need_act_samples_for_tvz
             )
             pred_pa, extras_pa = render_minibatch(
-                generator, z_latent, ray_batch_pa, need_raw=args.debug_zero_var, ct_context=ct_context
+                generator, z_latent, ray_batch_pa, need_raw=args.debug_zero_var, ct_context=ct_context, need_act_samples=need_act_samples_for_tvz
             )
 
             target_ap = ap_flat_proc[0, idx_ap].unsqueeze(0)
@@ -1584,13 +1603,17 @@ def train():
 
             tv_base_loss = torch.tensor(0.0, device=device)
             tv_mu_loss = torch.tensor(0.0, device=device)
+            tv_z_loss = torch.tensor(0.0, device=device)
             mu_gate_loss = torch.tensor(0.0, device=device)
             loss_tv = torch.tensor(0.0, device=device)
             loss_tv_mu = torch.tensor(0.0, device=device)
+            loss_tv_z = torch.tensor(0.0, device=device)
             loss_mu_gate = torch.tensor(0.0, device=device)
 
             tv_base_terms = []
             tv_mu_terms = []
+            # Depth-wise TV along rays to encourage contiguous activity and reduce lamella artifacts.
+            tv_z_terms = []
             mu_gate_terms = []
             if isinstance(extras_ap, dict):
                 base_val = extras_ap.get("tv_base_loss") or extras_ap.get("tv_loss")
@@ -1598,6 +1621,14 @@ def train():
                     tv_base_terms.append(base_val)
                 if extras_ap.get("tv_mu_loss") is not None:
                     tv_mu_terms.append(extras_ap["tv_mu_loss"])
+                act_samples_ap = extras_ap.get("act_samples")
+                if act_samples_ap is not None:
+                    diff_ap = act_samples_ap[..., 1:] - act_samples_ap[..., :-1]
+                    if extras_ap.get("act_dists") is not None:
+                        dists_ap = extras_ap["act_dists"][..., :-1]
+                        tv_z_terms.append(torch.abs(diff_ap) / (torch.abs(dists_ap) + 1e-6))
+                    else:
+                        tv_z_terms.append(torch.abs(diff_ap))
                 if extras_ap.get("mu_gate_loss") is not None:
                     mu_gate_terms.append(extras_ap["mu_gate_loss"])
             if isinstance(extras_pa, dict):
@@ -1606,6 +1637,14 @@ def train():
                     tv_base_terms.append(base_val)
                 if extras_pa.get("tv_mu_loss") is not None:
                     tv_mu_terms.append(extras_pa["tv_mu_loss"])
+                act_samples_pa = extras_pa.get("act_samples")
+                if act_samples_pa is not None:
+                    diff_pa = act_samples_pa[..., 1:] - act_samples_pa[..., :-1]
+                    if extras_pa.get("act_dists") is not None:
+                        dists_pa = extras_pa["act_dists"][..., :-1]
+                        tv_z_terms.append(torch.abs(diff_pa) / (torch.abs(dists_pa) + 1e-6))
+                    else:
+                        tv_z_terms.append(torch.abs(diff_pa))
                 if extras_pa.get("mu_gate_loss") is not None:
                     mu_gate_terms.append(extras_pa["mu_gate_loss"])
 
@@ -1613,6 +1652,8 @@ def train():
                 tv_base_loss = torch.stack(tv_base_terms).mean()
             if tv_mu_terms:
                 tv_mu_loss = torch.stack(tv_mu_terms).mean()
+            if tv_z_terms:
+                tv_z_loss = torch.stack([t.mean() for t in tv_z_terms]).mean()
             if mu_gate_terms:
                 mu_gate_loss = torch.stack(mu_gate_terms).mean()
 
@@ -1622,6 +1663,9 @@ def train():
             if tv_weight_mu != 0.0:
                 loss_tv_mu = tv_weight_mu * tv_mu_loss
                 loss = loss + loss_tv_mu
+            if tv_z_weight != 0.0 and tv_z_terms:
+                loss_tv_z = tv_z_weight * tv_z_loss
+                loss = loss + loss_tv_z
             if mu_gate_weight != 0.0:
                 loss_mu_gate = mu_gate_weight * mu_gate_loss
                 loss = loss + loss_mu_gate
@@ -1631,6 +1675,57 @@ def train():
                 tv3d_loss_unweighted = compute_tv3d_stub(generator, z_latent, grid_size=tv3d_grid_size, device=device)
                 loss_tv3d = tv3d_weight * tv3d_loss_unweighted
                 loss = loss + loss_tv3d
+
+        if args.debug_tv_z_check and need_act_samples_for_tvz and args.preview_every > 0 and (step % args.preview_every) == 0:
+            with torch.no_grad():
+                def _tvz_debug(extras: dict, tag: str):
+                    act = extras.get("act_samples") if isinstance(extras, dict) else None
+                    z_vals = extras.get("act_z_vals") if isinstance(extras, dict) else None
+                    dists = extras.get("act_dists") if isinstance(extras, dict) else None
+                    if act is None or z_vals is None:
+                        return None
+                    idx_sort = torch.argsort(z_vals, dim=-1)
+                    z_sorted = torch.gather(z_vals, -1, idx_sort)
+                    act_sorted = torch.gather(act, -1, idx_sort)
+                    delta_z = z_sorted[..., 1:] - z_sorted[..., :-1]
+                    delta_a = torch.abs(act_sorted[..., 1:] - act_sorted[..., :-1])
+                    unsorted_frac = (delta_z < 0).any(dim=-1).float().mean()
+                    tv_mean = delta_a.mean()
+                    tv_median = delta_a.median()
+                    tv_w_mean = tv_w_median = None
+                    if dists is not None:
+                        dists_sorted = torch.gather(dists, -1, idx_sort)
+                        denom = torch.abs(dists_sorted[..., :-1]) + 1e-8
+                        tv_w = delta_a / denom
+                        tv_w_mean = tv_w.mean()
+                        tv_w_median = tv_w.median()
+                    return {
+                        "tag": tag,
+                        "min_dz": delta_z.min(),
+                        "unsorted_frac": unsorted_frac,
+                        "tv_mean": tv_mean,
+                        "tv_median": tv_median,
+                        "tv_w_mean": tv_w_mean,
+                        "tv_w_median": tv_w_median,
+                    }
+
+                stats_list = []
+                for ex, tag in ((extras_ap, "AP"), (extras_pa, "PA")):
+                    res = _tvz_debug(ex, tag)
+                    if res is not None:
+                        stats_list.append(res)
+                if stats_list:
+                    msg_parts = []
+                    for s in stats_list:
+                        msg = (
+                            f"[tv_z_debug][{s['tag']}] min_dz={s['min_dz'].item():.3e} "
+                            f"| unsorted_frac={s['unsorted_frac'].item():.3e} "
+                            f"| tv_mean={s['tv_mean'].item():.3e} | tv_median={s['tv_median'].item():.3e}"
+                        )
+                        if s["tv_w_mean"] is not None:
+                            msg += f" | tv_w_mean={s['tv_w_mean'].item():.3e} | tv_w_median={s['tv_w_median'].item():.3e}"
+                        msg_parts.append(msg)
+                    print("\n".join(msg_parts), flush=True)
 
         grad_stats = None
         if args.grad_stats_every > 0 and (step % args.grad_stats_every) == 0:
@@ -1738,7 +1833,8 @@ def train():
         msg = (
             f"[step {step:05d}] loss={loss.item():.6f} | ap={loss_ap.item():.6f} | pa={loss_pa.item():.6f} "
             f"| act={loss_act.item():.6f} | ct={loss_ct.item():.6f} | tv={loss_tv.item():.6f} | tv_mu={loss_tv_mu.item():.6f} "
-            f"| mu_gate={loss_mu_gate.item():.6f} | tv3d={loss_tv3d.item():.6f} | zreg={loss_reg.item():.6f} "
+            f"| tv_z={tv_z_loss.item():.6f} | tv_z_w={loss_tv_z.item():.6f} | mu_gate={loss_mu_gate.item():.6f} "
+            f"| tv3d={loss_tv3d.item():.6f} | zreg={loss_reg.item():.6f} "
             f"| mae_ap={mae_ap:.6f} | mae_pa={mae_pa:.6f} "
             f"| psnr_ap={psnr_ap:.2f} | psnr_pa={psnr_pa:.2f} "
             f"| predμ_raw=({pred_mean_raw[0]:.3e},{pred_mean_raw[1]:.3e}) predσ_raw=({pred_std_raw[0]:.3e},{pred_std_raw[1]:.3e}) "
@@ -1779,6 +1875,8 @@ def train():
                 loss_ct.item(),
                 loss_tv.item(),
                 loss_tv_mu.item(),
+                tv_z_loss.item(),
+                loss_tv_z.item(),
                 loss_mu_gate.item(),
                 loss_tv3d.item(),
                 mae_ap,

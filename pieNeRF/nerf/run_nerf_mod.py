@@ -267,6 +267,7 @@ def raw2outputs_emission(
     mu_gate_mode: str = "none",
     mu_gate_center: float = 0.2,
     mu_gate_width: float = 0.1,
+    return_act_samples: bool = False,
 ):
     """
     Emissions-NeRF:
@@ -418,6 +419,12 @@ def raw2outputs_emission(
             debug_payload["debug_mu"] = torch.clamp(mu_vals, min=0.0).detach()
         if transmission is not None:
             debug_payload["debug_transmission"] = transmission.detach()
+    if return_act_samples:
+        if debug_payload is None:
+            debug_payload = {}
+        debug_payload["act_samples"] = lambda_vals
+        debug_payload["act_dists"] = dists
+        debug_payload["act_z_vals"] = z_vals
 
     return proj_map, disp_map, acc_map, debug_payload, tv_base, tv_mu, mu_gate_loss
 
@@ -489,6 +496,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
     use_attenuation = bool(kwargs.get("use_attenuation", False))
     attenuation_debug = bool(kwargs.get("attenuation_debug", False))
     debug_prints = bool(kwargs.get("debug_prints", False))
+    return_act_samples = bool(kwargs.get("return_act_samples", False))
     tv_mu_sigma = float(kwargs.get("tv_mu_sigma", 1.0))
     mu_gate_mode = kwargs.get("mu_gate_mode", "none")
     mu_gate_center = float(kwargs.get("mu_gate_center", 0.2))
@@ -539,6 +547,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
             mu_gate_mode=mu_gate_mode,
             mu_gate_center=mu_gate_center,
             mu_gate_width=mu_gate_width,
+            return_act_samples=return_act_samples,
         )
         # Standard-Outputs
         ret = {
