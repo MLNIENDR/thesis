@@ -3,6 +3,7 @@ import argparse
 import csv
 import math
 import logging
+import subprocess
 import time
 from pathlib import Path
 from typing import Optional, Tuple, Dict
@@ -400,6 +401,44 @@ def grad_norm_of(loss_term: torch.Tensor, params) -> float:
     return float(flat.norm().detach().cpu().item())
 
 
+def safe_git_rev() -> str:
+    """Versucht den aktuellen Git-Commit (kurz) zu lesen, fällt andernfalls auf 'unknown' zurück."""
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=Path(__file__).resolve().parent)
+        return out.decode().strip()
+    except Exception as exc:  # noqa: BLE001 – bewusst breit, nur Debug-Info
+        return f"unknown ({exc.__class__.__name__})"
+
+
+def log_effective_config(outdir: Path, config: dict, args):
+    """Einmalige Ausgabe der effektiv genutzten Konfiguration (nach YAML+CLI-Merge)."""
+    nerf_cfg = config.get("nerf", {})
+    data_cfg = config.get("data", {})
+    training_cfg = config.get("training", {})
+    git_rev = safe_git_rev()
+    print(f"[cfg] git_rev={git_rev} | expname={config.get('expname', 'n/a')} | outdir={outdir}", flush=True)
+    print(
+        f"[cfg][data] projection_normalization={data_cfg.get('projection_normalization')} "
+        f"| act_scale={data_cfg.get('act_scale')} | near={data_cfg.get('near')} | far={data_cfg.get('far')} "
+        f"| orthographic={data_cfg.get('orthographic')}",
+        flush=True,
+    )
+    print(
+        f"[cfg][nerf] N_samples={nerf_cfg.get('N_samples')} | N_importance={nerf_cfg.get('N_importance')} "
+        f"| perturb={nerf_cfg.get('perturb')} | atten_scale={nerf_cfg.get('atten_scale')} "
+        f"| use_attenuation={nerf_cfg.get('use_attenuation')}",
+        flush=True,
+    )
+    print(
+        f"[cfg][training] lr_g={training_cfg.get('lr_g')} | tv_weight={training_cfg.get('tv_weight')} "
+        f"| tv_z_weight={training_cfg.get('tv_z_weight')} | tv_weight_mu={training_cfg.get('tv_weight_mu')} "
+        f"| act_loss_weight={args.act_loss_weight} | act_samples={args.act_samples} | act_pos_weight={args.act_pos_weight} "
+        f"| ct_loss_weight={args.ct_loss_weight} | ct_threshold={args.ct_threshold} | z_reg_weight={args.z_reg_weight} "
+        f"| mu_gate_weight={training_cfg.get('mu_gate_weight')}",
+        flush=True,
+    )
+
+
 def build_loss_weights(target: torch.Tensor, bg_weight: float, threshold: float) -> Optional[torch.Tensor]:
     """Erzeuge optionale Strahl-Gewichte, die Null-Strahlen abschwächen."""
     if bg_weight >= 1.0:
@@ -513,8 +552,14 @@ def init_log_file(path: Path):
                 "pred_std_ap",
                 "pred_std_pa",
                 "loss_test_all",
+                "loss_test_ap",
+                "loss_test_pa",
                 "psnr_test_all",
+                "psnr_test_ap",
+                "psnr_test_pa",
                 "mae_test_all",
+                "mae_test_ap",
+                "mae_test_pa",
                 "loss_test_fg",
                 "psnr_test_fg",
                 "mae_test_fg",
@@ -638,6 +683,10 @@ def evaluate_pixel_subsets(
                 "mae": 0.5 * (mae_ap + mae_pa),
                 "pred_mean": ((float(pred_ap.mean()), float(pred_pa.mean()))),
                 "target_mean": ((float(target_ap.mean()), float(target_pa.mean()))),
+                "view": {
+                    "ap": {"loss": loss_ap.item(), "psnr": psnr_ap, "mae": mae_ap},
+                    "pa": {"loss": loss_pa.item(), "psnr": psnr_pa, "mae": mae_pa},
+                },
             }
 
     if prev_flag:
@@ -1226,6 +1275,7 @@ def train():
     outdir = Path(config.get("training", {}).get("outdir", "./results_spect")).expanduser().resolve()
     (outdir / "preview").mkdir(parents=True, exist_ok=True)
     print(f"🗂️ Output-Ordner: {outdir}", flush=True)
+    log_effective_config(outdir, config, args)
     ckpt_dir = outdir / "checkpoints"
     log_path = outdir / "train_log.csv"
     init_log_file(log_path)
@@ -1464,7 +1514,6 @@ def train():
 
     data_iter = iter(dataloader)
     ct_context = None
-
     print(
         f"🚀 Starting emission-NeRF training | steps={args.max_steps} | rays/proj={rays_per_proj} "
         f"| image={generator.H}x{generator.W} | chunk={generator.chunk}"
@@ -1825,6 +1874,13 @@ def train():
         val_mae_bg = val_bg["mae"] if val_bg is not None else None
         val_pred_mean_bg = val_bg.get("pred_mean") if val_bg is not None else None
         val_target_mean_bg = val_bg.get("target_mean") if val_bg is not None else None
+        val_view_all = val_all.get("view") if val_all is not None else None
+        val_loss_ap = val_view_all["ap"]["loss"] if val_view_all is not None else None
+        val_loss_pa = val_view_all["pa"]["loss"] if val_view_all is not None else None
+        val_psnr_ap_val = val_view_all["ap"]["psnr"] if val_view_all is not None else None
+        val_psnr_pa_val = val_view_all["pa"]["psnr"] if val_view_all is not None else None
+        val_mae_ap_val = val_view_all["ap"]["mae"] if val_view_all is not None else None
+        val_mae_pa_val = val_view_all["pa"]["mae"] if val_view_all is not None else None
 
         val_loss_top10 = val_top10["loss"] if val_top10 is not None else None
         val_psnr_top10 = val_top10["psnr"] if val_top10 is not None else None
@@ -1832,7 +1888,8 @@ def train():
 
         msg = (
             f"[step {step:05d}] loss={loss.item():.6f} | ap={loss_ap.item():.6f} | pa={loss_pa.item():.6f} "
-            f"| act={loss_act.item():.6f} | ct={loss_ct.item():.6f} | tv={loss_tv.item():.6f} | tv_mu={loss_tv_mu.item():.6f} "
+            f"| act={loss_act.item():.6f} | ct={loss_ct.item():.6f} "
+            f"| tv={loss_tv.item():.6f} | tv_mu={loss_tv_mu.item():.6f} "
             f"| tv_z={tv_z_loss.item():.6f} | tv_z_w={loss_tv_z.item():.6f} | mu_gate={loss_mu_gate.item():.6f} "
             f"| tv3d={loss_tv3d.item():.6f} | zreg={loss_reg.item():.6f} "
             f"| mae_ap={mae_ap:.6f} | mae_pa={mae_pa:.6f} "
@@ -1863,6 +1920,11 @@ def train():
                 f"mean pred={val_pred_mean_bg[0]:.3e}/{val_pred_mean_bg[1]:.3e}",
                 flush=True,
             )
+        if val_view_all is not None:
+            msg += (
+                f" | test_ap_loss={val_loss_ap:.6f} | test_ap_psnr={val_psnr_ap_val:.2f} | test_ap_mae={val_mae_ap_val:.6f}"
+                f" | test_pa_loss={val_loss_pa:.6f} | test_pa_psnr={val_psnr_pa_val:.2f} | test_pa_mae={val_mae_pa_val:.6f}"
+            )
         print(msg, flush=True)
         append_log(
             log_path,
@@ -1888,8 +1950,14 @@ def train():
                 pred_std[0],
                 pred_std[1],
                 val_loss,
+                val_loss_ap,
+                val_loss_pa,
                 val_psnr,
+                val_psnr_ap_val,
+                val_psnr_pa_val,
                 val_mae,
+                val_mae_ap_val,
+                val_mae_pa_val,
                 val_loss_fg,
                 val_psnr_fg,
                 val_mae_fg,
