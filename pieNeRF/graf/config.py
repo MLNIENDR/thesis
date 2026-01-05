@@ -53,6 +53,7 @@ def get_data(config):
         transform_img=None,
         transform_ct=None,
         act_scale=float(config["data"].get("act_scale", 1.0)),
+        bin2x2=bool(config["data"].get("bin2x2", False)),
     )
 
     # 2) H und W aus einem Beispiel-AP-Bild ableiten

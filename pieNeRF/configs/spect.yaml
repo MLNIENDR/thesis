@@ -8,6 +8,8 @@ data:
   white_bkgd: False                             # Bei Szinti i.d.R. kein "weißer Hintergrund" wie bei DRRs nötig
   fixed_poses: ap_pa
 
+  bin2x2: False                                 # Optionales 2x2-Binning (Sum-Pooling) der AP/PA-Projektionen
+
   # Projektionsgeometrie
   orthographic: True                            # Für SPECT-ähnliche planare Szintigraphie parallelbeam:
   far: 1.0                                      # near/far definieren den normierten Tiefenbereich im NeRF-Raum --> für den Anfang hier [0,1] annehmen und später aus der CT-BBox ableiten.

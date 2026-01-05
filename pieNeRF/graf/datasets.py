@@ -23,6 +23,7 @@ class SpectDataset(torch.utils.data.Dataset):
         transform_img=None,
         transform_ct=None,
         act_scale: float = 1.0,
+        bin2x2: bool = False,
     ):  
         super().__init__()
         self.manifest_path = Path(manifest_path)                                # manifest_path = Pfad zur csv mit Spalten phantom_id, ap_path, pa_path, ct_path
@@ -30,6 +31,7 @@ class SpectDataset(torch.utils.data.Dataset):
         self.transform_img = transform_img                                      # optionale Transformationsfunktionen für AP/PA und CT
         self.transform_ct = transform_ct                                        # "
         self.act_scale = float(act_scale)                                       # globaler Faktor für ACT/λ (keine Normierung)
+        self.bin2x2 = bool(bin2x2)                                              # optionales 2x2-Binning der AP/PA-Projektionen (Sum-Pooling)
         self._logged_debug = False                                               # sorgt dafür, dass Debug-Ausgabe nur einmal erfolgt
 
         self.entries = []                                                       # Liste in der für jeden Fall ein kleines Dict mit Pfaden & ID steht
@@ -99,6 +101,10 @@ class SpectDataset(torch.utils.data.Dataset):
         ap = self._normalize_projection(ap)
         pa = self._normalize_projection(pa)
 
+        if self.bin2x2:                                                         # optionales Sum-Pooling 2x2 (Counts-erhaltend)
+            ap = self._bin_2x2(ap)
+            pa = self._bin_2x2(pa)
+
         if self.transform_img is not None:                                      # optionale zusätzliche Schritte (z.B. Resize, Cropping, ...)
             ap = self.transform_img(ap)
             pa = self.transform_img(pa)
@@ -143,3 +149,14 @@ class SpectDataset(torch.utils.data.Dataset):
         if maxv > 0:
             tensor = tensor / maxv
         return tensor
+
+    def _bin_2x2(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Classic 2x2 sum binning (truncate odd rows/cols)."""
+        _, H, W = tensor.shape
+        H_even = (H // 2) * 2
+        W_even = (W // 2) * 2
+        if H_even == 0 or W_even == 0:
+            return tensor[..., :H_even, :W_even]
+        trimmed = tensor[..., :H_even, :W_even]
+        binned = trimmed.reshape(1, H_even // 2, 2, W_even // 2, 2).sum(dim=(2, 4))
+        return binned
