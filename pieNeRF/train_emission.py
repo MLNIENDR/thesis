@@ -66,11 +66,6 @@ def parse_args():
         help="If >0 renders and stores full AP/PA previews every N steps (slow, full-frame render).",
     )
     parser.add_argument(
-        "--preview-only",
-        action="store_true",
-        help="Optionaler Preview-Only-Lauf (aktiviert nur Debug-Dumps, beeinflusst das Training nicht).",
-    )
-    parser.add_argument(
         "--save-every",
         type=int,
         default=0,
@@ -103,11 +98,6 @@ def parse_args():
         "--debug-prints",
         action="store_true",
         help="Aktiviert verbosere Debug-Ausgaben (keine Verhaltensänderung).",
-    )
-    parser.add_argument(
-        "--debug-proj-alignment",
-        action="store_true",
-        help="Einmaliger Dump für AP/PA/CT/ACT-Alignment (debug_algorithm_orientation).",
     )
     parser.add_argument(
         "--weight-threshold",
@@ -164,86 +154,16 @@ def parse_args():
         help="Gewicht für den 1D-TV-Loss entlang der Rays (0 = deaktiviert).",
     )
     parser.add_argument(
-        "--tv-weight-mu",
-        type=float,
-        default=0.0,
-        help="Gewicht für CT-gewichtete (edge-aware) TV entlang der Rays (0 = deaktiviert).",
-    )
-    parser.add_argument(
-        "--tv-mu-sigma",
-        type=float,
-        default=1.0,
-        help="Skalenparameter für μ-Differenzen im edge-aware TV-Weighting.",
-    )
-    parser.add_argument(
-        "--tv-z-weight",
-        type=float,
-        default=0.0,
-        help="Depth-wise TV along rays to encourage contiguous activity and reduce lamella artifacts (0 = off; start around 1e-4, then 3e-4 or 1e-3 if needed).",
-    )
-    parser.add_argument(
-        "--mu-gate-weight",
-        type=float,
-        default=0.0,
-        help="Gewicht für μ-basierten Emissions-Prior (0 = deaktiviert).",
-    )
-    parser.add_argument(
-        "--mu-gate-mode",
-        type=str,
-        default="none",
-        choices=["none", "bandpass", "lowpass", "highpass"],
-        help="μ-Prior-Modus: none | bandpass | lowpass | highpass.",
-    )
-    parser.add_argument(
-        "--mu-gate-center",
-        type=float,
-        default=0.2,
-        help="Zentrum der bevorzugten μ-Region für den μ-Prior.",
-    )
-    parser.add_argument(
-        "--mu-gate-width",
-        type=float,
-        default=0.1,
-        help="Breite/Toleranz der bevorzugten μ-Region für den μ-Prior.",
-    )
-    parser.add_argument(
-        "--tv3d-weight",
-        type=float,
-        default=0.0,
-        help="Gewicht für eine optionale 3D-TV-Hülle (Stub, 0 = deaktiviert).",
-    )
-    parser.add_argument(
-        "--tv3d-grid-size",
+        "--grad-stats-every",
         type=int,
-        default=32,
-        help="Gittergröße für die (Stub-)3D-TV-Berechnung.",
-    )
-    parser.add_argument(
-        "--debug-zero-var",
-        action="store_true",
-        help="Aktiviere zusätzliche Diagnostik und speichere Zwischenergebnisse, sobald Vorhersagen konstante Werte liefern.",
-    )
-    parser.add_argument(
-        "--debug-tv-z-check",
-        action="store_true",
-        help="Einmal pro Preview: Debug-Ausgaben für z-Sortierung und tv_z (nur wenn tv_z_weight > 0).",
-    )
-    parser.add_argument(
-        "--debug-attenuation-ray",
-        action="store_true",
-        help="Logge λ/μ/T für einen Beispielstrahl (benötigt nerf.attenuation_debug=True).",
+        default=0,
+        help="Falls >0: Gradienten-Normen je Loss-Term alle N Schritte (nur z-Latent, retain_graph).",
     )
     parser.add_argument(
         "--atten-scale",
         type=float,
         default=ATTEN_SCALE_DEFAULT,
         help="Globaler Längenskalenfaktor für die Attenuation (μ in 1/cm, Bounding Box ~1).",
-    )
-    parser.add_argument(
-        "--grad-stats-every",
-        type=int,
-        default=0,
-        help="Falls >0: Gradienten-Normen je Loss-Term alle N Schritte (nur z-Latent, retain_graph).",
     )
     parser.add_argument(
         "--ray-split",
@@ -431,10 +351,8 @@ def log_effective_config(outdir: Path, config: dict, args):
     )
     print(
         f"[cfg][training] lr_g={training_cfg.get('lr_g')} | tv_weight={training_cfg.get('tv_weight')} "
-        f"| tv_z_weight={training_cfg.get('tv_z_weight')} | tv_weight_mu={training_cfg.get('tv_weight_mu')} "
         f"| act_loss_weight={args.act_loss_weight} | act_samples={args.act_samples} | act_pos_weight={args.act_pos_weight} "
-        f"| ct_loss_weight={args.ct_loss_weight} | ct_threshold={args.ct_threshold} | z_reg_weight={args.z_reg_weight} "
-        f"| mu_gate_weight={training_cfg.get('mu_gate_weight')}",
+        f"| ct_loss_weight={args.ct_loss_weight} | ct_threshold={args.ct_threshold} | z_reg_weight={args.z_reg_weight}",
         flush=True,
     )
 
@@ -468,16 +386,12 @@ def slice_rays(rays_full: torch.Tensor, ray_idx: torch.Tensor) -> torch.Tensor:
     )
 
 
-def render_minibatch(generator, z_latent, rays_subset, need_raw: bool = False, ct_context=None, need_act_samples: bool = False):
+def render_minibatch(generator, z_latent, rays_subset, ct_context=None):
     """Render a mini-batch of rays from a fixed pose while keeping training kwargs."""
     # train/test kwargs werden durch use_test_kwargs umgeschaltet
     render_kwargs = generator.render_kwargs_train if not generator.use_test_kwargs else generator.render_kwargs_test
     render_kwargs = dict(render_kwargs)
     render_kwargs["features"] = z_latent
-    if need_raw:
-        render_kwargs["retraw"] = True
-    if need_act_samples:
-        render_kwargs["return_act_samples"] = True
     if ct_context is not None:
         render_kwargs["ct_context"] = ct_context
     elif render_kwargs.get("use_attenuation"):
@@ -537,12 +451,8 @@ def init_log_file(path: Path):
                 "loss_pa",
                 "loss_act",
                 "loss_ct",
-                "tv",
-                "tv_mu",
-                "tv_z",
-                "tv_z_w",
-                "mu_gate",
-                "tv3d",
+                "loss_tv",
+                "zreg",
                 "mae_ap",
                 "mae_pa",
                 "psnr_ap",
@@ -578,22 +488,6 @@ def append_log(path: Path, row):
         writer.writerow(row)
 
 
-def compute_tv3d_stub(*args, device=None, **kwargs):
-    """
-    Platzhalter für eine zukünftige 3D-TV-Regularisierung über ein Hilfsgitter.
-    Aktuell wird kein Volumen evaluiert – der Rückgabewert bleibt 0.
-    """
-    if device is None:
-        for arg in args:
-            if isinstance(arg, torch.Tensor):
-                device = arg.device
-                break
-    if device is None and "device" in kwargs and isinstance(kwargs["device"], torch.device):
-        device = kwargs["device"]
-    device = device or torch.device("cpu")
-    return torch.tensor(0.0, device=device)
-
-
 def save_checkpoint(step, generator, z_train, optimizer, scaler, ckpt_dir: Path):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     # Minimal-Checkpoint: coarse/fine Netze, Optimizer, AMP-Scaler
@@ -612,16 +506,289 @@ def save_checkpoint(step, generator, z_train, optimizer, scaler, ckpt_dir: Path)
     print(f"💾 Checkpoint gespeichert: {ckpt_path}", flush=True)
 
 
-def dump_debug_tensor(outpath: Path, tensor: torch.Tensor):
-    outpath.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(tensor.detach().cpu(), outpath)
-
-
 def compute_psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
     mse = torch.mean((pred - target) ** 2).item()
     if mse <= 0:
         return float("inf")
     return -10.0 * math.log10(mse + 1e-12)
+
+
+def save_depth_profile(step, generator, z_latent, ct_vol, act_vol, outdir: Path, proj_ap=None, proj_pa=None):
+    """
+    Speichert Tiefenprofile (λ/μ/Prediction) entlang ausgewählter Strahlen für Analyse/Debugging.
+    """
+    H, W = generator.H, generator.W
+
+    ap_img = proj_ap.detach().view(H, W).cpu().numpy() if proj_ap is not None else None
+    pa_img = proj_pa.detach().view(H, W).cpu().numpy() if proj_pa is not None else None
+
+    act_data = act_vol.detach().cpu().numpy() if act_vol is not None else None
+    act_masks = None
+    if act_data is not None:
+        if act_data.ndim == 4:
+            act_data = act_data.squeeze(0)
+        act_zero = act_data < 1e-6
+        act_nonzero = act_data > 1e-6
+        act_masks = (act_zero.max(axis=0), act_nonzero.max(axis=0))
+
+    def extract_curve(vol: torch.Tensor, y_idx: int, x_idx: int):
+        if vol is None:
+            return None, None
+        vol = vol.detach()
+        if vol.dim() == 4:
+            vol = vol.squeeze(0)
+        if vol.dim() != 3:
+            return None, None
+        D, H_loc, W_loc = vol.shape[-3:]
+        if not (0 <= y_idx < H_loc and 0 <= x_idx < W_loc):
+            return None, None
+        curve = vol[:, y_idx, x_idx].cpu().numpy()
+        z_coords = idx_to_coord(torch.arange(D, device=vol.device), D, generator.radius if not isinstance(generator.radius, tuple) else generator.radius[1])
+        return curve, z_coords
+
+    def pick_ray_indices(num_zero: int = 1, num_active: int = 3):
+        chosen = []
+
+        def add_unique(idx):
+            if idx is None:
+                return False
+            if idx in chosen:
+                return False
+            chosen.append(idx)
+            return True
+
+        def dist(a, b):
+            return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
+
+        def is_far_enough(idx):
+            return all(dist(idx, c) > 8 for c in chosen)
+
+        def pick_from_mask(mask, prefer_high: bool):
+            if mask is None:
+                return None
+            mask = mask.copy()
+            chosen_mask = np.zeros_like(mask, dtype=bool)
+            for y, x in chosen:
+                if 0 <= y < H and 0 <= x < W:
+                    chosen_mask[y, x] = True
+            mask = mask & (~chosen_mask)
+            if not mask.any():
+                return None
+            coords = np.argwhere(mask)
+            if coords.size == 0:
+                return None
+
+            weight_map = None
+            if ap_img is not None and pa_img is not None:
+                weight_map = ap_img + pa_img
+            if weight_map is not None:
+                weights = weight_map[mask]
+                if weights.size == 0:
+                    weights = None
+                else:
+                    if prefer_high:
+                        weights = weights - weights.min() + 1e-6
+                    else:
+                        weights = weights.max() - weights + 1e-6
+                    if not np.isfinite(weights).any() or np.sum(weights) <= 0:
+                        weights = None
+            if weights is None:
+                np.random.shuffle(coords)
+                for y, x in coords:
+                    if is_far_enough((int(y), int(x))):
+                        return int(y), int(x)
+                y, x = coords[0]
+                return int(y), int(x)
+
+            for _ in range(min(len(coords), 64)):
+                idx = np.random.choice(len(coords), p=weights / weights.sum())
+                y, x = coords[idx]
+                if is_far_enough((int(y), int(x))):
+                    return int(y), int(x)
+            y, x = coords[np.argmax(weights)]
+            return int(y), int(x)
+
+        def pick_proj_extreme(func):
+            if ap_img is None or pa_img is None:
+                return None
+            combo = (ap_img + pa_img).copy()
+            for y, x in chosen:
+                if 0 <= y < H and 0 <= x < W:
+                    combo[y, x] = np.nan
+            try:
+                y, x = np.unravel_index(func(combo), combo.shape)
+            except ValueError:
+                return None
+            return int(y), int(x)
+
+        ct_pos_mask = None
+        if ct_vol is not None:
+            ct_data = ct_vol.detach()
+            if ct_data.dim() == 4:
+                ct_data = ct_data.squeeze(0)
+            if ct_data.dim() == 3:
+                ct_depth_max = ct_data.max(dim=0).values.cpu().numpy()
+                ct_pos_mask = ct_depth_max > 1e-8
+
+        def combine_mask(base_mask, require_ct: bool):
+            if base_mask is None:
+                return None
+            mask = base_mask.astype(bool)
+            if ct_pos_mask is not None and require_ct:
+                mask = mask & ct_pos_mask
+            return mask
+
+        zero_mask = nonzero_mask = None
+        if act_data is not None and act_masks is not None:
+            zero_mask, nonzero_mask = act_masks
+
+        zero_needed = max(num_zero, 0)
+        active_needed = max(num_active, 0)
+
+        if zero_needed > 0:
+            for mask in (combine_mask(zero_mask, True), zero_mask):
+                if zero_needed <= 0:
+                    break
+                if add_unique(pick_from_mask(mask, prefer_high=False)):
+                    zero_needed -= 1
+
+        if active_needed > 0:
+            for _ in range(active_needed):
+                idx = pick_from_mask(combine_mask(nonzero_mask, True), prefer_high=True)
+                if not add_unique(idx):
+                    break
+                active_needed -= 1
+            while active_needed > 0:
+                idx = pick_from_mask(nonzero_mask, prefer_high=True)
+                if idx is None:
+                    break
+                if add_unique(idx):
+                    active_needed -= 1
+
+        if zero_needed > 0:
+            if add_unique(pick_proj_extreme(np.nanargmin)):
+                zero_needed -= 1
+
+        while active_needed > 0:
+            idx = pick_proj_extreme(np.nanargmax)
+            if idx is None:
+                break
+            if add_unique(idx):
+                active_needed -= 1
+
+        fixed_coords = [(72, 428), (69, 336)]
+        for y_raw, x_raw in fixed_coords:
+            if len(chosen) >= num_zero + num_active:
+                break
+            y = int(np.clip(y_raw, 0, H - 1))
+            x = int(np.clip(x_raw, 0, W - 1))
+            add_unique((y, x))
+        rel_coords = [(0.5, 0.5), (0.25, 0.75), (0.75, 0.25)]
+        for ry, rx in rel_coords:
+            if len(chosen) >= num_zero + num_active:
+                break
+            y = int(np.clip(round((H - 1) * ry), 0, H - 1))
+            x = int(np.clip(round((W - 1) * rx), 0, W - 1))
+            add_unique((y, x))
+
+        if ap_img is not None and pa_img is not None and len(chosen) < num_zero + num_active:
+            max_y, max_x = np.unravel_index(np.argmax(ap_img + pa_img), ap_img.shape)
+            add_unique((int(max_y), int(max_x)))
+
+        while len(chosen) < num_zero + num_active:
+            y = int(np.random.randint(0, H))
+            x = int(np.random.randint(0, W))
+            add_unique((y, x))
+
+        return chosen[: num_zero + num_active]
+
+    def first_shape(vol_a, vol_b):
+        for v in (vol_a, vol_b):
+            if v is None:
+                continue
+            data = v.squeeze(0).detach().cpu().numpy() if v.dim() == 4 else v.detach().cpu().numpy()
+            if data.ndim == 3:
+                return data.shape
+        return None
+
+    target_shape = first_shape(ct_vol, act_vol)
+    if target_shape is None:
+        return
+
+    D = target_shape[0]
+    radius = generator.radius
+    if isinstance(radius, tuple):
+        radius = radius[1]
+
+    num_zero, num_active = 1, 3
+    target_total = max(num_zero + num_active, 1)
+    cache_attr = "_depth_profile_rays_cache"
+    cache = getattr(generator, cache_attr, None)
+    ray_indices_cache = None
+    if isinstance(cache, dict):
+        cached_indices = cache.get("indices")
+        cached_shape = cache.get("shape")
+        cached_total = cache.get("total")
+        if cached_indices and cached_shape == (generator.H, generator.W) and cached_total == target_total:
+            ray_indices_cache = cached_indices
+
+    if ray_indices_cache is None:
+        ray_indices = pick_ray_indices(num_zero=num_zero, num_active=num_active)
+        setattr(generator, cache_attr, {"indices": list(ray_indices), "shape": (generator.H, generator.W), "total": target_total})
+    else:
+        ray_indices = ray_indices_cache
+
+    depth_idx = torch.arange(D, device=generator.device)
+    z_coords = idx_to_coord(depth_idx, D, radius)
+    depth_axis = np.linspace(0.0, 1.0, D)
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, len(ray_indices), figsize=(4 * len(ray_indices), 4), sharex=True, sharey=True)
+    if not isinstance(axes, np.ndarray):
+        axes = [axes]
+
+    for ax, (y_idx, x_idx) in zip(axes, ray_indices):
+        curves = []
+        labels = []
+        curve_ct = extract_curve(ct_vol, y_idx, x_idx) if ct_vol is not None else (None, None)
+        curve_act = extract_curve(act_vol, y_idx, x_idx) if act_vol is not None else (None, None)
+
+        if curve_ct[0] is not None:
+            curves.append(normalize_curve(curve_ct[0].copy()))
+            labels.append("μ (CT)")
+        if curve_act[0] is not None:
+            curves.append(normalize_curve(curve_act[0].copy()))
+            labels.append("Aktivität (GT)")
+
+        x_coord = idx_to_coord(torch.tensor(x_idx, device=generator.device), target_shape[2], radius)
+        y_coord = idx_to_coord(torch.tensor(y_idx, device=generator.device), target_shape[1], radius)
+        coords = torch.stack((x_coord.repeat(D), y_coord.repeat(D), z_coords), dim=1)
+        pred = query_emission_at_points(generator, z_latent, coords).detach().cpu().numpy()
+        curves.append(normalize_curve(pred.copy()))
+        labels.append("Aktivität (NeRF)")
+
+        for curve, label in zip(curves, labels):
+            ax.plot(depth_axis, curve, label=label)
+
+        title_extra = []
+        if ap_img is not None:
+            title_extra.append(f"I_AP={ap_img[y_idx, x_idx]:.2e}")
+        if pa_img is not None:
+            title_extra.append(f"I_PA={pa_img[y_idx, x_idx]:.2e}")
+        aux = " | ".join(title_extra)
+        ax.set_title(f"Strahl y={y_idx}, x={x_idx}" + (f"\n{aux}" if aux else ""))
+        ax.set_ylim(0, 1.05)
+        ax.grid(True, alpha=0.2)
+        ax.legend(loc="upper right", fontsize=8)
+
+    axes[0].set_ylabel("normierte Intensität")
+    for ax in axes:
+        ax.set_xlabel("Tiefe (anterior → posterior)")
+    fig.suptitle(f"Depth-Profile @ step {step:05d}")
+    fig.tight_layout()
+    outdir.mkdir(parents=True, exist_ok=True)
+    fig.savefig(outdir / f"depth_profile_step_{step:05d}.png", dpi=150)
+    plt.close(fig)
 
 
 def evaluate_pixel_subsets(
@@ -655,8 +822,8 @@ def evaluate_pixel_subsets(
             ray_batch_ap = slice_rays(rays_cache["ap"], idx_ap)
             ray_batch_pa = slice_rays(rays_cache["pa"], idx_pa)
 
-            pred_ap, _ = render_minibatch(generator, z_latent, ray_batch_ap, need_raw=False, ct_context=ct_context)
-            pred_pa, _ = render_minibatch(generator, z_latent, ray_batch_pa, need_raw=False, ct_context=ct_context)
+            pred_ap, _ = render_minibatch(generator, z_latent, ray_batch_ap, ct_context=ct_context)
+            pred_pa, _ = render_minibatch(generator, z_latent, ray_batch_pa, ct_context=ct_context)
 
             target_ap = ap_flat_proc[0, idx_ap].unsqueeze(0)
             target_pa = pa_flat_proc[0, idx_pa].unsqueeze(0)
@@ -788,387 +955,6 @@ def normalize_curve(arr: np.ndarray) -> np.ndarray:
     return arr
 
 
-def save_depth_profile(step, generator, z_latent, ct_vol, act_vol, outdir: Path, proj_ap=None, proj_pa=None):
-    # Nur aktiv, wenn Ground Truth CT oder act existieren
-    if ct_vol is None and act_vol is None:
-        return
-
-    def extract_curve(vol, y_idx: int, x_idx: int):
-        if vol is None:
-            return None, None
-        data = vol.squeeze(0).detach().cpu().numpy() if vol.dim() == 4 else vol.detach().cpu().numpy()
-        if data.ndim != 3:
-            return None, None
-        D, H, W = data.shape
-        y_idx = int(np.clip(y_idx, 0, H - 1))
-        x_idx = int(np.clip(x_idx, 0, W - 1))
-        return data[:, y_idx, x_idx], (D, H, W)
-
-    def to_np_image(tensor):
-        if tensor is None:
-            return None
-        return tensor.detach().cpu().reshape(generator.H, generator.W).numpy()
-
-    ap_img = to_np_image(proj_ap)
-    pa_img = to_np_image(proj_pa)
-
-    act_data = None
-    act_masks = None
-    if act_vol is not None:
-        act_data = act_vol.squeeze(0).detach().cpu().numpy() if act_vol.dim() == 4 else act_vol.detach().cpu().numpy()
-        if act_data.ndim != 3:
-            act_data = None
-        else:
-            depth_max = act_data.max(axis=0)
-            if depth_max.shape != (generator.H, generator.W):
-                depth_max = None
-            if depth_max is not None:
-                act_masks = (depth_max <= 1e-8, depth_max > 1e-8)
-
-    ct_data = None
-    ct_depth_max = None
-    if ct_vol is not None:
-        ct_data = ct_vol.squeeze(0).detach().cpu().numpy() if ct_vol.dim() == 4 else ct_vol.detach().cpu().numpy()
-        if ct_data.ndim == 3:
-            ct_depth_max = ct_data.max(axis=0)
-            if ct_depth_max.shape != (generator.H, generator.W):
-                ct_depth_max = None
-
-
-    def pick_ray_indices(num_zero: int = 1, num_active: int = 3):
-        """Wählt Strahlen für das Depth-Profil: 1 Hintergrundstrahl + 3 aktive."""
-        H, W = generator.H, generator.W
-        chosen = []
-        target_total = max(num_zero + num_active, 1)
-        min_dist = max(1, int(0.05 * min(H, W)))  # verhindert, dass Strahlen direkt benachbart sind
-
-        def is_far_enough(idx):
-            if idx is None or not chosen:
-                return True
-            y, x = idx
-            for cy, cx in chosen:
-                if np.hypot(y - cy, x - cx) < min_dist:
-                    return False
-            return True
-
-        def add_unique(idx):
-            if idx is None:
-                return False
-            if idx not in chosen and is_far_enough(idx):
-                chosen.append(idx)
-                return True
-            return False
-
-        def pick_from_mask(mask, prefer_high=True):
-            if mask is None:
-                return None
-            mask = mask.astype(bool).copy()
-            if mask.shape != (H, W) or not mask.any():
-                return None
-            for y, x in chosen:
-                if 0 <= y < H and 0 <= x < W:
-                    mask[y, x] = False
-            if not mask.any():
-                return None
-            coords = np.argwhere(mask)
-            if coords.size == 0:
-                return None
-
-            weight_map = None
-            if ap_img is not None and pa_img is not None:
-                weight_map = ap_img + pa_img
-            if weight_map is not None:
-                weights = weight_map[mask]
-                if weights.size == 0:
-                    weights = None
-                else:
-                    if prefer_high:
-                        weights = weights - weights.min() + 1e-6
-                    else:
-                        weights = weights.max() - weights + 1e-6
-                    if not np.isfinite(weights).any() or np.sum(weights) <= 0:
-                        weights = None
-            if weights is None:
-                np.random.shuffle(coords)
-                for y, x in coords:
-                    if is_far_enough((int(y), int(x))):
-                        return int(y), int(x)
-                y, x = coords[0]
-                return int(y), int(x)
-
-            for _ in range(min(len(coords), 64)):
-                idx = np.random.choice(len(coords), p=weights / weights.sum())
-                y, x = coords[idx]
-                if is_far_enough((int(y), int(x))):
-                    return int(y), int(x)
-            y, x = coords[np.argmax(weights)]
-            return int(y), int(x)
-
-        def pick_proj_extreme(func):
-            if ap_img is None or pa_img is None:
-                return None
-            combo = (ap_img + pa_img).copy()
-            for y, x in chosen:
-                if 0 <= y < H and 0 <= x < W:
-                    combo[y, x] = np.nan
-            try:
-                y, x = np.unravel_index(func(combo), combo.shape)
-            except ValueError:
-                return None
-            return int(y), int(x)
-
-        ct_pos_mask = None
-        if ct_depth_max is not None:
-            ct_pos_mask = ct_depth_max > 1e-8
-
-        def combine_mask(base_mask, require_ct: bool):
-            if base_mask is None:
-                return None
-            mask = base_mask.astype(bool)
-            if ct_pos_mask is not None and require_ct:
-                mask = mask & ct_pos_mask
-            return mask
-
-        zero_mask = nonzero_mask = None
-        if act_data is not None and act_masks is not None:
-            zero_mask, nonzero_mask = act_masks
-
-        zero_needed = max(num_zero, 0)
-        active_needed = max(num_active, 0)
-
-        # (1) Gezielt Null- und Aktiv-Strahlen auswählen
-        if zero_needed > 0:
-            for mask in (combine_mask(zero_mask, True), zero_mask):
-                if zero_needed <= 0:
-                    break
-                if add_unique(pick_from_mask(mask, prefer_high=False)):
-                    zero_needed -= 1
-
-        if active_needed > 0:
-            for _ in range(active_needed):
-                idx = pick_from_mask(combine_mask(nonzero_mask, True), prefer_high=True)
-                if not add_unique(idx):
-                    break
-                active_needed -= 1
-            while active_needed > 0:
-                idx = pick_from_mask(nonzero_mask, prefer_high=True)
-                if idx is None:
-                    break
-                if add_unique(idx):
-                    active_needed -= 1
-
-        # (2) Fallback über Projektionen (Minimum für 0-Strahl, Maximum für Aktivität)
-        if zero_needed > 0:
-            if add_unique(pick_proj_extreme(np.nanargmin)):
-                zero_needed -= 1
-
-        while active_needed > 0:
-            idx = pick_proj_extreme(np.nanargmax)
-            if idx is None:
-                break
-            if add_unique(idx):
-                active_needed -= 1
-
-        # (3) Rest mit festen/relativen Koordinaten auffüllen
-        fixed_coords = [(72, 428), (69, 336)]
-        for y_raw, x_raw in fixed_coords:
-            if len(chosen) >= target_total:
-                break
-            y = int(np.clip(y_raw, 0, H - 1))
-            x = int(np.clip(x_raw, 0, W - 1))
-            add_unique((y, x))
-        rel_coords = [(0.5, 0.5), (0.25, 0.75), (0.75, 0.25)]
-        for ry, rx in rel_coords:
-            if len(chosen) >= target_total:
-                break
-            y = int(np.clip(round((H - 1) * ry), 0, H - 1))
-            x = int(np.clip(round((W - 1) * rx), 0, W - 1))
-            add_unique((y, x))
-
-        if ap_img is not None and pa_img is not None and len(chosen) < target_total:
-            max_y, max_x = np.unravel_index(np.argmax(ap_img + pa_img), ap_img.shape)
-            add_unique((int(max_y), int(max_x)))
-
-        while len(chosen) < target_total:
-            y = int(np.random.randint(0, H))
-            x = int(np.random.randint(0, W))
-            add_unique((y, x))
-
-        return chosen[:target_total]
-
-    def first_shape(vol_a, vol_b):
-        for v in (vol_a, vol_b):
-            if v is None:
-                continue
-            data = v.squeeze(0).detach().cpu().numpy() if v.dim() == 4 else v.detach().cpu().numpy()
-            if data.ndim == 3:
-                return data.shape
-        return None
-
-    target_shape = first_shape(ct_vol, act_vol)
-    if target_shape is None:
-        return
-
-    D = target_shape[0]
-    radius = generator.radius
-    if isinstance(radius, tuple):
-        radius = radius[1]
-
-    # Strahlen je Lauf fixieren, damit Profile über die Trainingsschritte vergleichbar bleiben
-    num_zero, num_active = 1, 3
-    target_total = max(num_zero + num_active, 1)
-    cache_attr = "_depth_profile_rays_cache"
-    cache = getattr(generator, cache_attr, None)
-    ray_indices_cache = None
-    if isinstance(cache, dict):
-        cached_indices = cache.get("indices")
-        cached_shape = cache.get("shape")
-        cached_total = cache.get("total")
-        if (
-            cached_indices
-            and cached_shape == (generator.H, generator.W)
-            and cached_total == target_total
-        ):
-            ray_indices_cache = cached_indices
-
-    depth_idx = torch.arange(D, device=generator.device)
-    z_coords = idx_to_coord(depth_idx, D, radius)
-    depth_axis = np.linspace(0.0, 1.0, D)
-    import matplotlib.pyplot as plt
-
-    if ray_indices_cache is None:
-        ray_indices = pick_ray_indices(num_zero=num_zero, num_active=num_active)
-        setattr(
-            generator,
-            cache_attr,
-            {"indices": list(ray_indices), "shape": (generator.H, generator.W), "total": target_total},
-        )
-    else:
-        ray_indices = ray_indices_cache
-    fig, axes = plt.subplots(1, len(ray_indices), figsize=(4 * len(ray_indices), 4), sharex=True, sharey=True)
-    if not isinstance(axes, np.ndarray):
-        axes = [axes]
-
-    for ax, (y_idx, x_idx) in zip(axes, ray_indices):
-        curves = []
-        labels = []
-        curve_ct = extract_curve(ct_vol, y_idx, x_idx) if ct_vol is not None else (None, None)
-        curve_act = extract_curve(act_vol, y_idx, x_idx) if act_vol is not None else (None, None)
-
-        if curve_ct[0] is not None:
-            curves.append(normalize_curve(curve_ct[0].copy()))
-            labels.append("μ (CT)")
-        if curve_act[0] is not None:
-            curves.append(normalize_curve(curve_act[0].copy()))
-            labels.append("Aktivität (GT)")
-
-        x_coord = idx_to_coord(torch.tensor(x_idx, device=generator.device), target_shape[2], radius)
-        y_coord = idx_to_coord(torch.tensor(y_idx, device=generator.device), target_shape[1], radius)
-        coords = torch.stack(
-            (x_coord.repeat(D), y_coord.repeat(D), z_coords),
-            dim=1,
-        )
-        # Vorhersage entlang der Tiefe an genau diesem Pixel extrahieren
-        pred = query_emission_at_points(generator, z_latent, coords).detach().cpu().numpy()
-        curves.append(normalize_curve(pred.copy()))
-        labels.append("Aktivität (NeRF)")
-
-        for curve, label in zip(curves, labels):
-            ax.plot(depth_axis, curve, label=label)
-
-        title_extra = []
-        if ap_img is not None:
-            title_extra.append(f"I_AP={ap_img[y_idx, x_idx]:.2e}")
-        if pa_img is not None:
-            title_extra.append(f"I_PA={pa_img[y_idx, x_idx]:.2e}")
-        aux = " | ".join(title_extra)
-        ax.set_title(f"Strahl y={y_idx}, x={x_idx}" + (f"\n{aux}" if aux else ""))
-        ax.set_ylim(0, 1.05)
-        ax.grid(True, alpha=0.2)
-        ax.legend(loc="upper right", fontsize=8)
-
-    axes[0].set_ylabel("normierte Intensität")
-    for ax in axes:
-        ax.set_xlabel("Tiefe (anterior → posterior)")
-    fig.suptitle(f"Depth-Profile @ step {step:05d}")
-    fig.tight_layout()
-    outdir.mkdir(parents=True, exist_ok=True)
-    fig.savefig(outdir / f"depth_profile_step_{step:05d}.png", dpi=150)
-    plt.close(fig)
-
-
-def log_attenuation_profile(step: int, view: str, extras: dict):
-    """Druckt λ/μ/T über der Strahltiefe für Debugging-Zwecke."""
-    if extras is None:
-        return
-    lambda_vals = extras.get("debug_lambda")
-    if lambda_vals is None:
-        return
-    ray_idx = 0
-    to_np = lambda tensor: tensor[ray_idx].detach().cpu().numpy()
-    lam = to_np(lambda_vals)
-    mu_vals = extras.get("debug_mu")
-    mu = to_np(mu_vals) if mu_vals is not None else None
-    trans_vals = extras.get("debug_transmission")
-    trans = to_np(trans_vals) if trans_vals is not None else None
-    dists = extras.get("debug_dists")
-    d = to_np(dists) if dists is not None else None
-    weights = extras.get("debug_weights")
-    contrib = to_np(weights) if weights is not None else None
-    intensity = float(np.sum(contrib)) if contrib is not None else float(np.sum(lam))
-
-    def fmt(arr):
-        if arr is None:
-            return "n/a"
-        return np.array2string(arr, precision=4, separator=", ")
-
-    print(
-        f"[attenuation-debug][{view}][step {step:05d}] I={intensity:.4e} | "
-        f"λ={fmt(lam)} | μ={fmt(mu)} | Δ={fmt(d)} | T={fmt(trans)} | λ·T·Δ={fmt(contrib)}",
-        flush=True,
-    )
-
-
-def save_raw_png_and_npy(array: np.ndarray, png_path: Path):
-    """Speichert ein Array ohne Layout-Änderungen als .npy und PNG."""
-    png_path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(png_path.with_suffix(".npy"), array)
-    import matplotlib.pyplot as plt
-    plt.imsave(png_path, array, cmap="gray")
-
-
-def dump_algorithm_orientation(debug_dir: Path, generator, ap_flat_proc, pa_flat_proc, act_vol, ct_context, mask_tensor=None):
-    # debug_algorithm_orientation:
-    # Stores tensors exactly as used in the network / loss (no visualization transforms).
-    H, W = generator.H, generator.W
-    debug_dir.mkdir(parents=True, exist_ok=True)
-
-    ap_arr = ap_flat_proc[0].detach().view(H, W).cpu().numpy()
-    pa_arr = pa_flat_proc[0].detach().view(H, W).cpu().numpy()
-    save_raw_png_and_npy(ap_arr, debug_dir / "ap_used.png")
-    save_raw_png_and_npy(pa_arr, debug_dir / "pa_used.png")
-
-    if act_vol is not None and act_vol.numel() > 0:
-        act_3d = act_vol.detach()
-        if act_3d.dim() == 4:
-            act_3d = act_3d.squeeze(0)
-        act_mip = act_3d.max(dim=0).values.cpu().numpy()
-        save_raw_png_and_npy(act_mip, debug_dir / "act_used_mip.png")
-
-    if ct_context is not None and isinstance(ct_context, dict) and ct_context.get("volume") is not None:
-        vol = ct_context["volume"].detach().cpu()
-        if vol.dim() == 5:
-            vol = vol[0, 0]  # [D, H, W]
-        if vol.dim() == 3 and vol.shape[0] > 0:
-            mid = vol.shape[0] // 2
-            slice_mid = vol[mid].numpy()
-            save_raw_png_and_npy(slice_mid, debug_dir / "ct_att_slice_mid.png")
-            save_raw_png_and_npy(slice_mid, debug_dir / "spect_att_slice_mid.png")
-
-    if mask_tensor is not None and mask_tensor.numel() > 0:
-        mask_arr = mask_tensor.detach().view(H, W).cpu().numpy()
-        save_raw_png_and_npy(mask_arr, debug_dir / "mask_used.png")
-
 
 def sample_ct_pairs(ct: torch.Tensor, nsamples: int, thresh: float, radius: float):
     """Wählt Voxel-Paare (z,z+1) mit geringer CT-Änderung entlang der Tiefe."""
@@ -1242,24 +1028,6 @@ def train():
     training_cfg.setdefault("val_interval", 0)
     training_cfg.setdefault("tv_weight", 0.001)
     training_cfg["tv_weight"] = args.tv_weight
-    training_cfg.setdefault("tv_weight_mu", 0.0)
-    training_cfg.setdefault("tv_mu_sigma", 1.0)
-    training_cfg["tv_weight_mu"] = args.tv_weight_mu
-    training_cfg["tv_mu_sigma"] = args.tv_mu_sigma
-    training_cfg.setdefault("tv_z_weight", 0.0)
-    training_cfg["tv_z_weight"] = args.tv_z_weight
-    training_cfg.setdefault("mu_gate_weight", 0.0)
-    training_cfg.setdefault("mu_gate_mode", "none")
-    training_cfg.setdefault("mu_gate_center", 0.2)
-    training_cfg.setdefault("mu_gate_width", 0.1)
-    training_cfg["mu_gate_weight"] = args.mu_gate_weight
-    training_cfg["mu_gate_mode"] = args.mu_gate_mode
-    training_cfg["mu_gate_center"] = args.mu_gate_center
-    training_cfg["mu_gate_width"] = args.mu_gate_width
-    training_cfg.setdefault("tv3d_weight", 0.0)
-    training_cfg.setdefault("tv3d_grid_size", 32)
-    training_cfg["tv3d_weight"] = args.tv3d_weight
-    training_cfg["tv3d_grid_size"] = args.tv3d_grid_size
     training_cfg.setdefault("act_samples", 16384)
     training_cfg.setdefault("act_pos_weight", 2.0)
     if args.act_samples is None:
@@ -1270,6 +1038,14 @@ def train():
         args.act_pos_weight = float(training_cfg.get("act_pos_weight", 2.0))
     else:
         training_cfg["act_pos_weight"] = args.act_pos_weight
+    training_cfg.setdefault("ct_loss_weight", 0.0)
+    training_cfg.setdefault("ct_threshold", 0.05)
+    training_cfg.setdefault("ct_samples", 8192)
+    training_cfg["ct_loss_weight"] = args.ct_loss_weight
+    training_cfg["ct_threshold"] = args.ct_threshold
+    training_cfg["ct_samples"] = args.ct_samples
+    training_cfg.setdefault("z_reg_weight", 0.0)
+    training_cfg["z_reg_weight"] = args.z_reg_weight
 
     print(f"📂 CWD: {Path.cwd().resolve()}", flush=True)
     outdir = Path(config.get("training", {}).get("outdir", "./results_spect")).expanduser().resolve()
@@ -1279,10 +1055,6 @@ def train():
     ckpt_dir = outdir / "checkpoints"
     log_path = outdir / "train_log.csv"
     init_log_file(log_path)
-    debug_dir = outdir / "debug_dump"
-    orientation_debug_dir = outdir / "debug_algorithm_orientation"
-    orientation_dump_enabled = bool(args.debug_proj_alignment or args.preview_only)
-    orientation_dump_done = False
 
     dataset, hwfr, _ = get_data(config)
     config["data"]["hwfr"] = hwfr
@@ -1315,29 +1087,11 @@ def train():
     ray_train_fg_frac = float(np.clip(args.ray_train_fg_frac, 0.0, 1.0))
     val_interval = int(training_cfg.get("val_interval", 0) or 0)
     tv_weight = float(training_cfg.get("tv_weight", 0.0))
-    tv_weight_mu = float(training_cfg.get("tv_weight_mu", 0.0))
-    tv_mu_sigma = float(training_cfg.get("tv_mu_sigma", 1.0))
-    tv_z_weight = float(training_cfg.get("tv_z_weight", 0.0))
-    mu_gate_weight = float(training_cfg.get("mu_gate_weight", 0.0))
-    mu_gate_mode = str(training_cfg.get("mu_gate_mode", "none")).lower()
-    mu_gate_center = float(training_cfg.get("mu_gate_center", 0.2))
-    mu_gate_width = float(training_cfg.get("mu_gate_width", 0.1))
-    tv3d_weight = float(training_cfg.get("tv3d_weight", 0.0))
-    tv3d_grid_size = int(training_cfg.get("tv3d_grid_size", 32))
-    need_act_samples_for_tvz = tv_z_weight > 0.0
 
     generator = build_models(config)
     generator.to(device)
     generator.train()
     generator.use_test_kwargs = False  # enforce training kwargs
-    for kwargs_render in (generator.render_kwargs_train, generator.render_kwargs_test):
-        kwargs_render["tv_mu_sigma"] = tv_mu_sigma
-        kwargs_render["mu_gate_mode"] = mu_gate_mode
-        kwargs_render["mu_gate_center"] = mu_gate_center
-        kwargs_render["mu_gate_width"] = mu_gate_width
-    if args.debug_attenuation_ray:
-        generator.render_kwargs_train["attenuation_debug"] = True
-        generator.render_kwargs_test["attenuation_debug"] = True
 
     # always provide AP/PA fallback poses if not already configured
     generator.set_fixed_ap_pa(radius=hwfr[3])
@@ -1546,18 +1300,6 @@ def train():
         ap_flat_proc = ap_flat
         pa_flat_proc = pa_flat
 
-        if orientation_dump_enabled and not orientation_dump_done:
-            dump_algorithm_orientation(
-                orientation_debug_dir,
-                generator,
-                ap_flat_proc,
-                pa_flat_proc,
-                act_vol,
-                ct_context,
-                batch.get("mask"),
-            )
-            orientation_dump_done = True
-
         z_latent = z_train
 
         optimizer.zero_grad(set_to_none=True)
@@ -1577,10 +1319,10 @@ def train():
 
         with torch.cuda.amp.autocast(enabled=amp_enabled):
             pred_ap, extras_ap = render_minibatch(
-                generator, z_latent, ray_batch_ap, need_raw=args.debug_zero_var, ct_context=ct_context, need_act_samples=need_act_samples_for_tvz
+                generator, z_latent, ray_batch_ap, ct_context=ct_context
             )
             pred_pa, extras_pa = render_minibatch(
-                generator, z_latent, ray_batch_pa, need_raw=args.debug_zero_var, ct_context=ct_context, need_act_samples=need_act_samples_for_tvz
+                generator, z_latent, ray_batch_pa, ct_context=ct_context
             )
 
             target_ap = ap_flat_proc[0, idx_ap].unsqueeze(0)
@@ -1607,9 +1349,6 @@ def train():
                     f"PRED PA min/max: {pred_pa.min().item():.3e}/{pred_pa.max().item():.3e}",
                     flush=True,
                 )
-            if args.debug_attenuation_ray:
-                log_attenuation_profile(step, "AP", extras_ap)
-                log_attenuation_profile(step, "PA", extras_pa)
 
             loss_act = torch.tensor(0.0, device=device)
             if args.act_loss_weight > 0.0 and act_vol is not None:
@@ -1651,132 +1390,25 @@ def train():
                 loss = loss + args.z_reg_weight * loss_reg
 
             tv_base_loss = torch.tensor(0.0, device=device)
-            tv_mu_loss = torch.tensor(0.0, device=device)
-            tv_z_loss = torch.tensor(0.0, device=device)
-            mu_gate_loss = torch.tensor(0.0, device=device)
             loss_tv = torch.tensor(0.0, device=device)
-            loss_tv_mu = torch.tensor(0.0, device=device)
-            loss_tv_z = torch.tensor(0.0, device=device)
-            loss_mu_gate = torch.tensor(0.0, device=device)
 
             tv_base_terms = []
-            tv_mu_terms = []
-            # Depth-wise TV along rays to encourage contiguous activity and reduce lamella artifacts.
-            tv_z_terms = []
-            mu_gate_terms = []
             if isinstance(extras_ap, dict):
                 base_val = extras_ap.get("tv_base_loss") or extras_ap.get("tv_loss")
                 if base_val is not None:
                     tv_base_terms.append(base_val)
-                if extras_ap.get("tv_mu_loss") is not None:
-                    tv_mu_terms.append(extras_ap["tv_mu_loss"])
-                act_samples_ap = extras_ap.get("act_samples")
-                if act_samples_ap is not None:
-                    diff_ap = act_samples_ap[..., 1:] - act_samples_ap[..., :-1]
-                    if extras_ap.get("act_dists") is not None:
-                        dists_ap = extras_ap["act_dists"][..., :-1]
-                        tv_z_terms.append(torch.abs(diff_ap) / (torch.abs(dists_ap) + 1e-6))
-                    else:
-                        tv_z_terms.append(torch.abs(diff_ap))
-                if extras_ap.get("mu_gate_loss") is not None:
-                    mu_gate_terms.append(extras_ap["mu_gate_loss"])
             if isinstance(extras_pa, dict):
                 base_val = extras_pa.get("tv_base_loss") or extras_pa.get("tv_loss")
                 if base_val is not None:
                     tv_base_terms.append(base_val)
-                if extras_pa.get("tv_mu_loss") is not None:
-                    tv_mu_terms.append(extras_pa["tv_mu_loss"])
-                act_samples_pa = extras_pa.get("act_samples")
-                if act_samples_pa is not None:
-                    diff_pa = act_samples_pa[..., 1:] - act_samples_pa[..., :-1]
-                    if extras_pa.get("act_dists") is not None:
-                        dists_pa = extras_pa["act_dists"][..., :-1]
-                        tv_z_terms.append(torch.abs(diff_pa) / (torch.abs(dists_pa) + 1e-6))
-                    else:
-                        tv_z_terms.append(torch.abs(diff_pa))
-                if extras_pa.get("mu_gate_loss") is not None:
-                    mu_gate_terms.append(extras_pa["mu_gate_loss"])
 
             if tv_base_terms:
                 tv_base_loss = torch.stack(tv_base_terms).mean()
-            if tv_mu_terms:
-                tv_mu_loss = torch.stack(tv_mu_terms).mean()
-            if tv_z_terms:
-                tv_z_loss = torch.stack([t.mean() for t in tv_z_terms]).mean()
-            if mu_gate_terms:
-                mu_gate_loss = torch.stack(mu_gate_terms).mean()
 
             if tv_weight != 0.0:
                 loss_tv = tv_weight * tv_base_loss
                 loss = loss + loss_tv
-            if tv_weight_mu != 0.0:
-                loss_tv_mu = tv_weight_mu * tv_mu_loss
-                loss = loss + loss_tv_mu
-            if tv_z_weight != 0.0 and tv_z_terms:
-                loss_tv_z = tv_z_weight * tv_z_loss
-                loss = loss + loss_tv_z
-            if mu_gate_weight != 0.0:
-                loss_mu_gate = mu_gate_weight * mu_gate_loss
-                loss = loss + loss_mu_gate
 
-            loss_tv3d = torch.tensor(0.0, device=device)
-            if tv3d_weight > 0.0:
-                tv3d_loss_unweighted = compute_tv3d_stub(generator, z_latent, grid_size=tv3d_grid_size, device=device)
-                loss_tv3d = tv3d_weight * tv3d_loss_unweighted
-                loss = loss + loss_tv3d
-
-        if args.debug_tv_z_check and need_act_samples_for_tvz and args.preview_every > 0 and (step % args.preview_every) == 0:
-            with torch.no_grad():
-                def _tvz_debug(extras: dict, tag: str):
-                    act = extras.get("act_samples") if isinstance(extras, dict) else None
-                    z_vals = extras.get("act_z_vals") if isinstance(extras, dict) else None
-                    dists = extras.get("act_dists") if isinstance(extras, dict) else None
-                    if act is None or z_vals is None:
-                        return None
-                    idx_sort = torch.argsort(z_vals, dim=-1)
-                    z_sorted = torch.gather(z_vals, -1, idx_sort)
-                    act_sorted = torch.gather(act, -1, idx_sort)
-                    delta_z = z_sorted[..., 1:] - z_sorted[..., :-1]
-                    delta_a = torch.abs(act_sorted[..., 1:] - act_sorted[..., :-1])
-                    unsorted_frac = (delta_z < 0).any(dim=-1).float().mean()
-                    tv_mean = delta_a.mean()
-                    tv_median = delta_a.median()
-                    tv_w_mean = tv_w_median = None
-                    if dists is not None:
-                        dists_sorted = torch.gather(dists, -1, idx_sort)
-                        denom = torch.abs(dists_sorted[..., :-1]) + 1e-8
-                        tv_w = delta_a / denom
-                        tv_w_mean = tv_w.mean()
-                        tv_w_median = tv_w.median()
-                    return {
-                        "tag": tag,
-                        "min_dz": delta_z.min(),
-                        "unsorted_frac": unsorted_frac,
-                        "tv_mean": tv_mean,
-                        "tv_median": tv_median,
-                        "tv_w_mean": tv_w_mean,
-                        "tv_w_median": tv_w_median,
-                    }
-
-                stats_list = []
-                for ex, tag in ((extras_ap, "AP"), (extras_pa, "PA")):
-                    res = _tvz_debug(ex, tag)
-                    if res is not None:
-                        stats_list.append(res)
-                if stats_list:
-                    msg_parts = []
-                    for s in stats_list:
-                        msg = (
-                            f"[tv_z_debug][{s['tag']}] min_dz={s['min_dz'].item():.3e} "
-                            f"| unsorted_frac={s['unsorted_frac'].item():.3e} "
-                            f"| tv_mean={s['tv_mean'].item():.3e} | tv_median={s['tv_median'].item():.3e}"
-                        )
-                        if s["tv_w_mean"] is not None:
-                            msg += f" | tv_w_mean={s['tv_w_mean'].item():.3e} | tv_w_median={s['tv_w_median'].item():.3e}"
-                        msg_parts.append(msg)
-                    print("\n".join(msg_parts), flush=True)
-
-        grad_stats = None
         if args.grad_stats_every > 0 and (step % args.grad_stats_every) == 0:
             proj_loss_for_grad = 0.5 * (loss_ap + loss_pa)
             grad_stats = {
@@ -1837,26 +1469,6 @@ def train():
                     ct_context=ct_context,
                     W=W,
                 )
-        if args.debug_zero_var:
-            targ_std = (target_ap.std().item(), target_pa.std().item())
-            if pred_std[0] < 1e-7 or pred_std[1] < 1e-7:
-                print("⚠️ Zero-Var Vorhersage erkannt – dumppe Debug-Daten ...", flush=True)
-                dump_debug_tensor(debug_dir / f"step_{step:05d}_pred_ap.pt", pred_ap)
-                dump_debug_tensor(debug_dir / f"step_{step:05d}_pred_pa.pt", pred_pa)
-                dump_debug_tensor(debug_dir / f"step_{step:05d}_target_ap.pt", target_ap)
-                dump_debug_tensor(debug_dir / f"step_{step:05d}_target_pa.pt", target_pa)
-                dump_debug_tensor(debug_dir / f"step_{step:05d}_rays_ap.pt", ray_batch_ap)
-                dump_debug_tensor(debug_dir / f"step_{step:05d}_rays_pa.pt", ray_batch_pa)
-                if extras_ap.get("raw") is not None:
-                    dump_debug_tensor(debug_dir / f"step_{step:05d}_raw_ap.pt", extras_ap["raw"])
-                if extras_pa.get("raw") is not None:
-                    dump_debug_tensor(debug_dir / f"step_{step:05d}_raw_pa.pt", extras_pa["raw"])
-                print(
-                    f"   targetσ=({targ_std[0]:.3e},{targ_std[1]:.3e}) "
-                    f"| predμ=({pred_mean[0]:.3e},{pred_mean[1]:.3e})",
-                    flush=True,
-                )
-
         val_all = val_stats.get("test_all") if isinstance(val_stats, dict) else None
         val_fg = val_stats.get("test_fg") if isinstance(val_stats, dict) else None
         val_top10 = val_stats.get("test_top10") if isinstance(val_stats, dict) else None
@@ -1889,9 +1501,7 @@ def train():
         msg = (
             f"[step {step:05d}] loss={loss.item():.6f} | ap={loss_ap.item():.6f} | pa={loss_pa.item():.6f} "
             f"| act={loss_act.item():.6f} | ct={loss_ct.item():.6f} "
-            f"| tv={loss_tv.item():.6f} | tv_mu={loss_tv_mu.item():.6f} "
-            f"| tv_z={tv_z_loss.item():.6f} | tv_z_w={loss_tv_z.item():.6f} | mu_gate={loss_mu_gate.item():.6f} "
-            f"| tv3d={loss_tv3d.item():.6f} | zreg={loss_reg.item():.6f} "
+            f"| tv={loss_tv.item():.6f} | zreg={loss_reg.item():.6f} "
             f"| mae_ap={mae_ap:.6f} | mae_pa={mae_pa:.6f} "
             f"| psnr_ap={psnr_ap:.2f} | psnr_pa={psnr_pa:.2f} "
             f"| predμ_raw=({pred_mean_raw[0]:.3e},{pred_mean_raw[1]:.3e}) predσ_raw=({pred_std_raw[0]:.3e},{pred_std_raw[1]:.3e}) "
@@ -1936,11 +1546,7 @@ def train():
                 loss_act.item(),
                 loss_ct.item(),
                 loss_tv.item(),
-                loss_tv_mu.item(),
-                tv_z_loss.item(),
-                loss_tv_z.item(),
-                loss_mu_gate.item(),
-                loss_tv3d.item(),
+                loss_reg.item(),
                 mae_ap,
                 mae_pa,
                 psnr_ap,

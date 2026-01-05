@@ -35,7 +35,7 @@ srun python -u train_emission.py \
     --save-every 100 \
     --bg-weight 1.0 \
     --weight-threshold 0.0 \
-    --act-loss-weight 0.003 \
+    --act-loss-weight 0.005 \
     --act-samples 4096 \
     --act-pos-weight 1.0 \
     --ct-loss-weight 0.002 \
@@ -43,13 +43,11 @@ srun python -u train_emission.py \
     --ct-samples 4096 \
     --z-reg-weight 5e-4 \
     --tv-weight 0.0002 \
-    --tv-z-weight 0 \
-    --debug-tv-z-check \
     --grad-stats-every 10 \
     --ray-split-enable \
     --ray-split 0.8 \
     --ray-split-seed 123 \
     --ray-split-tile 32 \
     --ray-fg-thr 0.0 \
-    --ray-train-fg-frac 0.5
+    --ray-train-fg-frac 0.7
 echo "✅ Training finished at: $(date)"

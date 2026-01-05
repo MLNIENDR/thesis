@@ -2,7 +2,6 @@
 
 import numpy as np
 import warnings
-import random
 import torch
 import torch.nn.functional as F
 
@@ -95,7 +94,7 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     """Wendet 'render_rays' blockweise auf große Ray-Mengen an. Nutzt Chunking, damit GPU verträglich"""
     all_ret = {}
     features = kwargs.get('features')
-    scalar_accum = {k: [] for k in ("tv_loss", "tv_base_loss", "tv_mu_loss", "mu_gate_loss")}
+    scalar_accum = {k: [] for k in ("tv_loss",)}
     # blockweise über die Rays iterieren
     for i in range(0, rays_flat.shape[0], chunk):
         # z-Features passend mitschneiden
@@ -223,7 +222,7 @@ def render(H, W, focal, chunk=1024*32, rays=None, c2w=None,
     # Renderin in Chunks aufteilen
     # ---------------------------
     all_ret = batchify_rays(rays, chunk, **kwargs)
-    scalar_keys = ("tv_loss", "tv_base_loss", "tv_mu_loss", "mu_gate_loss")
+    scalar_keys = ("tv_loss",)
     scalar_ret = {k: all_ret.pop(k, None) for k in scalar_keys}
     # zurück in Bildform [H, W, ...]
     for k in all_ret:
@@ -260,14 +259,7 @@ def raw2outputs_emission(
     pytest=False,
     mu_vals=None,
     use_attenuation=False,
-    attenuation_debug=False,
     atten_scale: float = 25.0,
-    debug_prints: bool = False,
-    tv_mu_sigma: float = 1.0,
-    mu_gate_mode: str = "none",
-    mu_gate_center: float = 0.2,
-    mu_gate_width: float = 0.1,
-    return_act_samples: bool = False,
 ):
     """
     Emissions-NeRF:
@@ -281,14 +273,13 @@ def raw2outputs_emission(
       raw_noise_std     : Rauschstd. (Training-Stabilisierung)
       mu_vals    : [N_rays, N_samples]       CT-basiertes µ (optional, für Attenuation)
       use_attenuation  : bool                Ob Attenuation einbezogen wird
-      attenuation_debug: bool                Extra Debug-Infos für Attenuation
       atten_scale      : float               Globaler Längenskalenfaktor für ∫ μ ds
 
     Rückgaben:
       proj_map : [N_rays]   Intensität der Projektion (Line-Integral)
       disp_map : [N_rays]   einfache "Disparity" = 1 / gewichteter Tiefe
       acc_map  : [N_rays]   hier identisch zu proj_map (Summe als "Akkumulation")
-      debug_payload : dict oder None, optional Debug-Tensoren
+      tv_base : Skalarer 1D-TV-Term entlang der Rays
     """
     # Δs entlang des Strahls (Abstand zwischen aufeinanderfolgenden z-Samples)
     dists = z_vals[..., 1:] - z_vals[..., :-1]                  # [N_rays, N_samples-1]
@@ -317,33 +308,6 @@ def raw2outputs_emission(
     eps = 1e-6
     tv_ray = torch.sqrt(diff_lambda * diff_lambda + eps)
     tv_base = tv_ray.mean()
-
-    # Edge-aware TV, gewichtet mit μ-Differenzen (kleine Δμ => starke TV, große Δμ => schwächer)
-    if mu_vals is not None:
-        diff_mu = mu_vals[..., 1:] - mu_vals[..., :-1]
-    else:
-        diff_mu = torch.zeros_like(diff_lambda)
-    sigma = max(float(tv_mu_sigma), 1e-8)
-    w_mu = torch.exp(-torch.abs(diff_mu) / (sigma + 1e-8))
-    tv_mu = (w_mu * tv_ray).mean()
-
-    # μ-basierter Prior auf Emissionen (weiches Gate)
-    mu_gate_loss = lambda_vals.new_tensor(0.0)
-    gate_mode = (mu_gate_mode or "none").lower()
-    if gate_mode != "none" and mu_vals is not None:
-        center = float(mu_gate_center)
-        width = float(mu_gate_width)
-        if gate_mode == "bandpass":
-            dist = torch.clamp(torch.abs(mu_vals - center) - width, min=0.0)
-        elif gate_mode == "lowpass":
-            dist = torch.clamp(mu_vals - center, min=0.0)
-        elif gate_mode == "highpass":
-            dist = torch.clamp(center - mu_vals, min=0.0)
-        else:
-            dist = None
-        if dist is not None:
-            penalty = dist * dist * lambda_vals
-            mu_gate_loss = penalty.mean()
 
     transmission = None
     # Grundfall: keine Attenuation → einfache Gewichte = e * Δs
@@ -382,24 +346,6 @@ def raw2outputs_emission(
     # Line-Integral entlang des Strahls
     proj_map = torch.sum(weights, dim=-1)                        # [N_rays]
 
-    if debug_prints and random.randint(0, 50) == 0:
-        lam_min, lam_max = lambda_vals.min().item(), lambda_vals.max().item()
-        w_min, w_max = weights.min().item(), weights.max().item()
-        mu_min = mu_max = float("nan")
-        trans_min = trans_max = float("nan")
-        if mu_vals is not None:
-            mu_min, mu_max = mu_vals.min().item(), mu_vals.max().item()
-        if use_attenuation and transmission is not None:
-            trans_min, trans_max = transmission.min().item(), transmission.max().item()
-        print(
-            f"[DEBUG][raw2outputs_emission] λ min/max: {lam_min:.3e}/{lam_max:.3e} | "
-            f"μ min/max: {mu_min:.3e}/{mu_max:.3e} | "
-            f"T min/max: {trans_min:.3e}/{trans_max:.3e} | "
-            f"weights min/max: {w_min:.3e}/{w_max:.3e} | "
-            f"proj min/max: {proj_map.min().item():.3e}/{proj_map.max().item():.3e}",
-            flush=True,
-        )
-
     # "Tiefe" = gewichtetes Mittel der z-Positionen
     depth_map = torch.sum(z_vals * weights, dim=-1) / (proj_map + 1e-8)
     disp_map  = 1.0 / torch.clamp(depth_map, min=1e-8)           # einfache Disparity (optional)
@@ -407,26 +353,7 @@ def raw2outputs_emission(
     # "acc" – hier als Summenmaß einfach die projizierte Intensität
     acc_map   = proj_map.clone()
 
-    # Optionales Debug-Paket für Analyse
-    debug_payload = None
-    if attenuation_debug:
-        debug_payload = {
-            "debug_lambda": lambda_vals.detach(),
-            "debug_dists": dists.detach(),
-            "debug_weights": weights.detach(),
-        }
-        if mu_vals is not None:
-            debug_payload["debug_mu"] = torch.clamp(mu_vals, min=0.0).detach()
-        if transmission is not None:
-            debug_payload["debug_transmission"] = transmission.detach()
-    if return_act_samples:
-        if debug_payload is None:
-            debug_payload = {}
-        debug_payload["act_samples"] = lambda_vals
-        debug_payload["act_dists"] = dists
-        debug_payload["act_z_vals"] = z_vals
-
-    return proj_map, disp_map, acc_map, debug_payload, tv_base, tv_mu, mu_gate_loss
+    return proj_map, disp_map, acc_map, tv_base
 
 
 # ---------------------------
@@ -494,18 +421,11 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
     # Attenuation-Setup aus kwargs holen
     ct_context = kwargs.get("ct_context")
     use_attenuation = bool(kwargs.get("use_attenuation", False))
-    attenuation_debug = bool(kwargs.get("attenuation_debug", False))
-    debug_prints = bool(kwargs.get("debug_prints", False))
-    return_act_samples = bool(kwargs.get("return_act_samples", False))
-    tv_mu_sigma = float(kwargs.get("tv_mu_sigma", 1.0))
-    mu_gate_mode = kwargs.get("mu_gate_mode", "none")
-    mu_gate_center = float(kwargs.get("mu_gate_center", 0.2))
-    mu_gate_width = float(kwargs.get("mu_gate_width", 0.1))
     atten_scale = float(kwargs.get("atten_scale", 25.0))
     mu_vals = None
 
-    # Falls Attenuation aktiviert und CT-Context vorhanden: µ aus CT sampeln
-    if use_attenuation and ct_context is not None:
+    # Falls Attenuation aktiv: µ aus CT sampeln
+    if ct_context is not None and use_attenuation:
         mu_vals = sample_ct_volume(pts, ct_context)           # [N_rays, N_samples]
         if not torch.isfinite(mu_vals).all():
             raise ValueError("CT samples contain NaN/Inf values.")
@@ -532,7 +452,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
 
     # Emissions-Pfad (SPECT)
     if emission:
-        proj_map, disp_map, acc_map, debug_payload, tv_base_loss, tv_mu_loss, mu_gate_loss = raw2outputs_emission(
+        proj_map, disp_map, acc_map, tv_base_loss = raw2outputs_emission(
             raw,
             z_vals,
             rays_d,
@@ -540,14 +460,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
             pytest=pytest,
             mu_vals=mu_vals,
             use_attenuation=use_attenuation,
-            attenuation_debug=attenuation_debug,
             atten_scale=atten_scale,
-            debug_prints=debug_prints,
-            tv_mu_sigma=tv_mu_sigma,
-            mu_gate_mode=mu_gate_mode,
-            mu_gate_center=mu_gate_center,
-            mu_gate_width=mu_gate_width,
-            return_act_samples=return_act_samples,
         )
         # Standard-Outputs
         ret = {
@@ -555,16 +468,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
             'disp_map': disp_map,
             'acc_map': acc_map,
             'tv_loss': tv_base_loss,
-            'tv_base_loss': tv_base_loss,
-            'tv_mu_loss': tv_mu_loss,
-            'mu_gate_loss': mu_gate_loss,
         }
-        # Debug-Infos aus raw2outputs_emission übernehmen
-        if debug_payload:
-            ret.update(debug_payload)
-        # Falls Attenuation-Debug an, aber debug_mu noch nicht drin, hänge µ an
-        if attenuation_debug and mu_vals is not None and "debug_mu" not in ret:
-            ret["debug_mu"] = mu_vals.detach()
         # Optional: raw-Outputs für spätere Auswertungen zurückgeben
         if retraw:
             ret['raw'] = raw
