@@ -166,6 +166,31 @@ def parse_args():
         help="Globaler Längenskalenfaktor für die Attenuation (μ in 1/cm, Bounding Box ~1).",
     )
     parser.add_argument(
+        "--camera-model",
+        type=str,
+        default="none",
+        choices=["none", "gauss"],
+        help="Optionales Gamma-Kamera-Modell auf 2D-Projektionen (none|gauss).",
+    )
+    parser.add_argument(
+        "--camera-psf-sigma",
+        type=float,
+        default=0.0,
+        help="Sigma (Pixel) für Gaussian-Kollimator-PSF, 0 deaktiviert die Faltung.",
+    )
+    parser.add_argument(
+        "--camera-scatter-alpha",
+        type=float,
+        default=0.0,
+        help="Mischanteil des Scatter-Anteils (0..1), 0 deaktiviert Scatter.",
+    )
+    parser.add_argument(
+        "--camera-scatter-sigma",
+        type=float,
+        default=0.0,
+        help="Sigma (Pixel) für den Scatter-Gaussian (breiter als PSF), 0 deaktiviert den Blur.",
+    )
+    parser.add_argument(
         "--ray-split",
         type=float,
         default=0.8,
@@ -275,6 +300,92 @@ def poisson_nll(
     if weight is not None:
         nll = nll * weight
     return nll.mean()
+
+
+class CameraModel2D:
+    """Simple, differentiable Gamma-Kamera-Modell (PSF + Scatter) für 2D-Projektionen."""
+
+    def __init__(self, mode: str = "none", psf_sigma: float = 0.0, scatter_alpha: float = 0.0, scatter_sigma: float = 0.0):
+        self.mode = (mode or "none").lower()
+        self.psf_sigma = float(psf_sigma)
+        self.scatter_alpha = float(np.clip(scatter_alpha, 0.0, 1.0))
+        self.scatter_sigma = float(scatter_sigma)
+        self._kernel_col_cache = {}
+        self._scatter_kernel_cache = {}
+        self._warned_shape_mismatch = False
+
+    @property
+    def active(self) -> bool:
+        return self.mode == "gauss" and (self.psf_sigma > 0.0 or self.scatter_alpha > 0.0)
+
+    def _gauss2d(self, sigma: float, tensor: torch.Tensor) -> Optional[torch.Tensor]:
+        if sigma <= 0.0:
+            return None
+        key = (tensor.device, tensor.dtype)
+        kernel = self._kernel_col_cache.get(key)
+        if kernel is None:
+            radius = max(1, int(math.ceil(3.0 * sigma)))
+            size = 2 * radius + 1
+            coords = torch.arange(size, device=tensor.device, dtype=tensor.dtype) - radius
+            grid_y, grid_x = torch.meshgrid(coords, coords, indexing="ij")
+            kernel = torch.exp(-(grid_x**2 + grid_y**2) / (2.0 * sigma**2))
+            kernel = kernel / kernel.sum()
+            kernel = kernel.view(1, 1, size, size)
+            self._kernel_col_cache[key] = kernel
+        return kernel
+
+    def _gauss1d(self, sigma: float, tensor: torch.Tensor):
+        if sigma <= 0.0:
+            return None
+        key = (tensor.device, tensor.dtype)
+        kernels = self._scatter_kernel_cache.get(key)
+        if kernels is None:
+            radius = max(1, int(math.ceil(3.0 * sigma)))
+            size = 2 * radius + 1
+            coords = torch.arange(size, device=tensor.device, dtype=tensor.dtype) - radius
+            kernel_1d = torch.exp(-(coords**2) / (2.0 * sigma**2))
+            kernel_1d = kernel_1d / kernel_1d.sum()
+            kernel_x = kernel_1d.view(1, 1, 1, size)
+            kernel_y = kernel_1d.view(1, 1, size, 1)
+            kernels = (kernel_x, kernel_y)
+            self._scatter_kernel_cache[key] = kernels
+        return kernels
+
+    def apply(self, proj_flat: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        if not self.active:
+            return proj_flat
+        if proj_flat.dim() != 2 or proj_flat.shape[1] != H * W:
+            # Bei Teil-Renders ohne vollständige Projektion keine Kamera-Faltung anwenden.
+            if not self._warned_shape_mismatch:
+                print(
+                    "[camera] Warnung: Kamera-Modell erfordert vollständige HxW-Projektionen – wird für Teil-Renders übersprungen.",
+                    flush=True,
+                )
+                self._warned_shape_mismatch = True
+            return proj_flat
+
+        img = proj_flat.view(proj_flat.shape[0], 1, H, W)
+        kernel_col = self._gauss2d(self.psf_sigma, img)
+        if kernel_col is not None:
+            pad = kernel_col.shape[-1] // 2
+            img_col = F.conv2d(img, kernel_col, padding=pad)
+        else:
+            img_col = img
+
+        if self.scatter_alpha > 0.0:
+            kernels_scatter = self._gauss1d(self.scatter_sigma, img)
+            if kernels_scatter is not None:
+                kx, ky = kernels_scatter
+                pad = kx.shape[-1] // 2
+                img_sc = F.conv2d(img_col, kx, padding=(0, pad))
+                img_sc = F.conv2d(img_sc, ky, padding=(pad, 0))
+            else:
+                img_sc = img_col
+            img_out = (1.0 - self.scatter_alpha) * img_col + self.scatter_alpha * img_sc
+        else:
+            img_out = img_col
+
+        return img_out.view_as(proj_flat)
 
 
 def build_ray_split(num_pixels: int, split_ratio: float, device: torch.device) -> Dict[str, torch.Tensor]:
@@ -411,6 +522,7 @@ def maybe_render_preview(
     ct_volume=None,
     act_volume=None,
     ct_context=None,
+    camera_model: Optional[CameraModel2D] = None,
 ):
     # Volle AP/PA-Renderings sind teuer; nur alle N Schritte ausführen
     if args.preview_every <= 0 or (step % args.preview_every) != 0:
@@ -422,6 +534,9 @@ def maybe_render_preview(
     with torch.no_grad():
         proj_ap, _, _, _ = generator.render_from_pose(z_eval, generator.pose_ap, ct_context=ctx)
         proj_pa, _, _, _ = generator.render_from_pose(z_eval, generator.pose_pa, ct_context=ctx)
+        if camera_model is not None:
+            proj_ap = camera_model.apply(proj_ap, generator.H, generator.W)
+            proj_pa = camera_model.apply(proj_pa, generator.H, generator.W)
     generator.train()
     generator.use_test_kwargs = prev_flag or False
     H, W = generator.H, generator.W
@@ -803,7 +918,9 @@ def evaluate_pixel_subsets(
     weight_threshold: float,
     pa_xflip: bool,
     ct_context=None,
+    H: int = None,
     W: int = None,
+    camera_model: Optional[CameraModel2D] = None,
 ):
     """Evaluiert Loss/PSNR/MAE auf gemeinsamen Pixel-Indizes für AP+PA (Loss gemittelt über Views)."""
     prev_flag = generator.use_test_kwargs
@@ -827,6 +944,10 @@ def evaluate_pixel_subsets(
 
             target_ap = ap_flat_proc[0, idx_ap].unsqueeze(0)
             target_pa = pa_flat_proc[0, idx_pa].unsqueeze(0)
+
+            if camera_model is not None:
+                pred_ap = camera_model.apply(pred_ap, H, W)
+                pred_pa = camera_model.apply(pred_pa, H, W)
 
             pred_ap = pred_ap.clamp_min(1e-8)
             pred_pa = pred_pa.clamp_min(1e-8)
@@ -1093,6 +1214,19 @@ def train():
     generator.train()
     generator.use_test_kwargs = False  # enforce training kwargs
 
+    camera_model = CameraModel2D(
+        mode=args.camera_model,
+        psf_sigma=args.camera_psf_sigma,
+        scatter_alpha=args.camera_scatter_alpha,
+        scatter_sigma=args.camera_scatter_sigma,
+    )
+    print(
+        f"[camera] model={camera_model.mode} | psf_sigma={camera_model.psf_sigma} "
+        f"| scatter_alpha={camera_model.scatter_alpha} | scatter_sigma={camera_model.scatter_sigma} "
+        f"| active={'yes' if camera_model.active else 'no'}",
+        flush=True,
+    )
+
     # always provide AP/PA fallback poses if not already configured
     generator.set_fixed_ap_pa(radius=hwfr[3])
 
@@ -1108,6 +1242,8 @@ def train():
         z_smoke = z_train.detach()
         proj_ap, _, _, _ = generator.render_from_pose(z_smoke, generator.pose_ap)
         proj_pa, _, _, _ = generator.render_from_pose(z_smoke, generator.pose_pa)
+        proj_ap = camera_model.apply(proj_ap, generator.H, generator.W)
+        proj_pa = camera_model.apply(proj_pa, generator.H, generator.W)
         generator.train()
         generator.use_test_kwargs = False
 
@@ -1328,12 +1464,14 @@ def train():
             target_ap = ap_flat_proc[0, idx_ap].unsqueeze(0)
             target_pa = pa_flat_proc[0, idx_pa].unsqueeze(0)
 
-            # Poisson-NLL erwartet pred >= 0
-            pred_ap_raw = pred_ap.clamp_min(1e-8)
-            pred_pa_raw = pred_pa.clamp_min(1e-8)
+            pred_ap = camera_model.apply(pred_ap, H, W)
+            pred_pa = camera_model.apply(pred_pa, H, W)
 
-            pred_ap = pred_ap_raw
-            pred_pa = pred_pa_raw
+            # Poisson-NLL erwartet pred >= 0
+            pred_ap = pred_ap.clamp_min(1e-8)
+            pred_pa = pred_pa.clamp_min(1e-8)
+            pred_ap_raw = pred_ap
+            pred_pa_raw = pred_pa
 
             weight_ap = build_loss_weights(target_ap, args.bg_weight, args.weight_threshold)
             weight_pa = build_loss_weights(target_pa, args.bg_weight, args.weight_threshold)
@@ -1467,7 +1605,9 @@ def train():
                     weight_threshold=args.weight_threshold,
                     pa_xflip=pa_xflip,
                     ct_context=ct_context,
+                    H=H,
                     W=W,
+                    camera_model=camera_model,
                 )
         val_all = val_stats.get("test_all") if isinstance(val_stats, dict) else None
         val_fg = val_stats.get("test_fg") if isinstance(val_stats, dict) else None
@@ -1585,6 +1725,7 @@ def train():
             ct_vol,
             act_vol,
             ct_context,
+            camera_model=camera_model,
         )
 
     prev_flag = generator.use_test_kwargs
@@ -1593,6 +1734,8 @@ def train():
     with torch.no_grad():
         proj_ap, _, _, _ = generator.render_from_pose(z_train.detach(), generator.pose_ap, ct_context=ct_context)
         proj_pa, _, _, _ = generator.render_from_pose(z_train.detach(), generator.pose_pa, ct_context=ct_context)
+        proj_ap = camera_model.apply(proj_ap, generator.H, generator.W)
+        proj_pa = camera_model.apply(proj_pa, generator.H, generator.W)
     generator.train()
     generator.use_test_kwargs = prev_flag or False
 

@@ -49,5 +49,9 @@ srun python -u train_emission.py \
     --ray-split-seed 123 \
     --ray-split-tile 32 \
     --ray-fg-thr 0.0 \
-    --ray-train-fg-frac 0.7
+    --ray-train-fg-frac 0.7 \
+    --camera-model gauss \
+    --camera-psf-sigma 1.5 \
+    --camera-scatter-alpha 0.15 \
+    --camera-scatter-sigma 4.0
 echo "✅ Training finished at: $(date)"
