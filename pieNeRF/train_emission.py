@@ -154,6 +154,26 @@ def parse_args():
         help="Gewicht für den 1D-TV-Loss entlang der Rays (0 = deaktiviert).",
     )
     parser.add_argument(
+        "--ray-tv-weight",
+        type=float,
+        default=0.0,
+        help="Gewicht für den Ray-1D-TV-Prior entlang der Samples (0 = deaktiviert).",
+    )
+    parser.add_argument(
+        "--ray-tv-edge-aware",
+        type=str2bool,
+        default=False,
+        nargs="?",
+        const=True,
+        help="Aktiviere edge-aware Ray-TV (benoetigt ray_tv_weight > 0 und ray_tv_alpha > 0).",
+    )
+    parser.add_argument(
+        "--ray-tv-alpha",
+        type=float,
+        default=0.0,
+        help="Alpha fuer edge-aware Ray-TV (Gewicht exp(-alpha*|delta_mu|)).",
+    )
+    parser.add_argument(
         "--grad-stats-every",
         type=int,
         default=0,
@@ -352,7 +372,8 @@ def log_effective_config(outdir: Path, config: dict, args):
     print(
         f"[cfg][training] lr_g={training_cfg.get('lr_g')} | tv_weight={training_cfg.get('tv_weight')} "
         f"| act_loss_weight={args.act_loss_weight} | act_samples={args.act_samples} | act_pos_weight={args.act_pos_weight} "
-        f"| ct_loss_weight={args.ct_loss_weight} | ct_threshold={args.ct_threshold} | z_reg_weight={args.z_reg_weight}",
+        f"| ct_loss_weight={args.ct_loss_weight} | ct_threshold={args.ct_threshold} | z_reg_weight={args.z_reg_weight} "
+        f"| ray_tv_weight={args.ray_tv_weight} | ray_tv_edge_aware={args.ray_tv_edge_aware} | ray_tv_alpha={args.ray_tv_alpha}",
         flush=True,
     )
 
@@ -386,7 +407,7 @@ def slice_rays(rays_full: torch.Tensor, ray_idx: torch.Tensor) -> torch.Tensor:
     )
 
 
-def render_minibatch(generator, z_latent, rays_subset, ct_context=None):
+def render_minibatch(generator, z_latent, rays_subset, ct_context=None, return_raw: bool = False):
     """Render a mini-batch of rays from a fixed pose while keeping training kwargs."""
     # train/test kwargs werden durch use_test_kwargs umgeschaltet
     render_kwargs = generator.render_kwargs_train if not generator.use_test_kwargs else generator.render_kwargs_test
@@ -396,10 +417,40 @@ def render_minibatch(generator, z_latent, rays_subset, ct_context=None):
         render_kwargs["ct_context"] = ct_context
     elif render_kwargs.get("use_attenuation"):
         render_kwargs["use_attenuation"] = False
+    if return_raw:
+        render_kwargs["retraw"] = True
     if DEBUG_PRINTS:
         render_kwargs["debug_prints"] = True
     proj_map, _, _, extras = generator.render(rays=rays_subset, **render_kwargs)
     return proj_map.view(z_latent.shape[0], -1), extras
+
+
+def compute_ray_tv(
+    raw: torch.Tensor,
+    mu_vals: Optional[torch.Tensor] = None,
+    edge_aware: bool = False,
+    alpha: float = 0.0,
+    return_stats: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Berechnet den (edge-aware) 1D-Total-Variation-Prior entlang jedes Rays."""
+    lambda_vals = F.softplus(raw[..., 0])  # [N_rays, N_samples]
+    diffs = torch.abs(lambda_vals[..., 1:] - lambda_vals[..., :-1])
+    if edge_aware and mu_vals is not None and alpha > 0.0:
+        if mu_vals.shape != lambda_vals.shape:
+            raise ValueError(f"CT samples have wrong shape {mu_vals.shape}, expected {lambda_vals.shape}.")
+        mu = torch.clamp(mu_vals, min=0.0)
+        mu_diffs = torch.abs(mu[..., 1:] - mu[..., :-1])
+        weights = torch.exp(-alpha * mu_diffs)
+        tv_per_ray = torch.sum(weights * diffs, dim=-1)
+        tv = torch.mean(tv_per_ray)
+        if return_stats:
+            return tv, weights.mean()
+        return tv, None
+    tv_per_ray = torch.sum(diffs, dim=-1)
+    tv = torch.mean(tv_per_ray)
+    if return_stats:
+        return tv, None
+    return tv, None
 
 
 def maybe_render_preview(
@@ -451,6 +502,8 @@ def init_log_file(path: Path):
                 "loss_pa",
                 "loss_act",
                 "loss_ct",
+                "ray_tv",
+                "ray_tv_w",
                 "loss_tv",
                 "zreg",
                 "mae_ap",
@@ -478,6 +531,8 @@ def init_log_file(path: Path):
                 "mae_test_top10",
                 "iter_ms",
                 "lr",
+                "ray_tv_mode",
+                "ray_tv_w_mean",
             ]
         )
 
@@ -1028,6 +1083,12 @@ def train():
     training_cfg.setdefault("val_interval", 0)
     training_cfg.setdefault("tv_weight", 0.001)
     training_cfg["tv_weight"] = args.tv_weight
+    training_cfg.setdefault("ray_tv_weight", 0.0)
+    training_cfg["ray_tv_weight"] = args.ray_tv_weight
+    training_cfg.setdefault("ray_tv_edge_aware", False)
+    training_cfg["ray_tv_edge_aware"] = bool(args.ray_tv_edge_aware)
+    training_cfg.setdefault("ray_tv_alpha", 0.0)
+    training_cfg["ray_tv_alpha"] = float(args.ray_tv_alpha)
     training_cfg.setdefault("act_samples", 16384)
     training_cfg.setdefault("act_pos_weight", 2.0)
     if args.act_samples is None:
@@ -1087,6 +1148,9 @@ def train():
     ray_train_fg_frac = float(np.clip(args.ray_train_fg_frac, 0.0, 1.0))
     val_interval = int(training_cfg.get("val_interval", 0) or 0)
     tv_weight = float(training_cfg.get("tv_weight", 0.0))
+    ray_tv_weight = float(training_cfg.get("ray_tv_weight", 0.0))
+    ray_tv_edge_aware = bool(training_cfg.get("ray_tv_edge_aware", False))
+    ray_tv_alpha = float(training_cfg.get("ray_tv_alpha", 0.0))
 
     generator = build_models(config)
     generator.to(device)
@@ -1305,6 +1369,8 @@ def train():
         optimizer.zero_grad(set_to_none=True)
         t0 = time.perf_counter()
 
+        need_ray_tv = ray_tv_weight != 0.0
+
         if ray_split_enabled and pixel_split_np is not None and rng_train is not None:
             idx_np = sample_train_indices(pixel_split_np, rays_per_proj, ray_train_fg_frac, rng_train)
             idx_ap = torch.from_numpy(idx_np).long().to(device, non_blocking=True)
@@ -1319,10 +1385,10 @@ def train():
 
         with torch.cuda.amp.autocast(enabled=amp_enabled):
             pred_ap, extras_ap = render_minibatch(
-                generator, z_latent, ray_batch_ap, ct_context=ct_context
+                generator, z_latent, ray_batch_ap, ct_context=ct_context, return_raw=need_ray_tv
             )
             pred_pa, extras_pa = render_minibatch(
-                generator, z_latent, ray_batch_pa, ct_context=ct_context
+                generator, z_latent, ray_batch_pa, ct_context=ct_context, return_raw=need_ray_tv
             )
 
             target_ap = ap_flat_proc[0, idx_ap].unsqueeze(0)
@@ -1391,6 +1457,10 @@ def train():
 
             tv_base_loss = torch.tensor(0.0, device=device)
             loss_tv = torch.tensor(0.0, device=device)
+            loss_ray_tv = torch.tensor(0.0, device=device)
+            loss_ray_tv_w = torch.tensor(0.0, device=device)
+            ray_tv_mode = "plain"
+            ray_tv_w_mean = None
 
             tv_base_terms = []
             if isinstance(extras_ap, dict):
@@ -1408,6 +1478,39 @@ def train():
             if tv_weight != 0.0:
                 loss_tv = tv_weight * tv_base_loss
                 loss = loss + loss_tv
+
+            if ray_tv_weight != 0.0:
+                edge_aware_active = ray_tv_edge_aware and ray_tv_alpha > 0.0
+                ray_tv_terms = []
+                ray_tv_w_terms = []
+                for extras in (extras_ap, extras_pa):
+                    if not isinstance(extras, dict):
+                        continue
+                    raw_out = extras.get("raw")
+                    if raw_out is None:
+                        continue
+                    if edge_aware_active:
+                        mu_out = extras.get("mu")
+                        tv_val, w_mean = compute_ray_tv(
+                            raw_out,
+                            mu_vals=mu_out,
+                            edge_aware=True,
+                            alpha=ray_tv_alpha,
+                            return_stats=True,
+                        )
+                        if w_mean is not None:
+                            ray_tv_w_terms.append(w_mean)
+                        ray_tv_terms.append(tv_val)
+                    else:
+                        tv_val, _ = compute_ray_tv(raw_out)
+                        ray_tv_terms.append(tv_val)
+                if ray_tv_terms:
+                    loss_ray_tv = torch.stack(ray_tv_terms).mean()
+                    loss_ray_tv_w = loss_ray_tv * ray_tv_weight
+                    loss = loss + loss_ray_tv_w
+                if edge_aware_active and ray_tv_w_terms:
+                    ray_tv_w_mean = torch.stack(ray_tv_w_terms).mean().item()
+                    ray_tv_mode = "edgeaware"
 
         if args.grad_stats_every > 0 and (step % args.grad_stats_every) == 0:
             proj_loss_for_grad = 0.5 * (loss_ap + loss_pa)
@@ -1501,12 +1604,17 @@ def train():
         msg = (
             f"[step {step:05d}] loss={loss.item():.6f} | ap={loss_ap.item():.6f} | pa={loss_pa.item():.6f} "
             f"| act={loss_act.item():.6f} | ct={loss_ct.item():.6f} "
+            f"| ray_tv={loss_ray_tv.item():.6f} | ray_tv_w={loss_ray_tv_w.item():.6f} "
             f"| tv={loss_tv.item():.6f} | zreg={loss_reg.item():.6f} "
             f"| mae_ap={mae_ap:.6f} | mae_pa={mae_pa:.6f} "
             f"| psnr_ap={psnr_ap:.2f} | psnr_pa={psnr_pa:.2f} "
             f"| predμ_raw=({pred_mean_raw[0]:.3e},{pred_mean_raw[1]:.3e}) predσ_raw=({pred_std_raw[0]:.3e},{pred_std_raw[1]:.3e}) "
             f"| predμ=({pred_mean[0]:.3e},{pred_mean[1]:.3e}) predσ=({pred_std[0]:.3e},{pred_std[1]:.3e})"
         )
+        if ray_tv_weight != 0.0:
+            msg += f" | ray_tv_mode={ray_tv_mode}"
+            if ray_tv_w_mean is not None:
+                msg += f" | ray_tv_w_mean={ray_tv_w_mean:.6f}"
         if val_all is not None:
             msg += (
                 f" | test_all_loss={val_loss:.6f} | test_all_psnr={val_psnr:.2f} | test_all_mae={val_mae:.6f}"
@@ -1545,6 +1653,8 @@ def train():
                 loss_pa.item(),
                 loss_act.item(),
                 loss_ct.item(),
+                loss_ray_tv.item(),
+                loss_ray_tv_w.item(),
                 loss_tv.item(),
                 loss_reg.item(),
                 mae_ap,
@@ -1572,6 +1682,8 @@ def train():
                 val_mae_top10,
                 iter_ms,
                 optimizer.param_groups[0]["lr"],
+                ray_tv_mode,
+                ray_tv_w_mean,
             ],
         )
         if args.save_every > 0 and (step % args.save_every == 0):

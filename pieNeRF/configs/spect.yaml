@@ -47,7 +47,7 @@ nerf:
 
   # Sampling entlang der Strahlen
   # Increased depth sampling to reduce discretization-induced lamella artifacts.
-  N_samples: 64                                 # eig. 128, aber für schnelles Training erstmal runter
+  N_samples: 96                                 # eig. 128, aber für schnelles Training erstmal runter
   N_importance: 0                             # aktiviert hierarchisches Fine-Sampling mit höherer Auflösung
 
   # MLP-Größe

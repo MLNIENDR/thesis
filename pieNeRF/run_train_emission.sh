@@ -27,27 +27,30 @@ nvidia-smi
 # 4️⃣ Training starten
 echo "🏋️ Running train_emission.py..."
 srun python -u train_emission.py \
-    --config configs/spect.yaml \
-    --max-steps 2000 \
-    --rays-per-step 16384 \
-    --log-every 10 \
-    --preview-every 100 \
-    --save-every 100 \
-    --bg-weight 1.0 \
-    --weight-threshold 0.0 \
-    --act-loss-weight 0.005 \
-    --act-samples 4096 \
-    --act-pos-weight 1.0 \
-    --ct-loss-weight 0.002 \
-    --ct-threshold 0.05 \
-    --ct-samples 4096 \
-    --z-reg-weight 5e-4 \
-    --tv-weight 0.0002 \
-    --grad-stats-every 10 \
-    --ray-split-enable \
-    --ray-split 0.8 \
-    --ray-split-seed 123 \
-    --ray-split-tile 32 \
-    --ray-fg-thr 0.0 \
-    --ray-train-fg-frac 0.7
+  --config configs/spect.yaml \
+  --max-steps 2000 \
+  --rays-per-step 16384 \
+  --log-every 10 \
+  --preview-every 100 \
+  --save-every 100 \
+  --bg-weight 1.0 \
+  --weight-threshold 0.0 \
+  --act-loss-weight 0.005 \
+  --act-samples 4096 \
+  --act-pos-weight 1.0 \
+  --ct-loss-weight 0.002 \
+  --ct-threshold 0.05 \
+  --ct-samples 4096 \
+  --z-reg-weight 5e-4 \
+  --tv-weight 0.0002 \
+  --ray-tv-weight 2e-5 \
+  --ray-tv-edge-aware \
+  --ray-tv-alpha 30 \
+  --grad-stats-every 10 \
+  --ray-split-enable \
+  --ray-split 0.8 \
+  --ray-split-seed 123 \
+  --ray-split-tile 32 \
+  --ray-fg-thr 0.0 \
+  --ray-train-fg-frac 0.7
 echo "✅ Training finished at: $(date)"

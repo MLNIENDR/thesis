@@ -260,6 +260,7 @@ def raw2outputs_emission(
     mu_vals=None,
     use_attenuation=False,
     atten_scale: float = 25.0,
+    return_dists: bool = False,
 ):
     """
     Emissions-NeRF:
@@ -312,7 +313,6 @@ def raw2outputs_emission(
     transmission = None
     # Grundfall: keine Attenuation → einfache Gewichte = e * Δs
     weights = lambda_vals * dists
-
     if use_attenuation:
         if mu_vals is None:
             # Flag gesetzt, aber kein µ-Volumen übergeben → Warnung
@@ -353,6 +353,8 @@ def raw2outputs_emission(
     # "acc" – hier als Summenmaß einfach die projizierte Intensität
     acc_map   = proj_map.clone()
 
+    if return_dists:
+        return proj_map, disp_map, acc_map, tv_base, dists
     return proj_map, disp_map, acc_map, tv_base
 
 
@@ -452,7 +454,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
 
     # Emissions-Pfad (SPECT)
     if emission:
-        proj_map, disp_map, acc_map, tv_base_loss = raw2outputs_emission(
+        outputs = raw2outputs_emission(
             raw,
             z_vals,
             rays_d,
@@ -461,7 +463,12 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
             mu_vals=mu_vals,
             use_attenuation=use_attenuation,
             atten_scale=atten_scale,
+            return_dists=retraw,
         )
+        if retraw:
+            proj_map, disp_map, acc_map, tv_base_loss, dists_out = outputs
+        else:
+            proj_map, disp_map, acc_map, tv_base_loss = outputs
         # Standard-Outputs
         ret = {
             'proj_map': proj_map,
@@ -472,6 +479,9 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
         # Optional: raw-Outputs für spätere Auswertungen zurückgeben
         if retraw:
             ret['raw'] = raw
+            ret['dists'] = dists_out
+            if mu_vals is not None:
+                ret['mu'] = mu_vals
         return ret
 
     # Fallback: klassischer RGB-NeRF-Pfad (sollte in meinem Setup NIE aufgerufen werden)
