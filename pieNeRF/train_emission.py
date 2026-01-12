@@ -72,6 +72,23 @@ def parse_args():
         help="If >0 stores checkpoints every N steps in addition to the final checkpoint.",
     )
     parser.add_argument(
+        "--export-act-volume",
+        action="store_true",
+        help="Export the final predicted ACT volume as .npy after training.",
+    )
+    parser.add_argument(
+        "--export-act-out",
+        type=str,
+        default=None,
+        help="Optional output path for the exported ACT volume (.npy). Defaults to <outdir>/pred_act_step{max_steps}.npy.",
+    )
+    parser.add_argument(
+        "--export-act-chunk",
+        type=int,
+        default=131072,
+        help="Chunk size (voxels) for ACT volume export.",
+    )
+    parser.add_argument(
         "--normalize-targets",
         action="store_true",
         help="(Deprecated) Apply per-projection min/max normalisation to both targets and predictions.",
@@ -1010,6 +1027,69 @@ def normalize_curve(arr: np.ndarray) -> np.ndarray:
     return arr
 
 
+def export_pred_act_volume(
+    generator,
+    z_latent: torch.Tensor,
+    ref_volume: torch.Tensor,
+    out_path: Path,
+    chunk_size: int,
+):
+    if ref_volume is None or ref_volume.numel() == 0:
+        print("⚠️ Kein Referenz-Volume für ACT-Export gefunden (ct/act leer).", flush=True)
+        return
+    if ref_volume.dim() == 4:
+        ref_volume = ref_volume.squeeze(0)
+    if ref_volume.dim() != 3:
+        raise ValueError(f"Expected 3D reference volume, got shape {tuple(ref_volume.shape)}")
+
+    D, H, W = ref_volume.shape[-3:]
+    radius = generator.radius
+    if isinstance(radius, tuple):
+        radius = radius[1]
+    total = int(D * H * W)
+    if chunk_size <= 0:
+        raise ValueError("export_act_chunk must be > 0.")
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    flat = np.empty((total,), dtype=np.float32)
+
+    prev_flag = generator.use_test_kwargs
+    generator.eval()
+    generator.use_test_kwargs = True
+    device = z_latent.device
+
+    with torch.no_grad():
+        for start in range(0, total, chunk_size):
+            end = min(start + chunk_size, total)
+            idx = torch.arange(start, end, device=device, dtype=torch.long)
+            hw = H * W
+            z_idx = idx // hw
+            y_idx = (idx % hw) // W
+            x_idx = idx % W
+            coords = torch.stack(
+                (
+                    idx_to_coord(x_idx, W, radius),
+                    idx_to_coord(y_idx, H, radius),
+                    idx_to_coord(z_idx, D, radius),
+                ),
+                dim=1,
+            )
+            pred = query_emission_at_points(generator, z_latent, coords)
+            flat[start:end] = pred.detach().cpu().numpy().astype(np.float32, copy=False)
+
+    generator.use_test_kwargs = prev_flag or False
+    generator.train()
+
+    volume = flat.reshape(D, H, W)
+    np.save(out_path, volume)
+    print(
+        f"💾 ACT-Volume exportiert: {out_path} | "
+        f"min={volume.min():.6g} max={volume.max():.6g} mean={volume.mean():.6g}",
+        flush=True,
+    )
+
+
 
 def sample_ct_pairs(ct: torch.Tensor, nsamples: int, thresh: float, radius: float):
     """Wählt Voxel-Paare (z,z+1) mit geringer CT-Änderung entlang der Tiefe."""
@@ -1718,6 +1798,17 @@ def train():
     print("🖼️ Finale Previews gespeichert.", flush=True)
     print("   ", (fp / "final_AP.png").resolve(), flush=True)
     print("   ", (fp / "final_PA.png").resolve(), flush=True)
+
+    if args.export_act_volume:
+        ref_vol = act_vol if act_vol is not None else ct_vol
+        out_path = args.export_act_out or (outdir / f"pred_act_step{args.max_steps:05d}.npy")
+        export_pred_act_volume(
+            generator,
+            z_train.detach(),
+            ref_vol,
+            out_path,
+            args.export_act_chunk,
+        )
 
     save_checkpoint(args.max_steps, generator, z_train, optimizer, scaler, ckpt_dir)
     print("✅ Training run finished.", flush=True)

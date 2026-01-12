@@ -52,5 +52,8 @@ srun python -u train_emission.py \
   --ray-split-seed 123 \
   --ray-split-tile 32 \
   --ray-fg-thr 0.0 \
-  --ray-train-fg-frac 0.7
+  --ray-train-fg-frac 0.7 \
+  --export-act-volume \
+  --export-act-out results_spect/postprocessing/phantom_01/pred_act_step02000.npy \
+  --export-act-chunk 131072
 echo "✅ Training finished at: $(date)"
