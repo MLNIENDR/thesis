@@ -18,9 +18,11 @@ from torch.utils.data import DataLoader
 from graf.config import get_data, build_models
 try:
     from pieNeRF.utils.ray_split import PixelSplit, make_pixel_split_from_ap_pa, sample_train_indices
+    from pieNeRF.nerf.run_nerf_mod import sample_ct_volume
 except ModuleNotFoundError:
     # Fallback for running as a script from the repo root
     from utils.ray_split import PixelSplit, make_pixel_split_from_ap_pa, sample_train_indices
+    from nerf.run_nerf_mod import sample_ct_volume
 
 __VERSION__ = "emission-train v0.3"
 DEBUG_PRINTS = False  # Nur Debug-Ausgaben, keine Änderung am Verhalten
@@ -158,6 +160,20 @@ def parse_args():
         type=float,
         default=0.0,
         help="Gewicht für den Ray-1D-TV-Prior entlang der Samples (0 = deaktiviert).",
+    )
+    parser.add_argument(
+        "--ray-tv-oversample",
+        type=int,
+        default=2,
+        help="Oversampling-Faktor entlang z nur für den Ray-TV-Loss.",
+    )
+    parser.add_argument(
+        "--ray-tv-fg-only",
+        type=str2bool,
+        default=True,
+        nargs="?",
+        const=True,
+        help="Falls aktiv und Ray-Split vorhanden: Ray-TV nur auf FG-Rays berechnen.",
     )
     parser.add_argument(
         "--ray-tv-edge-aware",
@@ -373,7 +389,8 @@ def log_effective_config(outdir: Path, config: dict, args):
         f"[cfg][training] lr_g={training_cfg.get('lr_g')} | tv_weight={training_cfg.get('tv_weight')} "
         f"| act_loss_weight={args.act_loss_weight} | act_samples={args.act_samples} | act_pos_weight={args.act_pos_weight} "
         f"| ct_loss_weight={args.ct_loss_weight} | ct_threshold={args.ct_threshold} | z_reg_weight={args.z_reg_weight} "
-        f"| ray_tv_weight={args.ray_tv_weight} | ray_tv_edge_aware={args.ray_tv_edge_aware} | ray_tv_alpha={args.ray_tv_alpha}",
+        f"| ray_tv_weight={args.ray_tv_weight} | ray_tv_oversample={args.ray_tv_oversample} "
+        f"| ray_tv_fg_only={args.ray_tv_fg_only} | ray_tv_edge_aware={args.ray_tv_edge_aware} | ray_tv_alpha={args.ray_tv_alpha}",
         flush=True,
     )
 
@@ -426,30 +443,82 @@ def render_minibatch(generator, z_latent, rays_subset, ct_context=None, return_r
 
 
 def compute_ray_tv(
-    raw: torch.Tensor,
-    mu_vals: Optional[torch.Tensor] = None,
+    generator,
+    z_latent: torch.Tensor,
+    ray_batch: torch.Tensor,
+    ct_context=None,
+    oversample: int = 2,
     edge_aware: bool = False,
     alpha: float = 0.0,
     return_stats: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Berechnet den (edge-aware) 1D-Total-Variation-Prior entlang jedes Rays."""
-    lambda_vals = F.softplus(raw[..., 0])  # [N_rays, N_samples]
-    diffs = torch.abs(lambda_vals[..., 1:] - lambda_vals[..., :-1])
-    if edge_aware and mu_vals is not None and alpha > 0.0:
-        if mu_vals.shape != lambda_vals.shape:
-            raise ValueError(f"CT samples have wrong shape {mu_vals.shape}, expected {lambda_vals.shape}.")
-        mu = torch.clamp(mu_vals, min=0.0)
-        mu_diffs = torch.abs(mu[..., 1:] - mu[..., :-1])
-        weights = torch.exp(-alpha * mu_diffs)
-        tv_per_ray = torch.sum(weights * diffs, dim=-1)
-        tv = torch.mean(tv_per_ray)
-        if return_stats:
-            return tv, weights.mean()
-        return tv, None
+    """Berechnet den (edge-aware) 1D-Total-Variation-Prior entlang jedes Rays (oversampled)."""
+    if ray_batch is None or ray_batch.shape[1] == 0:
+        device = z_latent.device
+        return torch.tensor(0.0, device=device), None
+    render_kwargs = generator.render_kwargs_train if not generator.use_test_kwargs else generator.render_kwargs_test
+    network_fn = render_kwargs["network_fn"]
+    network_query_fn = render_kwargs["network_query_fn"]
+    use_viewdirs = bool(render_kwargs.get("use_viewdirs", False))
+
+    rays_o = ray_batch[0]
+    rays_d = ray_batch[1]
+    device = rays_o.device
+    dtype = rays_o.dtype
+
+    near = render_kwargs.get("near", 0.0)
+    far = render_kwargs.get("far", 1.0)
+    if not torch.is_tensor(near):
+        near = torch.tensor(near, device=device, dtype=dtype)
+    if not torch.is_tensor(far):
+        far = torch.tensor(far, device=device, dtype=dtype)
+    near = near.expand(rays_o.shape[0], 1)
+    far = far.expand(rays_o.shape[0], 1)
+    if isinstance(generator.radius, tuple):
+        rays_radius = rays_o.norm(dim=-1)
+        shift = (generator.radius[1] - rays_radius).view(-1, 1).float()
+        near = near - shift
+        far = far - shift
+
+    N_samples = int(render_kwargs.get("N_samples", 0))
+    oversample = max(1, int(oversample))
+    N_tv = max(1, N_samples * oversample)
+    t_vals = torch.linspace(0.0, 1.0, steps=N_tv, device=device, dtype=dtype)
+    if render_kwargs.get("lindisp", False):
+        z_tv = 1.0 / (1.0 / near * (1.0 - t_vals) + 1.0 / far * t_vals)
+    else:
+        z_tv = near * (1.0 - t_vals) + far * t_vals
+    z_tv = z_tv.expand([rays_o.shape[0], N_tv])
+
+    pts_tv = rays_o[..., None, :] + rays_d[..., None, :] * z_tv[..., :, None]
+
+    if z_latent.shape[0] != rays_o.shape[0]:
+        z_features = z_latent.expand(rays_o.shape[0], -1)
+    else:
+        z_features = z_latent
+
+    viewdirs = None
+    if use_viewdirs:
+        viewdirs = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
+
+    raw_tv = network_query_fn(pts_tv, viewdirs, network_fn, features=z_features)
+    lambda_tv = F.softplus(raw_tv[..., 0])
+
+    diffs = torch.abs(lambda_tv[..., 1:] - lambda_tv[..., :-1])
+    w_mean = None
+    if edge_aware and alpha > 0.0 and ct_context is not None:
+        mu_tv = sample_ct_volume(pts_tv, ct_context)
+        if mu_tv is not None:
+            mu_diff = torch.abs(mu_tv[:, 1:] - mu_tv[:, :-1])
+            w_edge = torch.exp(-alpha * mu_diff)
+            diffs = w_edge * diffs
+            if return_stats:
+                w_mean = w_edge.mean()
+
     tv_per_ray = torch.sum(diffs, dim=-1)
     tv = torch.mean(tv_per_ray)
     if return_stats:
-        return tv, None
+        return tv, w_mean
     return tv, None
 
 
@@ -1085,6 +1154,10 @@ def train():
     training_cfg["tv_weight"] = args.tv_weight
     training_cfg.setdefault("ray_tv_weight", 0.0)
     training_cfg["ray_tv_weight"] = args.ray_tv_weight
+    training_cfg.setdefault("ray_tv_oversample", 2)
+    training_cfg["ray_tv_oversample"] = int(args.ray_tv_oversample)
+    training_cfg.setdefault("ray_tv_fg_only", True)
+    training_cfg["ray_tv_fg_only"] = bool(args.ray_tv_fg_only)
     training_cfg.setdefault("ray_tv_edge_aware", False)
     training_cfg["ray_tv_edge_aware"] = bool(args.ray_tv_edge_aware)
     training_cfg.setdefault("ray_tv_alpha", 0.0)
@@ -1149,6 +1222,8 @@ def train():
     val_interval = int(training_cfg.get("val_interval", 0) or 0)
     tv_weight = float(training_cfg.get("tv_weight", 0.0))
     ray_tv_weight = float(training_cfg.get("ray_tv_weight", 0.0))
+    ray_tv_oversample = int(training_cfg.get("ray_tv_oversample", 2))
+    ray_tv_fg_only = bool(training_cfg.get("ray_tv_fg_only", True))
     ray_tv_edge_aware = bool(training_cfg.get("ray_tv_edge_aware", False))
     ray_tv_alpha = float(training_cfg.get("ray_tv_alpha", 0.0))
 
@@ -1480,30 +1555,34 @@ def train():
                 loss = loss + loss_tv
 
             if ray_tv_weight != 0.0:
-                edge_aware_active = ray_tv_edge_aware and ray_tv_alpha > 0.0
+                edge_aware_active = ray_tv_edge_aware and ray_tv_alpha > 0.0 and ct_context is not None
                 ray_tv_terms = []
                 ray_tv_w_terms = []
-                for extras in (extras_ap, extras_pa):
-                    if not isinstance(extras, dict):
+                ray_tv_mask = None
+                if ray_tv_fg_only and ray_split_enabled:
+                    fg_idx = ray_indices["pixel"].get("train_idx_fg")
+                    if fg_idx is not None:
+                        ray_tv_mask = torch.isin(idx_ap, fg_idx)
+
+                ray_tv_batch_ap = ray_batch_ap[:, ray_tv_mask] if ray_tv_mask is not None else ray_batch_ap
+                ray_tv_batch_pa = ray_batch_pa[:, ray_tv_mask] if ray_tv_mask is not None else ray_batch_pa
+
+                for ray_batch in (ray_tv_batch_ap, ray_tv_batch_pa):
+                    if ray_batch.shape[1] == 0:
                         continue
-                    raw_out = extras.get("raw")
-                    if raw_out is None:
-                        continue
-                    if edge_aware_active:
-                        mu_out = extras.get("mu")
-                        tv_val, w_mean = compute_ray_tv(
-                            raw_out,
-                            mu_vals=mu_out,
-                            edge_aware=True,
-                            alpha=ray_tv_alpha,
-                            return_stats=True,
-                        )
-                        if w_mean is not None:
-                            ray_tv_w_terms.append(w_mean)
-                        ray_tv_terms.append(tv_val)
-                    else:
-                        tv_val, _ = compute_ray_tv(raw_out)
-                        ray_tv_terms.append(tv_val)
+                    tv_val, w_mean = compute_ray_tv(
+                        generator,
+                        z_latent,
+                        ray_batch,
+                        ct_context=ct_context,
+                        oversample=ray_tv_oversample,
+                        edge_aware=edge_aware_active,
+                        alpha=ray_tv_alpha,
+                        return_stats=edge_aware_active,
+                    )
+                    ray_tv_terms.append(tv_val)
+                    if w_mean is not None:
+                        ray_tv_w_terms.append(w_mean)
                 if ray_tv_terms:
                     loss_ray_tv = torch.stack(ray_tv_terms).mean()
                     loss_ray_tv_w = loss_ray_tv * ray_tv_weight

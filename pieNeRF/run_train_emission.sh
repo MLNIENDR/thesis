@@ -39,11 +39,13 @@ srun python -u train_emission.py \
   --act-samples 4096 \
   --act-pos-weight 1.0 \
   --ct-loss-weight 0.002 \
-  --ct-threshold 0.05 \
+  --ct-threshold 0.002 \
   --ct-samples 4096 \
   --z-reg-weight 5e-4 \
-  --tv-weight 0.0002 \
+  --tv-weight 2e-3 \
   --ray-tv-weight 2e-5 \
+  --ray-tv-oversample 2 \
+  --ray-tv-fg-only true \
   --ray-tv-edge-aware \
   --ray-tv-alpha 30 \
   --grad-stats-every 10 \
@@ -52,5 +54,11 @@ srun python -u train_emission.py \
   --ray-split-seed 123 \
   --ray-split-tile 32 \
   --ray-fg-thr 0.0 \
-  --ray-train-fg-frac 0.7
+  --ray-train-fg-frac 0.7 
+
 echo "✅ Training finished at: $(date)"
+
+
+#  --export-act-volume \
+#  --export-act-out results_spect/postprocessing/phantom_01/pred_act_step02000.npy \
+#  --export-act-chunk 131072
