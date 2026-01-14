@@ -354,8 +354,8 @@ def raw2outputs_emission(
     acc_map   = proj_map.clone()
 
     if return_dists:
-        return proj_map, disp_map, acc_map, tv_base, dists
-    return proj_map, disp_map, acc_map, tv_base
+        return proj_map, disp_map, acc_map, tv_base, dists, weights, transmission
+    return proj_map, disp_map, acc_map, tv_base, weights, transmission
 
 
 # ---------------------------
@@ -466,16 +466,19 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
             return_dists=retraw,
         )
         if retraw:
-            proj_map, disp_map, acc_map, tv_base_loss, dists_out = outputs
+            proj_map, disp_map, acc_map, tv_base_loss, dists_out, weights_out, transmission_out = outputs
         else:
-            proj_map, disp_map, acc_map, tv_base_loss = outputs
+            proj_map, disp_map, acc_map, tv_base_loss, weights_out, transmission_out = outputs
         # Standard-Outputs
         ret = {
             'proj_map': proj_map,
             'disp_map': disp_map,
             'acc_map': acc_map,
             'tv_loss': tv_base_loss,
+            'weights': weights_out,
         }
+        if transmission_out is not None:
+            ret['transmission'] = transmission_out
         # Optional: raw-Outputs für spätere Auswertungen zurückgeben
         if retraw:
             ret['raw'] = raw

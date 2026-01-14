@@ -6,11 +6,26 @@ This script is strictly post-hoc: it does NOT re-fit projections or influence tr
 It targets z-axis artifacts while preserving XY layout. The recommended mode is
 `holefill`, which closes short zero-drops between active regions without reducing
 peak heights or merging separated plateaus.
+
+
+Aufruf: 
+python3 postprocessing.py \
+  --in results_spect/postprocessing/phantom_01/pred_act_step02000.npy \
+  --method holefill \
+  --z-axis 0 \
+  --export-projections \
+  --ct data/phantom_01/spect_att.npy \
+  --target-ap data/phantom_01/ap.npy \
+  --target-pa data/phantom_01/pa.npy \
+  --outdir results_spect/postprocessing/phantom_01/proj_withCT
+
+
 """
 
 from __future__ import annotations
 
 import argparse
+import torch
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 
@@ -573,23 +588,36 @@ def _resolve_aux_inputs(
 def _save_png(arr: np.ndarray, path: Path, title: Optional[str] = None) -> None:
     import matplotlib.pyplot as plt
 
-    if not np.isfinite(arr).all():
-        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-    a_min, a_max = float(np.min(arr)), float(np.max(arr))
-    if np.isclose(a_min, a_max):
-        img = np.zeros_like(arr) if a_max == 0 else arr / (a_max + 1e-8)
+    a = np.asarray(arr, dtype=np.float32)
+    if a.ndim == 0:
+        a = a.reshape(1, 1)
+    elif a.ndim == 1:
+        a = a[None, :]
+    if not np.isfinite(a).all():
+        a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # robust contrast: percentile scaling (prevents "only contour" look)
+    p1, p99 = np.percentile(a, [1, 99])
+    if np.isclose(p1, p99):
+        vmin, vmax = float(a.min()), float(a.max())
     else:
-        arr_shift = arr - a_min
-        arr_log = np.log1p(arr_shift)
-        img = (arr_log - arr_log.min()) / (arr_log.max() - arr_log.min() + 1e-8)
+        vmin, vmax = float(p1), float(p99)
+
+    if np.isclose(vmin, vmax):
+        img = np.zeros_like(a, dtype=np.float32)
+    else:
+        img = np.clip((a - vmin) / (vmax - vmin + 1e-8), 0.0, 1.0)
+
     plt.figure(figsize=(6, 4))
-    plt.imshow(img, cmap="gray")
+    plt.imshow(img, cmap="gray", vmin=0.0, vmax=1.0)
     if title:
         plt.title(title)
     plt.axis("off")
     plt.tight_layout()
     plt.savefig(path, dpi=150)
     plt.close()
+
+ 
 
 
 def _build_grid_context(volume: np.ndarray, radius: float) -> Dict[str, Any]:
@@ -619,7 +647,7 @@ def _render_projection_from_volume(
     W: int,
 ) -> np.ndarray:
     import torch
-    from nerf.run_nerf_mod import raw2outputs_emission, sample_ct_volume
+    from nerf.run_nerf_mod import sample_ct_volume
     from nerf.run_nerf_helpers_mod import get_rays, get_rays_ortho
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -629,7 +657,6 @@ def _render_projection_from_volume(
     near = float(data_cfg.get("near", 0.0))
     far = float(data_cfg.get("far", 1.0))
     use_attenuation = bool(nerf_cfg.get("use_attenuation", False))
-    atten_scale = float(nerf_cfg.get("atten_scale", 25.0))
     orthographic = bool(data_cfg.get("orthographic", True))
     fov = float(data_cfg.get("fov", 60.0))
     radius = data_cfg.get("radius", 0.5)
@@ -660,26 +687,37 @@ def _render_projection_from_volume(
     lambda_vals = sample_ct_volume(pts, act_ctx)
     if lambda_vals is None:
         raise RuntimeError("Failed to sample activity volume along rays.")
+    if lambda_vals.ndim == 3 and lambda_vals.shape[-1] == 1:
+        lambda_vals = lambda_vals[..., 0]
     lambda_vals = torch.clamp(lambda_vals, min=0.0)
-    raw = torch.log(torch.expm1(lambda_vals).clamp_min(1e-6)).unsqueeze(-1)
 
     mu_vals = None
     if use_attenuation and ct_volume is not None:
         ct_ctx = _build_grid_context(ct_volume, radius_val)
         ct_ctx["volume"] = ct_ctx["volume"].to(device)
         mu_vals = sample_ct_volume(pts, ct_ctx)
+        if mu_vals is not None and mu_vals.ndim == 3 and mu_vals.shape[-1] == 1:
+            mu_vals = mu_vals[..., 0]
 
     with torch.no_grad():
-        proj_map, _, _, _ = raw2outputs_emission(
-            raw,
-            z_vals,
-            rays_d,
-            raw_noise_std=0.0,
-            pytest=False,
-            mu_vals=mu_vals,
-            use_attenuation=use_attenuation and mu_vals is not None,
-            atten_scale=atten_scale,
-        )
+        # step size must be positive
+        ds = (z_vals[:, 1] - z_vals[:, 0]).abs()
+
+        if mu_vals is not None and use_attenuation:
+            mu_vals = torch.clamp(mu_vals, min=0.0)
+            tau = torch.cumsum(mu_vals * ds[:, None], dim=1)
+            tau_prev = torch.cat([torch.zeros_like(tau[:, :1]), tau[:, :-1]], dim=1)
+            weights = torch.exp(-tau_prev)
+        else:
+            weights = torch.ones_like(lambda_vals)
+
+        proj_map = torch.sum(lambda_vals * weights * ds[:, None], dim=1)
+        if proj_map.ndim != 1 or proj_map.numel() != H * W:
+            raise RuntimeError(
+                f"proj_map shape {tuple(proj_map.shape)} (numel={proj_map.numel()}) "
+                f"does not match H*W={H*W}. H={H}, W={W}"
+            )
+
     proj = proj_map.reshape(H, W).detach().cpu().numpy()
     return proj
 
@@ -856,7 +894,9 @@ def _export_artifacts(processed_volume: np.ndarray, out_path: Path, args) -> Non
         loc_pa = np.array([0.0, 0.0, -radius_val], dtype=np.float32)
         pose_ap = _pose_from_loc(loc_ap)
         pose_pa = _pose_from_loc(loc_pa)
-        pose_pa[:, 0] *= -1.0
+        # Optional PA x-flip to match alternate handedness conventions.
+        if args.pa_xflip:
+            pose_pa[:, 0] *= -1.0
 
         if target_ap is not None:
             H, W = target_ap.shape

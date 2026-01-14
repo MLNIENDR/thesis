@@ -20,10 +20,6 @@ source /home/mnguest12/mambaforge/bin/activate totalseg
 # 2️⃣ Ins Projektverzeichnis
 cd /home/mnguest12/projects/thesis/pieNeRF
 
-# 3️⃣ Optional: GPU-Info ausgeben
-echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
-nvidia-smi
-
 # 4️⃣ Training starten
 echo "🏋️ Running train_emission.py..."
 srun python -u train_emission.py \
@@ -39,13 +35,16 @@ srun python -u train_emission.py \
   --act-samples 4096 \
   --act-pos-weight 1.0 \
   --ct-loss-weight 0.002 \
-  --ct-threshold 0.05 \
+  --ct-threshold 0.002 \
   --ct-samples 4096 \
   --z-reg-weight 5e-4 \
-  --tv-weight 0.0002 \
+  --tv-weight 2e-3 \
   --ray-tv-weight 2e-5 \
+  --ray-tv-oversample 2 \
+  --ray-tv-fg-only true \
   --ray-tv-edge-aware \
   --ray-tv-alpha 30 \
+  --peak-loss-weight 5e-2 \
   --grad-stats-every 10 \
   --ray-split-enable \
   --ray-split 0.8 \
