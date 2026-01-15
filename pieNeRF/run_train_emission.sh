@@ -36,7 +36,7 @@ srun python -u train_emission.py \
   --bg-weight 1.0 \
   --weight-threshold 0.0 \
   --act-loss-weight 0.005 \
-  --act-samples 4096 \
+  --act-samples 8192 \
   --act-pos-weight 1.0 \
   --ct-loss-weight 0.002 \
   --ct-threshold 0.05 \

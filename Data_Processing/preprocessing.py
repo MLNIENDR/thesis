@@ -3,7 +3,7 @@
 preprocessing.py
 
 Preprocessing-Schritt für XCAT-Phantome mit
-- physikalisch plausibler Aktivitätskonzentration (Lu-177-PSMA, kBq/mL)
+- physikalisch plausibler Aktivitätskonzentration (Lu-177-PSMA)
 - Gamma-Kamera-Forwardmodell (Scatter + Kollimator)
 - optionaler Poisson-Rauschsimulation in den Projektionen
 - rein RELATIVE Projektionen (AP/PA), global normalisiert
@@ -24,10 +24,10 @@ Erzeugt im out/-Ordner:
 Beispielaufruf:
 
 python preprocessing.py \
-  --base /home/mnguest12/projects/thesis/Data_Processing/phantom_01 \
-  --spect_bin phantom_01_spect208keV.par_atn_1.bin \
-  --ct_bin    phantom_01_ct80keV.par_atn_1.bin \
-  --mask_bin  phantom_01_mask.par_act_1.bin \
+  --base /home/mnguest12/projects/thesis/Data_Processing/phantom_48 \
+  --spect_bin phantom_48_spect208keV.par_atn_1.bin \
+  --ct_bin    phantom_48_ct80keV.par_atn_1.bin \
+  --mask_bin  phantom_48_mask.par_act_1.bin \
   --shape 256,256,651 \
   --spect_dtype float32 \
   --ct_dtype    float32 \

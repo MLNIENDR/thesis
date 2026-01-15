@@ -113,7 +113,7 @@ training:
   act_pos_weight: 2.0         # Gewichtung für ACT>0 Samples im ACT-Loss
 
   # Optimierung (nur Generator, weil kein GAN)
-  lr_g: 0.0005
+  lr_g: 0.00025
   lr_d: 0.0                   # unbenutzt
   lr_anneal: 1.0              # 1.0 ⇒ keine Annealing-Wirkung
   lr_anneal_every: []         # leere Liste = keine geplanten Drop-Punkte

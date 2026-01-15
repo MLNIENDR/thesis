@@ -17,7 +17,7 @@ Erzeugt:
 
 Aufruf:
 python check_preprocessing.py \
-  --base /home/mnguest12/projects/thesis/Data_Processing/phantom_01
+  --base /home/mnguest12/projects/thesis/Data_Processing/phantom_48
 """
 
 import argparse
