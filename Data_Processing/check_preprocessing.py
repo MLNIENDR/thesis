@@ -115,21 +115,21 @@ def main():
     axs[ax_idx].set_title("SPECT μ – coronal")
     axs[ax_idx].axis("off")
     c0 = plt.colorbar(im0, ax=axs[ax_idx])
-    c0.set_label("μ (arb. units)")   # falls du weißt: z.B. „μ (1/cm)“
+    c0.set_label("μ [1/cm]")
     ax_idx += 1
 
     im1 = axs[ax_idx].imshow(ct_cor, cmap="gray")
     axs[ax_idx].set_title("CT μ – coronal")
     axs[ax_idx].axis("off")
     c1 = plt.colorbar(im1, ax=axs[ax_idx])
-    c1.set_label("μ (arb. units)")
+    c1.set_label("μ [1/cm]")
     ax_idx += 1
 
     im2 = axs[ax_idx].imshow(act_cor, cmap="inferno")
     axs[ax_idx].set_title("Activity – coronal")
     axs[ax_idx].axis("off")
     c2 = plt.colorbar(im2, ax=axs[ax_idx])
-    c2.set_label("Activity (kBq/mL)")   # <<< wichtige Änderung: Einheit klar
+    c2.set_label("Activity (kBq/ml)")   # <<< wichtige Änderung: Einheit klar
     ax_idx += 1
 
     if mask_cor is not None:
@@ -189,7 +189,7 @@ def main():
         ax_pa.axis("off")
 
         cbar = fig.colorbar(im_pa, cax=cax)
-        cbar.set_label("Intensity (a.u.)")  # hier sind es weiterhin „relative counts“ o. skaliert
+        cbar.set_label("Relative intensity (normalized)")
 
         plt.tight_layout()
         out2 = base / "check_projections.png"

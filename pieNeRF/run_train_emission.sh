@@ -38,8 +38,8 @@ srun python -u train_emission.py \
   --act-loss-weight 0.005 \
   --act-samples 8192 \
   --act-pos-weight 1.0 \
-  --ct-loss-weight 0.002 \
-  --ct-threshold 0.05 \
+  --ct-loss-weight 0.005 \
+  --ct-threshold 0.02 \
   --ct-samples 4096 \
   --z-reg-weight 0 \
   --tv-weight 0.0002 \
@@ -52,5 +52,5 @@ srun python -u train_emission.py \
   --ray-split-seed 123 \
   --ray-split-tile 32 \
   --ray-fg-thr 0.0 \
-  --ray-train-fg-frac 0.8
+  --ray-train-fg-frac 0.7
 echo "✅ Training finished at: $(date)"

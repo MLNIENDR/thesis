@@ -38,6 +38,7 @@ python preprocessing.py \
   --bin_order F \
   --percentile 99.9 --activity_seed -1 \
   --poisson_max_counts 3000 --poisson_ref_percentile 99.5
+
 """
 
 from __future__ import annotations
@@ -300,7 +301,7 @@ def _process_view_phys(act_data: np.ndarray, atn_data: np.ndarray,
         vol_coll = vol_atn
 
     # (4) z-Summation
-    return np.sum(vol_coll, axis=2)
+    return np.sum(vol_coll, axis=2) * step_len
 
 
 def gamma_camera_core(act_data: np.ndarray, atn_data: np.ndarray,
@@ -457,6 +458,8 @@ def parse_args():
                    help="Perzentil für die robuste Normierung (z.B. 99.9)")
     p.add_argument("--clip_to_one", action="store_true",
                    help="Wenn gesetzt, werden AP/PA nach Normierung auf <=1.0 gecappt.")
+    p.add_argument("--apply_global_rot90", action="store_true",
+                   help="Wenn gesetzt, werden alle Volumina (und AP/PA) global 90° CCW rotiert.")
 
     return p.parse_args()
 
@@ -527,8 +530,9 @@ def main():
           f"min={act_xyz.min():.1f} kBq/mL, max={act_xyz.max():.1f} kBq/mL, "
           f"mean={act_xyz.mean():.1f} kBq/mL")
 
-    # SPECT-µ in Ziel-Einheit bringen
-    mu_xyz = convert_mu_units(spect_xyz, args.mu_unit, args.mu_target_unit)
+    # SPECT/CT-µ in Ziel-Einheit bringen (für Speicherung und Projektionen)
+    spect_mu_xyz = convert_mu_units(spect_xyz, args.mu_unit, args.mu_target_unit)
+    ct_mu_xyz = convert_mu_units(ct_xyz, args.mu_unit, args.mu_target_unit)
 
     # Schrittweite entlang Projektionsrichtung (z-Achse)
     if args.mu_target_unit == "per_cm":
@@ -550,7 +554,7 @@ def main():
     # Gamma-Kamera-Projektionen simulieren (AP/PA), relative Einheiten
     ap_raw, pa_raw = gamma_camera_core(
         act_data=act_xyz.astype(np.float32),
-        atn_data=mu_xyz.astype(np.float32),
+        atn_data=spect_mu_xyz.astype(np.float32),
         kernel_mat=kernel_mat,
         sigma=args.psf_sigma,
         z0_slices=args.z0_slices,
@@ -615,20 +619,20 @@ def main():
     ap_out = ap_norm
     pa_out = pa_norm
 
-    # Global 90° CCW rotation applied to all modalities to align
-    # detector orientation with the network/world coordinate system.
-    # Volumina sind in Shape (x, y, z) = (LR, AP/Depth, SI);
-    # die coronal-Ebene ist (x, z), daher rotieren wir nur in axes=(0, 2) und lassen AP/Depth (y) unangetastet.
-    rot_axes = (0, 2)
-    spect_xyz = np.rot90(spect_xyz, k=1, axes=rot_axes)
-    ct_xyz = np.rot90(ct_xyz, k=1, axes=rot_axes)
-    act_xyz = np.rot90(act_xyz, k=1, axes=rot_axes)
-    ap_out = np.rot90(ap_out, k=1)
-    pa_out = np.rot90(pa_out, k=1)
+    # Optional global 90° CCW rotation for network/world alignment.
+    if args.apply_global_rot90:
+        # Volumina sind in Shape (x, y, z) = (LR, AP/Depth, SI);
+        # die coronal-Ebene ist (x, z), daher rotieren wir nur in axes=(0, 2) und lassen AP/Depth (y) unangetastet.
+        rot_axes = (0, 2)
+        spect_mu_xyz = np.rot90(spect_mu_xyz, k=1, axes=rot_axes)
+        ct_mu_xyz = np.rot90(ct_mu_xyz, k=1, axes=rot_axes)
+        act_xyz = np.rot90(act_xyz, k=1, axes=rot_axes)
+        ap_out = np.rot90(ap_out, k=1)
+        pa_out = np.rot90(pa_out, k=1)
 
     # Speichern als .npy im out-Ordner
-    np.save(out_dir / "spect_att.npy", spect_xyz.astype(np.float32))
-    np.save(out_dir / "ct_att.npy",    ct_xyz.astype(np.float32))
+    np.save(out_dir / "spect_att.npy", spect_mu_xyz.astype(np.float32))
+    np.save(out_dir / "ct_att.npy",    ct_mu_xyz.astype(np.float32))
     np.save(out_dir / "act.npy",       act_xyz.astype(np.float32))
     np.save(out_dir / "ap.npy",        ap_out.astype(np.float32))
     np.save(out_dir / "pa.npy",        pa_out.astype(np.float32))
@@ -636,9 +640,9 @@ def main():
     # Orientierungskontrolle als PNGs (keine zusätzlichen Flips)
     orientation_dir = out_dir / "orientation_check"
     orientation_dir.mkdir(parents=True, exist_ok=True)
-    mid_y = spect_xyz.shape[1] // 2
-    save_png(spect_xyz[:, mid_y, :], orientation_dir / "spect_att_coronal_mid.png")
-    save_png(ct_xyz[:, mid_y, :],    orientation_dir / "ct_att_coronal_mid.png")
+    mid_y = spect_mu_xyz.shape[1] // 2
+    save_png(spect_mu_xyz[:, mid_y, :], orientation_dir / "spect_att_coronal_mid.png")
+    save_png(ct_mu_xyz[:, mid_y, :],    orientation_dir / "ct_att_coronal_mid.png")
     save_png(act_xyz[:, mid_y, :],   orientation_dir / "act_coronal_mid.png")
     save_png(ap_out, orientation_dir / "ap.png")
     save_png(pa_out, orientation_dir / "pa.png")
