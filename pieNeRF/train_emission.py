@@ -16,11 +16,7 @@ import yaml
 from torch.utils.data import DataLoader
 
 from graf.config import get_data, build_models
-try:
-    from pieNeRF.utils.ray_split import PixelSplit, make_pixel_split_from_ap_pa, sample_train_indices
-except ModuleNotFoundError:
-    # Fallback for running as a script from the repo root
-    from utils.ray_split import PixelSplit, make_pixel_split_from_ap_pa, sample_train_indices
+from utils.ray_split import PixelSplit, make_pixel_split_from_ap_pa, sample_train_indices
 
 __VERSION__ = "emission-train v0.3"
 DEBUG_PRINTS = False  # Nur Debug-Ausgaben, keine Änderung am Verhalten

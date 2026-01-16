@@ -24,10 +24,10 @@ Erzeugt im out/-Ordner:
 Beispielaufruf:
 
 python preprocessing.py \
-  --base /home/mnguest12/projects/thesis/Data_Processing/phantom_48 \
-  --spect_bin phantom_48_spect208keV.par_atn_1.bin \
-  --ct_bin    phantom_48_ct80keV.par_atn_1.bin \
-  --mask_bin  phantom_48_mask.par_act_1.bin \
+  --base /home/mnguest12/projects/thesis/Data_Processing/phantom_02 \
+  --spect_bin phantom_02_spect208keV.par_atn_1.bin \
+  --ct_bin    phantom_02_ct80keV.par_atn_1.bin \
+  --mask_bin  phantom_02_mask.par_act_1.bin \
   --shape 256,256,651 \
   --spect_dtype float32 \
   --ct_dtype    float32 \
@@ -36,7 +36,7 @@ python preprocessing.py \
   --sd_mm 1.5 \
   --kernel_mat LEAP_Kernel.mat --kernel_var kernel_mat \
   --bin_order F \
-  --percentile 99.9 --clip_to_one --activity_seed -1 \
+  --percentile 99.9 --activity_seed -1 \
   --poisson_max_counts 3000 --poisson_ref_percentile 99.5
 """
 
