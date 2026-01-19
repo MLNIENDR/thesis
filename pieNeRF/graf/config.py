@@ -52,6 +52,7 @@ def get_data(config):
         imsize=config["data"]["imsize"],                            # imsize ist hier nur noch „Meta“, nicht verbindlich
         transform_img=None,
         transform_ct=None,
+        projection_normalization=config["data"].get("projection_normalization", "per_projection_max"),
         act_scale=float(config["data"].get("act_scale", 1.0)),
     )
 

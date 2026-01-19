@@ -144,11 +144,12 @@ def sample_ct_volume(pts, context):
     coords = torch.clamp(coords, -1.0, 1.0)
     N_rays, N_samples = coords.shape[0], coords.shape[1]
     grid = coords.view(1, 1, N_rays, N_samples, 3)      # grid_sample erwartet 5D: [N, C, D, H, W]
+    padding_mode = context.get("padding_mode", "border")
     mu = F.grid_sample(                                 # Trilineare Interpolation im CT-Würfel    
         volume,
         grid,
         mode="bilinear",
-        padding_mode="border",
+        padding_mode=padding_mode,
         align_corners=True,
     )
     return mu.view(N_rays, N_samples)                   # Ergebnis in [N_rays, N_samples]    
@@ -480,6 +481,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
         if retraw:
             ret['raw'] = raw
             ret['dists'] = dists_out
+            ret['z_vals'] = z_vals
             if mu_vals is not None:
                 ret['mu'] = mu_vals
         return ret

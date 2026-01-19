@@ -347,7 +347,7 @@ class Generator(object):
 
         return proj_flat, disp_flat, acc_flat, extras
 
-    def build_ct_context(self, ct_volume):
+    def build_ct_context(self, ct_volume, padding_mode: str = "border"):
         """
         Bereitet ein CT-Volumen für das Attenuation-Rendering vor.
         Annahme: Das Volumen ist zentriert und teilt sich den Bounding Cube [-radius, radius]^3 mit dem NeRF.
@@ -383,4 +383,5 @@ class Generator(object):
             "volume": vol,
             "grid_radius": radius,
             "value_range": (vmin, vmax),
+            "padding_mode": padding_mode,
         }

@@ -22,6 +22,7 @@ class SpectDataset(torch.utils.data.Dataset):
         imsize=None,
         transform_img=None,
         transform_ct=None,
+        projection_normalization: str = "per_projection_max",
         act_scale: float = 1.0,
     ):  
         super().__init__()
@@ -29,6 +30,7 @@ class SpectDataset(torch.utils.data.Dataset):
         self.imsize = imsize                                                    # momentan nicht genutzt
         self.transform_img = transform_img                                      # optionale Transformationsfunktionen für AP/PA und CT
         self.transform_ct = transform_ct                                        # "
+        self.projection_normalization = (projection_normalization or "none").lower()
         self.act_scale = float(act_scale)                                       # globaler Faktor für ACT/λ (keine Normierung)
         self._logged_debug = False                                               # sorgt dafür, dass Debug-Ausgabe nur einmal erfolgt
 
@@ -54,6 +56,37 @@ class SpectDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.entries)                                                # Anzahl der Einträge = Anzahl Zeilen im Manifest = Anzahl Phantome/Patienten
+
+
+    @staticmethod
+    def _tensor_stats(t: torch.Tensor):
+        if t.numel() == 0:
+            return float("nan"), float("nan"), float("nan")
+        t = t.detach()
+        return (
+            float(t.min().item()),
+            float(t.max().item()),
+            float(torch.quantile(t.view(-1), 0.999).item()),
+        )
+
+
+    def _normalize_ap_pa(self, ap: torch.Tensor, pa: torch.Tensor):
+        mode = self.projection_normalization
+        scale_ap = float(ap.max().item()) if ap.numel() > 0 else 1.0
+        scale_pa = float(pa.max().item()) if pa.numel() > 0 else 1.0
+        scale_joint = 1.0
+        if mode == "none":
+            return ap, pa, scale_ap, scale_pa, scale_joint
+        if mode == "per_projection_max":
+            scale_ap = max(scale_ap, 1e-8)
+            scale_pa = max(scale_pa, 1e-8)
+            return ap / scale_ap, pa / scale_pa, scale_ap, scale_pa, scale_joint
+        if mode == "joint_p99":
+            p_ap = float(torch.quantile(ap.view(-1), 0.999).item()) if ap.numel() > 0 else 1.0
+            p_pa = float(torch.quantile(pa.view(-1), 0.999).item()) if pa.numel() > 0 else 1.0
+            scale_joint = max(p_ap, p_pa, 1e-8)
+            return ap / scale_joint, pa / scale_joint, scale_ap, scale_pa, scale_joint
+        raise ValueError(f"Unknown projection_normalization: {mode}")
 
 
     def _load_npy_image(self, path):                                            # lädt .npy Array, z.B. [H,W] mit Counts
@@ -96,8 +129,11 @@ class SpectDataset(torch.utils.data.Dataset):
         ct = self._load_npy_ct(e["ct_path"])                                    # lädt CT Volumen (gescaled)  
         act = self._load_npy_act(e["act_path"])                                 # lädt ACT Volumen (ohne Normierung, nur globaler Faktor)
 
-        ap = self._normalize_projection(ap)
-        pa = self._normalize_projection(pa)
+        ap_pre_stats = self._tensor_stats(ap)
+        pa_pre_stats = self._tensor_stats(pa)
+        ap, pa, ap_scale, pa_scale, proj_scale = self._normalize_ap_pa(ap, pa)
+        ap_post_stats = self._tensor_stats(ap)
+        pa_post_stats = self._tensor_stats(pa)
 
         if self.transform_img is not None:                                      # optionale zusätzliche Schritte (z.B. Resize, Cropping, ...)
             ap = self.transform_img(ap)
@@ -107,6 +143,15 @@ class SpectDataset(torch.utils.data.Dataset):
 
         # Debug-Ausgabe nur einmal pro Dataset-Instanz, um Skalen zu prüfen (kein Einfluss auf Verhalten).
         if not self._logged_debug:
+            print(
+                f"[DEBUG][norm] mode={self.projection_normalization} | "
+                f"AP pre min/max/p99.9={ap_pre_stats[0]:.3e}/{ap_pre_stats[1]:.3e}/{ap_pre_stats[2]:.3e} -> "
+                f"post {ap_post_stats[0]:.3e}/{ap_post_stats[1]:.3e}/{ap_post_stats[2]:.3e} | "
+                f"PA pre min/max/p99.9={pa_pre_stats[0]:.3e}/{pa_pre_stats[1]:.3e}/{pa_pre_stats[2]:.3e} -> "
+                f"post {pa_post_stats[0]:.3e}/{pa_post_stats[1]:.3e}/{pa_post_stats[2]:.3e} | "
+                f"ap_scale={ap_scale:.3e} pa_scale={pa_scale:.3e} joint_scale={proj_scale:.3e}",
+                flush=True,
+            )
             print(
                 f"[DEBUG][datasets] AP min/max: {ap.min().item():.3e}/{ap.max().item():.3e} | "
                 f"PA min/max: {pa.min().item():.3e}/{pa.max().item():.3e} | "
@@ -134,6 +179,10 @@ class SpectDataset(torch.utils.data.Dataset):
                 "pa_path": str(e["pa_path"]),
                 "ct_path": str(e["ct_path"]),
                 "act_path": str(e["act_path"]) if e["act_path"] is not None else None,
+                "proj_norm": self.projection_normalization,
+                "proj_scale": float(proj_scale),
+                "ap_scale": float(ap_scale),
+                "pa_scale": float(pa_scale),
             },
         }
 

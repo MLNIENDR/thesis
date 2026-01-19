@@ -41,7 +41,7 @@ nerf:
   use_viewdirs: False
   use_attenuation: True                         # aktiviert CT-basierte Schwächung im Forward-Modell
   attenuation_debug: False                      # falls True: logge λ/μ/T für einen Beispielstrahl
-  atten_scale: 25.0                             # globaler Längenskalenfaktor für ∫ μ ds
+  atten_scale: 38.4                             # globaler Längenskalenfaktor für ∫ μ ds
   multires: 10
   multires_views: 0                             # wird bei use_viewdirs=False sowieso ignoriert
 

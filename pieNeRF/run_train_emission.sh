@@ -28,29 +28,33 @@ nvidia-smi
 echo "🏋️ Running train_emission.py..."
 srun python -u train_emission.py \
   --config configs/spect.yaml \
-  --max-steps 2400 \
+  --max-steps 2000 \
   --rays-per-step 16384 \
   --log-every 10 \
   --preview-every 100 \
   --save-every 100 \
   --bg-weight 1.0 \
   --weight-threshold 0.0 \
-  --act-loss-weight 0.005 \
-  --act-samples 8192 \
-  --act-pos-weight 1.0 \
+  --act-loss-weight 0.02 \
+  --act-samples 16384 \
+  --act-pos-weight 5.0 \
   --ct-loss-weight 0.005 \
   --ct-threshold 0.02 \
   --ct-samples 4096 \
   --z-reg-weight 0 \
   --tv-weight 0.0002 \
-  --ray-tv-weight 2e-5 \
-  --ray-tv-edge-aware \
-  --ray-tv-alpha 30 \
+  --ray-tv-weight 1e-5 \
+  --ray-tv-edge-aware False \
+  --bg-depth-mass-weight 5e-4 \
+  --bg-depth-eps 1e-12 \
+  --bg-depth-mode integral \
   --grad-stats-every 10 \
   --ray-split-enable \
   --ray-split 0.8 \
   --ray-split-seed 123 \
   --ray-split-tile 32 \
-  --ray-fg-thr 0.0 \
-  --ray-train-fg-frac 0.7
+  --ray-fg-thr 0.01 \
+  --ray-train-fg-frac 0.9 \
+  --log-quantiles-final-only True \
+  --export-vol-res 128
 echo "✅ Training finished at: $(date)"

@@ -76,8 +76,8 @@ def parse_args():
         "--projection-normalization",
         type=str,
         default=None,
-        choices=["none", "per_dataset", "per_projection"],
-        help="Override data.projection_normalization from the config (none|per_dataset|per_projection).",
+        choices=["none", "per_projection_max", "joint_p99"],
+        help="Override data.projection_normalization from the config (none|per_projection_max|joint_p99).",
     )
     parser.add_argument(
         "--bg-weight",
@@ -100,6 +100,25 @@ def parse_args():
         type=float,
         default=1e-5,
         help="Zählrate, unter der ein Strahl als Hintergrund gilt (nur relevant mit bg-weight < 1).",
+    )
+    parser.add_argument(
+        "--bg-depth-mass-weight",
+        type=float,
+        default=0.0,
+        help="Gewicht fuer BG depth mass loss (0 = deaktiviert).",
+    )
+    parser.add_argument(
+        "--bg-depth-eps",
+        type=float,
+        default=1e-10,
+        help="Schwellwert fuer Background-Kriterium (Target < eps).",
+    )
+    parser.add_argument(
+        "--bg-depth-mode",
+        type=str,
+        default="integral",
+        choices=["integral", "mean"],
+        help="BG depth mass mode: integral (sum lambda*dz) oder mean (mean lambda).",
     )
     parser.add_argument(
         "--act-loss-weight",
@@ -170,6 +189,12 @@ def parse_args():
         help="Alpha fuer edge-aware Ray-TV (Gewicht exp(-alpha*|delta_mu|)).",
     )
     parser.add_argument(
+        "--ray-tv-w-clamp-min",
+        type=float,
+        default=0.0,
+        help="Optionales Minimum fuer edge-aware TV-Gewichte (z.B. 0.2).",
+    )
+    parser.add_argument(
         "--grad-stats-every",
         type=int,
         default=0,
@@ -180,6 +205,13 @@ def parse_args():
         type=float,
         default=ATTEN_SCALE_DEFAULT,
         help="Globaler Längenskalenfaktor für die Attenuation (μ in 1/cm, Bounding Box ~1).",
+    )
+    parser.add_argument(
+        "--ct-padding-mode",
+        type=str,
+        default="border",
+        choices=["border", "zeros"],
+        help="Padding-Mode fuer CT grid_sample (border|zeros).",
     )
     parser.add_argument(
         "--ray-split",
@@ -233,6 +265,26 @@ def parse_args():
         const=True,
         help="Spiegle PA in x-Richtung, um Pixel zu AP zu mappen.",
     )
+    parser.add_argument(
+        "--log-quantiles-final-only",
+        type=str2bool,
+        default=True,
+        nargs="?",
+        const=True,
+        help="Logge p50/p80/p95/p99 der rohen AP/PA-Projektionen (Pred + Target) nur am finalen Step.",
+    )
+    parser.add_argument(
+        "--export-vol-res",
+        type=int,
+        default=128,
+        help="Grid-Aufloesung fuer Export des finalen Aktivitaetsvolumens (z. B. 128 oder 256).",
+    )
+    parser.add_argument(
+        "--export-vol-every",
+        type=int,
+        default=0,
+        help="Optional: Exportiere Aktivitaetsvolumen alle N Schritte (0 = aus).",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     return parser.parse_args()
 
@@ -269,6 +321,69 @@ def save_img(arr, path, title=None):
     plt.tight_layout()
     plt.savefig(path, dpi=150)
     plt.close()
+
+
+def log_projection_quantiles(ap_pred, pa_pred, ap_target=None, pa_target=None, tag="final"):
+    quantiles = [0.5, 0.8, 0.95, 0.99]
+
+    def _q(arr):
+        data = arr.detach().float().cpu().numpy().ravel()
+        return np.quantile(data, quantiles)
+
+    ap_pred_q = _q(ap_pred)
+    pa_pred_q = _q(pa_pred)
+    msg = (
+        f"[quantiles][{tag}] pred_ap p50={ap_pred_q[0]:.3e} p80={ap_pred_q[1]:.3e} "
+        f"p95={ap_pred_q[2]:.3e} p99={ap_pred_q[3]:.3e} | "
+        f"pred_pa p50={pa_pred_q[0]:.3e} p80={pa_pred_q[1]:.3e} "
+        f"p95={pa_pred_q[2]:.3e} p99={pa_pred_q[3]:.3e}"
+    )
+    if ap_target is not None and pa_target is not None:
+        ap_t_q = np.quantile(ap_target.ravel(), quantiles)
+        pa_t_q = np.quantile(pa_target.ravel(), quantiles)
+        msg += (
+            f" | target_ap p50={ap_t_q[0]:.3e} p80={ap_t_q[1]:.3e} "
+            f"p95={ap_t_q[2]:.3e} p99={ap_t_q[3]:.3e} | "
+            f"target_pa p50={pa_t_q[0]:.3e} p80={pa_t_q[1]:.3e} "
+            f"p95={pa_t_q[2]:.3e} p99={pa_t_q[3]:.3e}"
+        )
+    print(msg, flush=True)
+
+
+def export_activity_volume(generator, z_latent, out_path: Path, res: int, device: torch.device):
+    radius = generator.radius
+    if isinstance(radius, tuple):
+        radius = radius[1]
+    radius = float(radius)
+    res = int(res)
+    if res <= 0:
+        raise ValueError("export-vol-res must be > 0")
+
+    x_coords = idx_to_coord(torch.arange(res, device=device), res, radius)
+    y_coords = idx_to_coord(torch.arange(res, device=device), res, radius)
+    y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing="ij")
+    x_flat = x_grid.reshape(-1)
+    y_flat = y_grid.reshape(-1)
+
+    target_points = 262144
+    chunk_depth = max(1, min(res, target_points // (res * res) if res * res > 0 else 1))
+
+    vol = np.empty((res, res, res), dtype=np.float32)
+    with torch.no_grad():
+        for z_start in range(0, res, chunk_depth):
+            z_end = min(res, z_start + chunk_depth)
+            z_idx = torch.arange(z_start, z_end, device=device)
+            z_coords = idx_to_coord(z_idx, res, radius)
+            z_rep = z_coords.repeat_interleave(x_flat.numel())
+            x_rep = x_flat.repeat(z_coords.numel())
+            y_rep = y_flat.repeat(z_coords.numel())
+            coords = torch.stack((x_rep, y_rep, z_rep), dim=1)
+            pred = query_emission_at_points(generator, z_latent, coords)
+            pred = pred.view(z_coords.numel(), res, res).detach().cpu().numpy().astype(np.float32)
+            vol[z_start:z_end, :, :] = pred
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(out_path, vol)
 
 
 def poisson_nll(
@@ -369,7 +484,9 @@ def log_effective_config(outdir: Path, config: dict, args):
         f"[cfg][training] lr_g={training_cfg.get('lr_g')} | tv_weight={training_cfg.get('tv_weight')} "
         f"| act_loss_weight={args.act_loss_weight} | act_samples={args.act_samples} | act_pos_weight={args.act_pos_weight} "
         f"| ct_loss_weight={args.ct_loss_weight} | ct_threshold={args.ct_threshold} | z_reg_weight={args.z_reg_weight} "
-        f"| ray_tv_weight={args.ray_tv_weight} | ray_tv_edge_aware={args.ray_tv_edge_aware} | ray_tv_alpha={args.ray_tv_alpha}",
+        f"| ray_tv_weight={args.ray_tv_weight} | ray_tv_edge_aware={args.ray_tv_edge_aware} | ray_tv_alpha={args.ray_tv_alpha} "
+        f"| ray_tv_w_clamp_min={args.ray_tv_w_clamp_min} | ct_padding_mode={args.ct_padding_mode} "
+        f"| bg_depth_mass_weight={args.bg_depth_mass_weight} | bg_depth_eps={args.bg_depth_eps} | bg_depth_mode={args.bg_depth_mode}",
         flush=True,
     )
 
@@ -426,8 +543,10 @@ def compute_ray_tv(
     mu_vals: Optional[torch.Tensor] = None,
     edge_aware: bool = False,
     alpha: float = 0.0,
+    w_clamp_min: float = 0.0,
+    mu_thresh: float = 1e-3,
     return_stats: bool = False,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, Optional[dict]]:
     """Berechnet den (edge-aware) 1D-Total-Variation-Prior entlang jedes Rays."""
     lambda_vals = F.softplus(raw[..., 0])  # [N_rays, N_samples]
     diffs = torch.abs(lambda_vals[..., 1:] - lambda_vals[..., :-1])
@@ -437,10 +556,25 @@ def compute_ray_tv(
         mu = torch.clamp(mu_vals, min=0.0)
         mu_diffs = torch.abs(mu[..., 1:] - mu[..., :-1])
         weights = torch.exp(-alpha * mu_diffs)
+        if w_clamp_min > 0.0:
+            weights = torch.clamp(weights, min=w_clamp_min)
         tv_per_ray = torch.sum(weights * diffs, dim=-1)
         tv = torch.mean(tv_per_ray)
         if return_stats:
-            return tv, weights.mean()
+            stats = {
+                "w_mean": weights.mean(),
+                "w_min": weights.min(),
+                "w_max": weights.max(),
+            }
+            if mu_thresh is not None and mu.numel() > 0:
+                mask = mu > mu_thresh
+                valid = mask.any(dim=-1)
+                if valid.any():
+                    first_idx = mask.float().argmax(dim=-1)
+                    depths = first_idx[valid].float() / max(1.0, float(mu.shape[-1] - 1))
+                    stats["ct_boundary_depth_mean"] = depths.mean()
+                    stats["ct_boundary_depth_median"] = depths.median()
+            return tv, stats
         return tv, None
     tv_per_ray = torch.sum(diffs, dim=-1)
     tv = torch.mean(tv_per_ray)
@@ -465,7 +599,7 @@ def maybe_render_preview(
     prev_flag = generator.use_test_kwargs
     generator.eval()
     generator.use_test_kwargs = True
-    ctx = ct_context or generator.build_ct_context(ct_volume)
+    ctx = ct_context or generator.build_ct_context(ct_volume, padding_mode=args.ct_padding_mode)
     with torch.no_grad():
         proj_ap, _, _, _ = generator.render_from_pose(z_eval, generator.pose_ap, ct_context=ctx)
         proj_pa, _, _, _ = generator.render_from_pose(z_eval, generator.pose_pa, ct_context=ctx)
@@ -500,6 +634,9 @@ def init_log_file(path: Path):
                 "loss_ct",
                 "ray_tv",
                 "ray_tv_w",
+                "bg_depth_mass",
+                "bg_depth_mass_w",
+                "bg_depth_frac",
                 "loss_tv",
                 "zreg",
                 "mae_ap",
@@ -1069,10 +1206,9 @@ def train():
         print("⚠️ --normalize-targets ist veraltet – Projektionen werden bereits im Loader auf [0,1] normiert.", flush=True)
     if args.projection_normalization is not None:
         data_cfg["projection_normalization"] = args.projection_normalization
-    proj_mode = data_cfg.setdefault("projection_normalization", "none").lower()
-    if proj_mode != "none":
-        print("⚠️ projection_normalization != 'none' wird ignoriert – Loader normiert jedes Bild einzeln.", flush=True)
-        data_cfg["projection_normalization"] = "none"
+    proj_mode = data_cfg.setdefault("projection_normalization", "per_projection_max").lower()
+    if proj_mode not in ("none", "per_projection_max", "joint_p99"):
+        raise ValueError(f"Unsupported projection_normalization: {proj_mode}")
     data_cfg.setdefault("act_scale", 1.0)
     data_cfg["ray_split_ratio"] = float(args.ray_split)
     training_cfg = config.setdefault("training", {})
@@ -1085,6 +1221,14 @@ def train():
     training_cfg["ray_tv_edge_aware"] = bool(args.ray_tv_edge_aware)
     training_cfg.setdefault("ray_tv_alpha", 0.0)
     training_cfg["ray_tv_alpha"] = float(args.ray_tv_alpha)
+    training_cfg.setdefault("ray_tv_w_clamp_min", 0.0)
+    training_cfg["ray_tv_w_clamp_min"] = float(args.ray_tv_w_clamp_min)
+    training_cfg.setdefault("bg_depth_mass_weight", 0.0)
+    training_cfg["bg_depth_mass_weight"] = float(args.bg_depth_mass_weight)
+    training_cfg.setdefault("bg_depth_eps", 1e-10)
+    training_cfg["bg_depth_eps"] = float(args.bg_depth_eps)
+    training_cfg.setdefault("bg_depth_mode", "integral")
+    training_cfg["bg_depth_mode"] = str(args.bg_depth_mode)
     training_cfg.setdefault("act_samples", 16384)
     training_cfg.setdefault("act_pos_weight", 2.0)
     if args.act_samples is None:
@@ -1147,6 +1291,7 @@ def train():
     ray_tv_weight = float(training_cfg.get("ray_tv_weight", 0.0))
     ray_tv_edge_aware = bool(training_cfg.get("ray_tv_edge_aware", False))
     ray_tv_alpha = float(training_cfg.get("ray_tv_alpha", 0.0))
+    ray_tv_w_clamp_min = float(training_cfg.get("ray_tv_w_clamp_min", 0.0))
 
     generator = build_models(config)
     generator.to(device)
@@ -1351,7 +1496,7 @@ def train():
         ct_vol = batch.get("ct")
         if ct_vol is not None:
             ct_vol = ct_vol.to(device, non_blocking=True).float()
-        ct_context = generator.build_ct_context(ct_vol) if ct_vol is not None else None
+        ct_context = generator.build_ct_context(ct_vol, padding_mode=args.ct_padding_mode) if ct_vol is not None else None
 
         # Wichtig: Flatten-Order ist (y * W + x), identisch zu den Ray-Indizes aus make_stratified_tile_split.
         # Keine permute/transpose zwischen (H, W) und reshape(-1), damit Target/Predict exakt die gleiche Reihenfolge teilen.
@@ -1366,6 +1511,8 @@ def train():
         t0 = time.perf_counter()
 
         need_ray_tv = ray_tv_weight != 0.0
+        need_bg_depth = args.bg_depth_mass_weight > 0.0
+        need_raw = need_ray_tv or need_bg_depth
 
         if ray_split_enabled and pixel_split_np is not None and rng_train is not None:
             idx_np = sample_train_indices(pixel_split_np, rays_per_proj, ray_train_fg_frac, rng_train)
@@ -1381,10 +1528,10 @@ def train():
 
         with torch.cuda.amp.autocast(enabled=amp_enabled):
             pred_ap, extras_ap = render_minibatch(
-                generator, z_latent, ray_batch_ap, ct_context=ct_context, return_raw=need_ray_tv
+                generator, z_latent, ray_batch_ap, ct_context=ct_context, return_raw=need_raw
             )
             pred_pa, extras_pa = render_minibatch(
-                generator, z_latent, ray_batch_pa, ct_context=ct_context, return_raw=need_ray_tv
+                generator, z_latent, ray_batch_pa, ct_context=ct_context, return_raw=need_raw
             )
 
             target_ap = ap_flat_proc[0, idx_ap].unsqueeze(0)
@@ -1411,6 +1558,49 @@ def train():
                     f"PRED PA min/max: {pred_pa.min().item():.3e}/{pred_pa.max().item():.3e}",
                     flush=True,
                 )
+
+            bg_depth_mass = torch.tensor(0.0, device=device)
+            bg_depth_mass_w = torch.tensor(0.0, device=device)
+            bg_depth_frac_t = torch.tensor(0.0, device=device)
+            if args.bg_depth_mass_weight > 0.0:
+                bg_mask = None
+                if target_ap is not None and target_pa is not None:
+                    bg_mask = (target_ap < args.bg_depth_eps) & (target_pa < args.bg_depth_eps)
+                elif target_ap is not None:
+                    bg_mask = target_ap < args.bg_depth_eps
+                elif target_pa is not None:
+                    bg_mask = target_pa < args.bg_depth_eps
+                if bg_mask is not None:
+                    bg_mask_flat = bg_mask.reshape(-1)
+                    bg_depth_frac_t = bg_mask_flat.float().mean()
+                    bg_terms = []
+                    for extras in (extras_ap, extras_pa):
+                        if not isinstance(extras, dict):
+                            continue
+                        raw_out = extras.get("raw")
+                        if raw_out is None:
+                            continue
+                        lambda_vals = F.softplus(raw_out[..., 0])
+                        if args.bg_depth_mode == "integral":
+                            dists = extras.get("dists")
+                            if dists is None:
+                                z_vals = extras.get("z_vals")
+                                if z_vals is not None:
+                                    dists = z_vals[..., 1:] - z_vals[..., :-1]
+                                    dists = torch.cat([dists, dists[..., -1:].clone()], dim=-1)
+                            if dists is None:
+                                continue
+                            m_ray = torch.sum(lambda_vals * dists, dim=-1)
+                        else:
+                            m_ray = torch.mean(lambda_vals, dim=-1)
+                        if m_ray.shape[0] != bg_mask_flat.shape[0]:
+                            continue
+                        if bg_mask_flat.any():
+                            bg_terms.append(m_ray[bg_mask_flat].mean())
+                    if bg_terms:
+                        bg_depth_mass = torch.stack(bg_terms).mean()
+                        bg_depth_mass_w = bg_depth_mass * args.bg_depth_mass_weight
+                        loss = loss + bg_depth_mass_w
 
             loss_act = torch.tensor(0.0, device=device)
             if args.act_loss_weight > 0.0 and act_vol is not None:
@@ -1457,6 +1647,10 @@ def train():
             loss_ray_tv_w = torch.tensor(0.0, device=device)
             ray_tv_mode = "plain"
             ray_tv_w_mean = None
+            ray_tv_w_min = None
+            ray_tv_w_max = None
+            ct_boundary_depth_mean = None
+            ct_boundary_depth_median = None
 
             tv_base_terms = []
             if isinstance(extras_ap, dict):
@@ -1487,15 +1681,22 @@ def train():
                         continue
                     if edge_aware_active:
                         mu_out = extras.get("mu")
-                        tv_val, w_mean = compute_ray_tv(
+                        tv_val, w_stats = compute_ray_tv(
                             raw_out,
                             mu_vals=mu_out,
                             edge_aware=True,
                             alpha=ray_tv_alpha,
+                            w_clamp_min=ray_tv_w_clamp_min,
                             return_stats=True,
                         )
-                        if w_mean is not None:
-                            ray_tv_w_terms.append(w_mean)
+                        if isinstance(w_stats, dict):
+                            w_mean = w_stats.get("w_mean")
+                            if w_mean is not None:
+                                ray_tv_w_terms.append(w_mean)
+                            ray_tv_w_min = w_stats.get("w_min")
+                            ray_tv_w_max = w_stats.get("w_max")
+                            ct_boundary_depth_mean = w_stats.get("ct_boundary_depth_mean")
+                            ct_boundary_depth_median = w_stats.get("ct_boundary_depth_median")
                         ray_tv_terms.append(tv_val)
                     else:
                         tv_val, _ = compute_ray_tv(raw_out)
@@ -1540,6 +1741,7 @@ def train():
             pred_std_raw = (pred_ap_raw.std().item(), pred_pa_raw.std().item())
             psnr_ap = compute_psnr(pred_ap, target_ap)
             psnr_pa = compute_psnr(pred_pa, target_pa)
+            bg_depth_frac = float(bg_depth_frac_t.detach().cpu().item())
             val_stats = None
             if val_interval > 0 and (step % val_interval) == 0 and (not args.no_val):
                 rays_eval = None if ray_split_enabled else rays_per_proj
@@ -1601,6 +1803,7 @@ def train():
             f"[step {step:05d}] loss={loss.item():.6f} | ap={loss_ap.item():.6f} | pa={loss_pa.item():.6f} "
             f"| act={loss_act.item():.6f} | ct={loss_ct.item():.6f} "
             f"| ray_tv={loss_ray_tv.item():.6f} | ray_tv_w={loss_ray_tv_w.item():.6f} "
+            f"| bg_depth_mass={bg_depth_mass.item():.6f} | bg_depth_mass_w={bg_depth_mass_w.item():.6f} | bg_depth_frac={bg_depth_frac:.4f} "
             f"| tv={loss_tv.item():.6f} | zreg={loss_reg.item():.6f} "
             f"| mae_ap={mae_ap:.6f} | mae_pa={mae_pa:.6f} "
             f"| psnr_ap={psnr_ap:.2f} | psnr_pa={psnr_pa:.2f} "
@@ -1611,6 +1814,13 @@ def train():
             msg += f" | ray_tv_mode={ray_tv_mode}"
             if ray_tv_w_mean is not None:
                 msg += f" | ray_tv_w_mean={ray_tv_w_mean:.6f}"
+            if ray_tv_w_min is not None and ray_tv_w_max is not None:
+                msg += f" | ray_tv_w_min={float(ray_tv_w_min):.6f} | ray_tv_w_max={float(ray_tv_w_max):.6f}"
+            if ct_boundary_depth_mean is not None and ct_boundary_depth_median is not None:
+                msg += (
+                    f" | ct_bnd_mean={float(ct_boundary_depth_mean):.3f}"
+                    f" | ct_bnd_med={float(ct_boundary_depth_median):.3f}"
+                )
         if val_all is not None:
             msg += (
                 f" | test_all_loss={val_loss:.6f} | test_all_psnr={val_psnr:.2f} | test_all_mae={val_mae:.6f}"
@@ -1651,6 +1861,9 @@ def train():
                 loss_ct.item(),
                 loss_ray_tv.item(),
                 loss_ray_tv_w.item(),
+                bg_depth_mass.item(),
+                bg_depth_mass_w.item(),
+                bg_depth_frac,
                 loss_tv.item(),
                 loss_reg.item(),
                 mae_ap,
@@ -1694,6 +1907,9 @@ def train():
             act_vol,
             ct_context,
         )
+        if args.export_vol_every > 0 and (step % args.export_vol_every == 0):
+            export_path = outdir / f"activity_pred_step_{step:05d}.npy"
+            export_activity_volume(generator, z_train.detach(), export_path, args.export_vol_res, device)
 
     prev_flag = generator.use_test_kwargs
     generator.eval()
@@ -1709,12 +1925,17 @@ def train():
     pa_np = proj_pa[0].reshape(H, W).detach().cpu().numpy()
     fp = outdir / "preview"
     fp.mkdir(parents=True, exist_ok=True)
+    if args.log_quantiles_final_only:
+        ap_t_np = ap.detach().cpu().numpy()[0] if ap is not None else None
+        pa_t_np = pa.detach().cpu().numpy()[0] if pa is not None else None
+        log_projection_quantiles(proj_ap, proj_pa, ap_target=ap_t_np, pa_target=pa_t_np, tag="final")
     save_img(ap_np, fp / "final_AP.png", "AP final")
     save_img(pa_np, fp / "final_PA.png", "PA final")
     print("🖼️ Finale Previews gespeichert.", flush=True)
     print("   ", (fp / "final_AP.png").resolve(), flush=True)
     print("   ", (fp / "final_PA.png").resolve(), flush=True)
 
+    export_activity_volume(generator, z_train.detach(), outdir / "activity_pred_final.npy", args.export_vol_res, device)
     save_checkpoint(args.max_steps, generator, z_train, optimizer, scaler, ckpt_dir)
     print("✅ Training run finished.", flush=True)
 
