@@ -23,15 +23,12 @@ This document audits the current pipeline and critical claims against the codeba
       --max-steps 2000 \
       --rays-per-step 16384 \
   ```
-- [CONFIRMED] YAML is loaded and merged with CLI overrides; `projection_normalization` is forced to `none`.
+- [CONFIRMED] YAML is loaded and merged with CLI overrides; projections are assumed pre-normalized on disk.
   - File: `pieNeRF/train_emission.py` (train)
   ```python
   with open(args.config, "r") as f:
       config = yaml.safe_load(f)
-  proj_mode = data_cfg.setdefault("projection_normalization", "none").lower()
-  if proj_mode != "none":
-      print("⚠️ projection_normalization != 'none' wird ignoriert – Loader normiert jedes Bild einzeln.")
-      data_cfg["projection_normalization"] = "none"
+  data_cfg = config.setdefault("data", {})
   ```
 - [CONFIRMED] `get_data` and `build_models` are the entry points for dataset and model construction.
   - File: `pieNeRF/train_emission.py` (train)
@@ -42,21 +39,17 @@ This document audits the current pipeline and critical claims against the codeba
   ```
 
 ### Block 1: Data Pipeline (AP/PA/CT/ACT)
-- [CONFIRMED] AP/PA are loaded from `.npy` and normalized per-projection by max.
-  - File: `pieNeRF/graf/datasets.py` (`_load_npy_image`, `_normalize_projection`)
+- [CONFIRMED] AP/PA are loaded from `.npy` as-is (no runtime normalization).
+  - File: `pieNeRF/graf/datasets.py` (`_load_npy_image`)
   ```python
   arr = np.load(path).astype(np.float32)
   tensor = torch.from_numpy(arr).unsqueeze(0)
-  maxv = tensor.max()
-  if maxv > 0:
-      tensor = tensor / maxv
   ```
-- [CONFIRMED] CT transpose order and scaling are applied as: `transpose(1,0,2)` then `*10.0`.
+- [CONFIRMED] CT transpose order is applied as: `transpose(1,0,2)` (no scaling).
   - File: `pieNeRF/graf/datasets.py` (`_load_npy_ct`)
   ```python
   vol = np.load(path).astype(np.float32)
   vol = np.transpose(vol, (1, 0, 2))
-  vol *= 10.0
   ```
 - [CONFIRMED] ACT transpose order and scaling are applied as: `transpose(1,0,2)` then `*act_scale`.
   - File: `pieNeRF/graf/datasets.py` (`_load_npy_act`)
@@ -365,7 +358,7 @@ Key config parameters and where they are used:
 - `training.lr_g` -> Adam in `pieNeRF/train_emission.py`
 
 Special checks:
-- A) `projection_normalization` is explicitly forced to `none` in `pieNeRF/train_emission.py` (see Block 0).
+- A) Projections are assumed normalized on disk (no runtime normalization) (see Block 0/1).
 - B) CT/ACT transpose + scaling are in `pieNeRF/graf/datasets.py` (see Block 1).
 - C) world->grid_sample: normalization + clamp + `align_corners=True` in `pieNeRF/nerf/run_nerf_mod.py` (see Block 6).
 - D) PA xflip & grid_x inversion both exist (see Block 2).

@@ -19,6 +19,16 @@ class PixelSplit:
     thr_used: float
 
 
+def _compute_score(target_ap: np.ndarray, target_pa: np.ndarray, pa_xflip: bool) -> np.ndarray:
+    def map_pa(pa_img: np.ndarray) -> np.ndarray:
+        if not pa_xflip:
+            return pa_img
+        return pa_img[:, ::-1]
+
+    pa_mapped = map_pa(target_pa)
+    return np.maximum(target_ap, pa_mapped)
+
+
 def _resolve_threshold(score_img: np.ndarray, thr: float) -> float:
     if thr < 0.0:
         q = abs(float(thr))
@@ -70,13 +80,7 @@ def make_pixel_split_from_ap_pa(
     tile_size = max(int(tile), 1)
     ratio = float(np.clip(train_frac, 0.0, 1.0))
 
-    def map_pa(pa_img: np.ndarray) -> np.ndarray:
-        if not pa_xflip:
-            return pa_img
-        return pa_img[:, ::-1]
-
-    pa_mapped = map_pa(target_pa)
-    score = np.maximum(target_ap, pa_mapped)
+    score = _compute_score(target_ap, target_pa, pa_xflip)
     thr_used = _resolve_threshold(score, thr)
 
     train_fg, train_bg, test_fg, test_bg = [], [], [], []
@@ -156,6 +160,86 @@ def make_pixel_split_from_ap_pa(
         fg_stats[0], fg_stats[1], fg_stats[2],
         bg_stats[0], bg_stats[1], bg_stats[2],
     )
+    return split
+
+
+def make_pixel_split_stratified_intensity(
+    target_ap: np.ndarray,
+    target_pa: np.ndarray,
+    train_frac: float,
+    fg_threshold: float,
+    fg_quantile: float,
+    seed: int,
+    pa_xflip: bool,
+    topk_frac: float = 0.10,
+) -> PixelSplit:
+    if target_ap.shape != target_pa.shape:
+        raise ValueError(f"AP/PA shapes differ: {target_ap.shape} vs {target_pa.shape}")
+    if target_ap.ndim != 2:
+        raise ValueError(f"target images must be (H,W), got {target_ap.shape}")
+    H, W = target_ap.shape
+    ratio = float(np.clip(train_frac, 0.0, 1.0))
+    score = _compute_score(target_ap, target_pa, pa_xflip)
+    score_flat = score.reshape(-1)
+
+    use_quantile = fg_threshold <= 0.0
+    if use_quantile:
+        q = float(np.clip(fg_quantile, 0.0, 1.0))
+        thr_used = float(np.quantile(score_flat, q)) if score_flat.size > 0 else 0.0
+        fg_mask = score_flat >= thr_used
+    else:
+        thr_used = float(fg_threshold)
+        fg_mask = score_flat > thr_used
+
+    all_idx = np.arange(H * W, dtype=np.int64)
+    fg_idx = all_idx[fg_mask]
+    bg_idx = all_idx[~fg_mask]
+
+    rng = np.random.default_rng(seed)
+    train_fg, test_fg, train_bg, test_bg = [], [], [], []
+    if fg_idx.size > 0:
+        perm_fg = rng.permutation(fg_idx.size)
+        n_train_fg = int(np.floor(ratio * fg_idx.size))
+        train_fg = fg_idx[perm_fg[:n_train_fg]]
+        test_fg = fg_idx[perm_fg[n_train_fg:]]
+    if bg_idx.size > 0:
+        perm_bg = rng.permutation(bg_idx.size)
+        n_train_bg = int(np.floor(ratio * bg_idx.size))
+        train_bg = bg_idx[perm_bg[:n_train_bg]]
+        test_bg = bg_idx[perm_bg[n_train_bg:]]
+
+    train_idx_fg = np.array(train_fg, dtype=np.int64) if np.size(train_fg) else np.array([], dtype=np.int64)
+    test_idx_fg = np.array(test_fg, dtype=np.int64) if np.size(test_fg) else np.array([], dtype=np.int64)
+    train_idx_bg = np.array(train_bg, dtype=np.int64) if np.size(train_bg) else np.array([], dtype=np.int64)
+    test_idx_bg = np.array(test_bg, dtype=np.int64) if np.size(test_bg) else np.array([], dtype=np.int64)
+    train_idx_all = np.concatenate([train_idx_fg, train_idx_bg]) if train_idx_fg.size + train_idx_bg.size > 0 else np.array([], dtype=np.int64)
+    test_idx_all = np.concatenate([test_idx_fg, test_idx_bg]) if test_idx_fg.size + test_idx_bg.size > 0 else np.array([], dtype=np.int64)
+
+    for arr in (train_idx_fg, test_idx_fg, train_idx_bg, test_idx_bg, train_idx_all, test_idx_all):
+        if arr.size > 0:
+            rng.shuffle(arr)
+
+    test_idx_top10 = None
+    if test_idx_all.size > 0:
+        test_values = score_flat[test_idx_all]
+        top_k = max(1, int(np.ceil(topk_frac * test_values.size)))
+        top_order = np.argpartition(-test_values, top_k - 1)[:top_k]
+        test_idx_top10 = test_idx_all[top_order]
+        rng.shuffle(test_idx_top10)
+
+    split = PixelSplit(
+        H=H,
+        W=W,
+        train_idx_all=train_idx_all.astype(np.int64),
+        test_idx_all=test_idx_all.astype(np.int64),
+        train_idx_fg=train_idx_fg.astype(np.int64),
+        train_idx_bg=train_idx_bg.astype(np.int64),
+        test_idx_fg=test_idx_fg.astype(np.int64),
+        test_idx_bg=test_idx_bg.astype(np.int64),
+        test_idx_top10=test_idx_top10.astype(np.int64) if test_idx_top10 is not None else None,
+        thr_used=float(thr_used),
+    )
+    _sanity_check(split)
     return split
 
 

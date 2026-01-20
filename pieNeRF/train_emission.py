@@ -16,7 +16,12 @@ import yaml
 from torch.utils.data import DataLoader
 
 from graf.config import get_data, build_models
-from utils.ray_split import PixelSplit, make_pixel_split_from_ap_pa, sample_train_indices
+from utils.ray_split import (
+    PixelSplit,
+    make_pixel_split_from_ap_pa,
+    make_pixel_split_stratified_intensity,
+    sample_train_indices,
+)
 
 __VERSION__ = "emission-train v0.3"
 DEBUG_PRINTS = False  # Nur Debug-Ausgaben, keine Änderung am Verhalten
@@ -71,13 +76,6 @@ def parse_args():
         "--normalize-targets",
         action="store_true",
         help="(Deprecated) Apply per-projection min/max normalisation to both targets and predictions.",
-    )
-    parser.add_argument(
-        "--projection-normalization",
-        type=str,
-        default=None,
-        choices=["none", "per_projection_max", "joint_p99"],
-        help="Override data.projection_normalization from the config (none|per_projection_max|joint_p99).",
     )
     parser.add_argument(
         "--bg-weight",
@@ -220,6 +218,13 @@ def parse_args():
         help="Anteil der Rays pro Bild für das Training (Rest = Test) beim stratifizierten Split.",
     )
     parser.add_argument(
+        "--ray-split-mode",
+        type=str,
+        default="tile_random",
+        choices=["tile_random", "stratified_intensity"],
+        help="Split-Modus: tile_random (Tile-permutiert) oder stratified_intensity (FG/BG stratifiziert).",
+    )
+    parser.add_argument(
         "--ray-split-seed",
         type=int,
         default=123,
@@ -240,8 +245,8 @@ def parse_args():
     parser.add_argument(
         "--ray-fg-quantile",
         type=float,
-        default=0.2,
-        help="Quantil q, falls --ray-fg-thr=quantile gewählt wird.",
+        default=0.90,
+        help="Quantil q für FG-Definition, falls ray-fg-thr<=0 oder 'quantile'.",
     )
     parser.add_argument(
         "--ray-train-fg-frac",
@@ -272,6 +277,16 @@ def parse_args():
         nargs="?",
         const=True,
         help="Logge p50/p80/p95/p99 der rohen AP/PA-Projektionen (Pred + Target) nur am finalen Step.",
+    )
+    parser.add_argument(
+        "--debug-proj-stats",
+        action="store_true",
+        help="Einmalige AP/PA-Min/Max/p99.9-Statistiken direkt nach dem Laden loggen.",
+    )
+    parser.add_argument(
+        "--log-proj-metrics-physical",
+        action="store_true",
+        help="Logge PSNR/MAE/Quantiles zusaetzlich im physikalischen Massstab (re-skaliert).",
     )
     parser.add_argument(
         "--export-vol-res",
@@ -348,6 +363,26 @@ def log_projection_quantiles(ap_pred, pa_pred, ap_target=None, pa_target=None, t
             f"p95={pa_t_q[2]:.3e} p99={pa_t_q[3]:.3e}"
         )
     print(msg, flush=True)
+
+
+def log_projection_quantiles_scaled(
+    ap_pred,
+    pa_pred,
+    ap_target=None,
+    pa_target=None,
+    tag="final",
+    ap_scale: float = 1.0,
+    pa_scale: float = 1.0,
+):
+    ap_scale = float(ap_scale)
+    pa_scale = float(pa_scale)
+    log_projection_quantiles(
+        ap_pred * ap_scale,
+        pa_pred * pa_scale,
+        ap_target=None if ap_target is None else ap_target * ap_scale,
+        pa_target=None if pa_target is None else pa_target * pa_scale,
+        tag=tag,
+    )
 
 
 def export_activity_volume(generator, z_latent, out_path: Path, res: int, device: torch.device):
@@ -469,8 +504,7 @@ def log_effective_config(outdir: Path, config: dict, args):
     git_rev = safe_git_rev()
     print(f"[cfg] git_rev={git_rev} | expname={config.get('expname', 'n/a')} | outdir={outdir}", flush=True)
     print(
-        f"[cfg][data] projection_normalization={data_cfg.get('projection_normalization')} "
-        f"| act_scale={data_cfg.get('act_scale')} | near={data_cfg.get('near')} | far={data_cfg.get('far')} "
+        f"[cfg][data] act_scale={data_cfg.get('act_scale')} | near={data_cfg.get('near')} | far={data_cfg.get('far')} "
         f"| orthographic={data_cfg.get('orthographic')}",
         flush=True,
     )
@@ -992,6 +1026,8 @@ def evaluate_pixel_subsets(
     pa_xflip: bool,
     ct_context=None,
     W: int = None,
+    scale_ap: Optional[float] = None,
+    scale_pa: Optional[float] = None,
 ):
     """Evaluiert Loss/PSNR/MAE auf gemeinsamen Pixel-Indizes für AP+PA (Loss gemittelt über Views)."""
     prev_flag = generator.use_test_kwargs
@@ -1030,6 +1066,27 @@ def evaluate_pixel_subsets(
             mae_ap = torch.mean(torch.abs(pred_ap - target_ap)).item()
             mae_pa = torch.mean(torch.abs(pred_pa - target_pa)).item()
 
+            phys_metrics = None
+            if scale_ap is not None and scale_pa is not None:
+                scale_ap_f = float(scale_ap)
+                scale_pa_f = float(scale_pa)
+                pred_ap_phys = pred_ap * scale_ap_f
+                pred_pa_phys = pred_pa * scale_pa_f
+                target_ap_phys = target_ap * scale_ap_f
+                target_pa_phys = target_pa * scale_pa_f
+                psnr_ap_phys = compute_psnr(pred_ap_phys, target_ap_phys)
+                psnr_pa_phys = compute_psnr(pred_pa_phys, target_pa_phys)
+                mae_ap_phys = torch.mean(torch.abs(pred_ap_phys - target_ap_phys)).item()
+                mae_pa_phys = torch.mean(torch.abs(pred_pa_phys - target_pa_phys)).item()
+                phys_metrics = {
+                    "psnr": 0.5 * (psnr_ap_phys + psnr_pa_phys),
+                    "mae": 0.5 * (mae_ap_phys + mae_pa_phys),
+                    "view": {
+                        "ap": {"psnr": psnr_ap_phys, "mae": mae_ap_phys},
+                        "pa": {"psnr": psnr_pa_phys, "mae": mae_pa_phys},
+                    },
+                }
+
             results[name] = {
                 "loss": loss_total.item(),
                 "loss_ap": loss_ap.item(),
@@ -1042,6 +1099,7 @@ def evaluate_pixel_subsets(
                     "ap": {"loss": loss_ap.item(), "psnr": psnr_ap, "mae": mae_ap},
                     "pa": {"loss": loss_pa.item(), "psnr": psnr_pa, "mae": mae_pa},
                 },
+                "phys": phys_metrics,
             }
 
     if prev_flag:
@@ -1203,13 +1261,9 @@ def train():
 
     data_cfg = config.setdefault("data", {})
     if args.normalize_targets:
-        print("⚠️ --normalize-targets ist veraltet – Projektionen werden bereits im Loader auf [0,1] normiert.", flush=True)
-    if args.projection_normalization is not None:
-        data_cfg["projection_normalization"] = args.projection_normalization
-    proj_mode = data_cfg.setdefault("projection_normalization", "per_projection_max").lower()
-    if proj_mode not in ("none", "per_projection_max", "joint_p99"):
-        raise ValueError(f"Unsupported projection_normalization: {proj_mode}")
+        print("⚠️ --normalize-targets ist veraltet und wird ignoriert.", flush=True)
     data_cfg.setdefault("act_scale", 1.0)
+    data_cfg["debug_proj_stats"] = bool(args.debug_proj_stats)
     data_cfg["ray_split_ratio"] = float(args.ray_split)
     training_cfg = config.setdefault("training", {})
     training_cfg.setdefault("val_interval", 0)
@@ -1280,12 +1334,14 @@ def train():
         print(f"[DEBUG] act_scale={act_global_scale}", flush=True)
     ray_split_ratio = float(data_cfg.get("ray_split_ratio", 0.8))
     ray_split_enabled = bool(args.ray_split_enable)
+    ray_split_mode = str(args.ray_split_mode)
     ray_split_seed = int(args.ray_split_seed)
     ray_split_tile = int(max(1, args.ray_split_tile))
     ray_fg_thr = args.ray_fg_thr
     ray_fg_quantile = float(args.ray_fg_quantile)
     pa_xflip = bool(args.pa_xflip)
     ray_train_fg_frac = float(np.clip(args.ray_train_fg_frac, 0.0, 1.0))
+    log_proj_metrics_physical = bool(args.log_proj_metrics_physical)
     val_interval = int(training_cfg.get("val_interval", 0) or 0)
     tv_weight = float(training_cfg.get("tv_weight", 0.0))
     ray_tv_weight = float(training_cfg.get("ray_tv_weight", 0.0))
@@ -1334,15 +1390,17 @@ def train():
     pixel_split_np: Optional[PixelSplit] = None
     ray_indices: Dict[str, Dict[str, Optional[torch.Tensor]]] = {}
 
-    def parse_fg_threshold(raw_thr) -> float:
+    def parse_fg_threshold(raw_thr) -> Tuple[float, bool]:
         try:
-            return float(raw_thr)
+            return float(raw_thr), False
         except Exception:
             if isinstance(raw_thr, str) and raw_thr.strip().lower() == "quantile":
-                return -abs(args.ray_fg_quantile)
+                return 0.0, True
             raise
 
-    ray_fg_thr_value = parse_fg_threshold(ray_fg_thr)
+    ray_fg_thr_value, ray_fg_force_quantile = parse_fg_threshold(ray_fg_thr)
+    if ray_split_mode not in ("tile_random", "stratified_intensity"):
+        raise ValueError(f"Unknown ray_split_mode: {ray_split_mode}")
 
     def map_pa_indices_torch(idx: torch.Tensor, W: int, do_flip: bool) -> torch.Tensor:
         if not do_flip:
@@ -1356,7 +1414,7 @@ def train():
             return None
         return torch.from_numpy(arr.astype(np.int64)).long().to(device, non_blocking=True)
 
-    def _log_split(split: PixelSplit, score_img: np.ndarray):
+    def _log_split(split: PixelSplit, score_img: np.ndarray, mode: str):
         fg_total = split.train_idx_fg.size + split.test_idx_fg.size
         bg_total = split.train_idx_bg.size + split.test_idx_bg.size
         fg_ratio = fg_total / float(num_pixels) if num_pixels > 0 else 0.0
@@ -1369,19 +1427,23 @@ def train():
             f"🔀 Pixel split: train={split.train_idx_all.size} | test={split.test_idx_all.size} "
             f"| fg={fg_total} ({fg_ratio:.3f}) | bg={bg_total} ({bg_ratio:.3f}) "
             f"| test_fg={split.test_idx_fg.size} ({test_fg_ratio:.3f}) | test_bg={split.test_idx_bg.size} ({test_bg_ratio:.3f}) "
-            f"| test_top10={top10_count} | tile={ray_split_tile} | thr={split.thr_used:.3e} | seed={ray_split_seed}",
+            f"| test_top10={top10_count} | mode={mode} | tile={ray_split_tile} | thr={split.thr_used:.3e} | seed={ray_split_seed}",
             flush=True,
         )
-        if split.test_idx_fg.size > 0:
-            rng_dbg = np.random.default_rng(ray_split_seed + 11)
-            sample_dbg = rng_dbg.choice(split.test_idx_fg, size=min(5, split.test_idx_fg.size), replace=False)
-            score_flat = score_img.reshape(-1)
+        score_flat = score_img.reshape(-1)
+        fg_all = np.concatenate([split.train_idx_fg, split.test_idx_fg]) if fg_total > 0 else np.array([], dtype=np.int64)
+        if fg_all.size > 0:
+            top_k = min(5, fg_all.size)
+            top_order = np.argpartition(-score_flat[fg_all], top_k - 1)[:top_k]
+            top_fg = fg_all[top_order]
             dbg_entries = []
-            for idx in sample_dbg:
+            for idx in top_fg:
                 y = int(idx // W)
                 x = int(idx % W)
                 dbg_entries.append(f"({x},{y},{score_flat[idx]:.3e})")
-            print(f"   [pixel-split-debug] FG samples (x,y,score): " + ", ".join(dbg_entries), flush=True)
+            print(f"   [pixel-split-debug] FG top-{top_k} (x,y,score): " + ", ".join(dbg_entries), flush=True)
+        else:
+            print("   [pixel-split-debug] FG top-k: none (no FG pixels).", flush=True)
 
     if ray_split_enabled:
         ref_sample = dataset[0]
@@ -1390,18 +1452,34 @@ def train():
         if ap_target_np.shape != (H, W) or pa_target_np.shape != (H, W):
             raise ValueError(f"Unexpected target shape: AP {ap_target_np.shape}, PA {pa_target_np.shape}, expected {(H, W)}")
 
-        pixel_split_np = make_pixel_split_from_ap_pa(
-            ap_target_np,
-            pa_target_np,
-            train_frac=ray_split_ratio,
-            tile=ray_split_tile,
-            thr=ray_fg_thr_value,
-            seed=ray_split_seed,
-            pa_xflip=pa_xflip,
-            topk_frac=0.10,
-        )
+        if ray_split_mode == "stratified_intensity":
+            fg_thr_value = ray_fg_thr_value if not ray_fg_force_quantile else 0.0
+            pixel_split_np = make_pixel_split_stratified_intensity(
+                ap_target_np,
+                pa_target_np,
+                train_frac=ray_split_ratio,
+                fg_threshold=fg_thr_value,
+                fg_quantile=ray_fg_quantile,
+                seed=ray_split_seed,
+                pa_xflip=pa_xflip,
+                topk_frac=0.10,
+            )
+        else:
+            fg_thr_value = ray_fg_thr_value
+            if ray_fg_force_quantile:
+                fg_thr_value = -abs(ray_fg_quantile)
+            pixel_split_np = make_pixel_split_from_ap_pa(
+                ap_target_np,
+                pa_target_np,
+                train_frac=ray_split_ratio,
+                tile=ray_split_tile,
+                thr=fg_thr_value,
+                seed=ray_split_seed,
+                pa_xflip=pa_xflip,
+                topk_frac=0.10,
+            )
         score_img = np.maximum(ap_target_np, pa_target_np[:, ::-1] if pa_xflip else pa_target_np)
-        _log_split(pixel_split_np, score_img)
+        _log_split(pixel_split_np, score_img, ray_split_mode)
 
         np.savez(
             outdir / "pixel_split.npz",
@@ -1421,6 +1499,7 @@ def train():
                         "tile": ray_split_tile,
                         "seed": ray_split_seed,
                         "threshold": pixel_split_np.thr_used,
+                        "mode": ray_split_mode,
                         "pa_xflip": pa_xflip,
                     }
                 ],
@@ -1477,6 +1556,10 @@ def train():
         f"🚀 Starting emission-NeRF training | steps={args.max_steps} | rays/proj={rays_per_proj} "
         f"| image={generator.H}x{generator.W} | chunk={generator.chunk}"
     )
+    scale_ap_used = 1.0
+    scale_pa_used = 1.0
+    scale_joint_used = 1.0
+    scale_missing_warned = False
 
     for step in range(1, args.max_steps + 1):
         try:
@@ -1487,6 +1570,35 @@ def train():
 
         ap = batch["ap"].to(device, non_blocking=True).float()
         pa = batch["pa"].to(device, non_blocking=True).float()
+        meta = batch.get("meta")
+        meta_scale = None
+        meta_missing = False
+        if isinstance(meta, dict):
+            meta_scale = meta.get("proj_scale_joint_p99")
+            meta_missing = meta.get("proj_scale_joint_p99_missing", False)
+            if isinstance(meta_scale, (list, tuple)):
+                meta_scale = meta_scale[0] if meta_scale else None
+            if torch.is_tensor(meta_scale):
+                meta_scale = meta_scale.item() if meta_scale.numel() > 0 else None
+            if torch.is_tensor(meta_missing):
+                meta_missing = bool(meta_missing.item()) if meta_missing.numel() > 0 else False
+        if meta_scale is None or (isinstance(meta_scale, float) and math.isnan(meta_scale)) or meta_missing:
+            scale_joint_used = 1.0
+            if not scale_missing_warned:
+                print(
+                    "[WARN] proj_scale_joint_p99 fehlt im manifest; physikalische Metriken sind bedeutungslos.",
+                    flush=True,
+                )
+                scale_missing_warned = True
+        else:
+            scale_joint_used = float(meta_scale)
+        scale_ap_used = scale_joint_used
+        scale_pa_used = scale_joint_used
+        if step == 1:
+            print(
+                f"[scale] projections_on_disk_normalized_with_joint_p99: proj_scale_joint_p99={scale_joint_used:.3e}",
+                flush=True,
+            )
         act_vol = batch.get("act")
         if act_vol is not None:
             if act_vol.numel() == 0:
@@ -1741,6 +1853,19 @@ def train():
             pred_std_raw = (pred_ap_raw.std().item(), pred_pa_raw.std().item())
             psnr_ap = compute_psnr(pred_ap, target_ap)
             psnr_pa = compute_psnr(pred_pa, target_pa)
+            psnr_ap_phys = None
+            psnr_pa_phys = None
+            mae_ap_phys = None
+            mae_pa_phys = None
+            if log_proj_metrics_physical:
+                pred_ap_phys = pred_ap * float(scale_ap_used)
+                pred_pa_phys = pred_pa * float(scale_pa_used)
+                target_ap_phys = target_ap * float(scale_ap_used)
+                target_pa_phys = target_pa * float(scale_pa_used)
+                psnr_ap_phys = compute_psnr(pred_ap_phys, target_ap_phys)
+                psnr_pa_phys = compute_psnr(pred_pa_phys, target_pa_phys)
+                mae_ap_phys = torch.mean(torch.abs(pred_ap_phys - target_ap_phys)).item()
+                mae_pa_phys = torch.mean(torch.abs(pred_pa_phys - target_pa_phys)).item()
             bg_depth_frac = float(bg_depth_frac_t.detach().cpu().item())
             val_stats = None
             if val_interval > 0 and (step % val_interval) == 0 and (not args.no_val):
@@ -1769,6 +1894,8 @@ def train():
                     pa_xflip=pa_xflip,
                     ct_context=ct_context,
                     W=W,
+                    scale_ap=scale_ap_used if log_proj_metrics_physical else None,
+                    scale_pa=scale_pa_used if log_proj_metrics_physical else None,
                 )
         val_all = val_stats.get("test_all") if isinstance(val_stats, dict) else None
         val_fg = val_stats.get("test_fg") if isinstance(val_stats, dict) else None
@@ -1788,6 +1915,10 @@ def train():
         val_pred_mean_bg = val_bg.get("pred_mean") if val_bg is not None else None
         val_target_mean_bg = val_bg.get("target_mean") if val_bg is not None else None
         val_view_all = val_all.get("view") if val_all is not None else None
+        val_phys_all = val_all.get("phys") if val_all is not None else None
+        val_phys_fg = val_fg.get("phys") if val_fg is not None else None
+        val_phys_bg = val_bg.get("phys") if val_bg is not None else None
+        val_phys_top10 = val_top10.get("phys") if val_top10 is not None else None
         val_loss_ap = val_view_all["ap"]["loss"] if val_view_all is not None else None
         val_loss_pa = val_view_all["pa"]["loss"] if val_view_all is not None else None
         val_psnr_ap_val = val_view_all["ap"]["psnr"] if val_view_all is not None else None
@@ -1810,6 +1941,11 @@ def train():
             f"| predμ_raw=({pred_mean_raw[0]:.3e},{pred_mean_raw[1]:.3e}) predσ_raw=({pred_std_raw[0]:.3e},{pred_std_raw[1]:.3e}) "
             f"| predμ=({pred_mean[0]:.3e},{pred_mean[1]:.3e}) predσ=({pred_std[0]:.3e},{pred_std[1]:.3e})"
         )
+        if log_proj_metrics_physical and psnr_ap_phys is not None:
+            msg += (
+                f" | mae_ap_phys={mae_ap_phys:.6f} | mae_pa_phys={mae_pa_phys:.6f} "
+                f"| psnr_ap_phys={psnr_ap_phys:.2f} | psnr_pa_phys={psnr_pa_phys:.2f}"
+            )
         if ray_tv_weight != 0.0:
             msg += f" | ray_tv_mode={ray_tv_mode}"
             if ray_tv_w_mean is not None:
@@ -1837,6 +1973,22 @@ def train():
         if val_bg is not None:
             msg += (
                 f" | test_bg_loss={val_loss_bg:.6f} | test_bg_psnr={val_psnr_bg:.2f} | test_bg_mae={val_mae_bg:.6f}"
+            )
+        if log_proj_metrics_physical and val_phys_all is not None:
+            msg += (
+                f" | test_all_psnr_phys={val_phys_all['psnr']:.2f} | test_all_mae_phys={val_phys_all['mae']:.6f}"
+            )
+        if log_proj_metrics_physical and val_phys_fg is not None:
+            msg += (
+                f" | test_fg_psnr_phys={val_phys_fg['psnr']:.2f} | test_fg_mae_phys={val_phys_fg['mae']:.6f}"
+            )
+        if log_proj_metrics_physical and val_phys_top10 is not None:
+            msg += (
+                f" | test_top10_psnr_phys={val_phys_top10['psnr']:.2f} | test_top10_mae_phys={val_phys_top10['mae']:.6f}"
+            )
+        if log_proj_metrics_physical and val_phys_bg is not None:
+            msg += (
+                f" | test_bg_psnr_phys={val_phys_bg['psnr']:.2f} | test_bg_mae_phys={val_phys_bg['mae']:.6f}"
             )
         if val_pred_mean_bg is not None and val_target_mean_bg is not None:
             print(
@@ -1929,6 +2081,16 @@ def train():
         ap_t_np = ap.detach().cpu().numpy()[0] if ap is not None else None
         pa_t_np = pa.detach().cpu().numpy()[0] if pa is not None else None
         log_projection_quantiles(proj_ap, proj_pa, ap_target=ap_t_np, pa_target=pa_t_np, tag="final")
+        if log_proj_metrics_physical:
+            log_projection_quantiles_scaled(
+                proj_ap,
+                proj_pa,
+                ap_target=ap_t_np,
+                pa_target=pa_t_np,
+                tag="final_phys",
+                ap_scale=scale_ap_used,
+                pa_scale=scale_pa_used,
+            )
     save_img(ap_np, fp / "final_AP.png", "AP final")
     save_img(pa_np, fp / "final_PA.png", "PA final")
     print("🖼️ Finale Previews gespeichert.", flush=True)

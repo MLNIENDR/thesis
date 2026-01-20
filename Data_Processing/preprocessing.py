@@ -24,10 +24,10 @@ Erzeugt im out/-Ordner:
 Beispielaufruf:
 
 python preprocessing.py \
-  --base /home/mnguest12/projects/thesis/Data_Processing/phantom_02 \
-  --spect_bin phantom_02_spect208keV.par_atn_1.bin \
-  --ct_bin    phantom_02_ct80keV.par_atn_1.bin \
-  --mask_bin  phantom_02_mask.par_act_1.bin \
+  --base /home/mnguest12/projects/thesis/Data_Processing/phantom_01 \
+  --spect_bin phantom_01_spect208keV.par_atn_1.bin \
+  --ct_bin    phantom_01_ct80keV.par_atn_1.bin \
+  --mask_bin  phantom_01_mask.par_act_1.bin \
   --shape 256,256,651 \
   --spect_dtype float32 \
   --ct_dtype    float32 \
@@ -36,8 +36,11 @@ python preprocessing.py \
   --sd_mm 1.5 \
   --kernel_mat LEAP_Kernel.mat --kernel_var kernel_mat \
   --bin_order F \
-  --percentile 99.9 --activity_seed -1 \
-  --poisson_max_counts 3000 --poisson_ref_percentile 99.5
+  --activity_seed -1 \
+  --poisson_max_counts 3000 --poisson_ref_percentile 99.5 \
+  --manifest /home/mnguest12/projects/thesis/pieNeRF/data/manifest.csv \
+  --patient-id phantom_01 \
+  --manifest-id-column patient_id
 
 """
 
@@ -46,6 +49,7 @@ import argparse
 from pathlib import Path
 from typing import Dict, Tuple
 import json
+import csv
 import hashlib
 import numpy as np
 try:
@@ -86,6 +90,39 @@ def ensure_dirs(base: Path) -> Tuple[Path, Path]:
         raise FileNotFoundError(f"src-Ordner nicht gefunden: {src}")
     out.mkdir(parents=True, exist_ok=True)
     return src, out
+
+
+def update_manifest_scale(manifest_path: Path, patient_id: str, scale: float, id_column: str = "patient_id"):
+    manifest_path = Path(manifest_path)
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"manifest.csv nicht gefunden: {manifest_path}")
+    rows = []
+    with open(manifest_path, newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+        if "proj_scale_joint_p99" not in fieldnames:
+            fieldnames.append("proj_scale_joint_p99")
+        for row in reader:
+            rows.append(row)
+
+    updated = False
+    for row in rows:
+        if row.get(id_column) == patient_id:
+            row["proj_scale_joint_p99"] = f"{float(scale):.8e}"
+            updated = True
+            break
+
+    if not updated:
+        available = [row.get(id_column, "") for row in rows]
+        raise ValueError(
+            f"patient_id '{patient_id}' nicht im manifest gefunden: {manifest_path}. "
+            f"Verfuegbare IDs: {available}"
+        )
+
+    with open(manifest_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _ensure_image_backend():
@@ -349,37 +386,28 @@ def gamma_camera_core(act_data: np.ndarray, atn_data: np.ndarray,
 # -----------------
 
 def normalize_projections(ap_raw: np.ndarray,
-                          pa_raw: np.ndarray,
-                          percentile: float = 99.9,
-                          clip_to_one: bool = True) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Skaliert AP/PA-Projektionen robust auf einen relativen Bereich.
+                          pa_raw: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Normiert AP/PA mit einem gemeinsamen p99.9-Skalierungsfaktor.
 
-    - scale = gemeinsames Perzentil von AP/PA (z.B. 99.9%)
-    - Normierung: ap_n = ap_raw / scale
-    - negatives auf 0 clampen
-    - optional ap_n, pa_n auf <= 1.0 clippen
-
-    Rückgabe:
-      ap_n, pa_n, scale
-    so dass gilt:
-      ap_raw ≈ ap_n * scale
-      pa_raw ≈ pa_n * scale
+    Skala s = quantile_0.999(concat(AP, PA)) auf Arrays, die gespeichert werden sollen
+    (post-noise, post-clipping falls angewandt).
+    Guard: falls s <= 0 -> max(concat) -> 1.0.
     """
+    ap_raw = np.clip(ap_raw, 0.0, None)
+    pa_raw = np.clip(pa_raw, 0.0, None)
     stacked = np.concatenate([ap_raw.ravel(), pa_raw.ravel()])
-    scale = np.percentile(stacked, percentile)
+    scale = float(np.quantile(stacked, 0.999)) if stacked.size > 0 else 1.0
+    if scale <= 0:
+        scale = float(stacked.max()) if stacked.size > 0 else 1.0
     if scale <= 0:
         scale = 1.0
 
-    ap_n = ap_raw / (scale + 1e-12)
-    pa_n = pa_raw / (scale + 1e-12)
+    ap_n = ap_raw / scale
+    pa_n = pa_raw / scale
 
     # negative Werte auf 0 (numerische Artefakte)
     ap_n = np.clip(ap_n, 0.0, None)
     pa_n = np.clip(pa_n, 0.0, None)
-
-    if clip_to_one:
-        ap_n = np.minimum(ap_n, 1.0)
-        pa_n = np.minimum(pa_n, 1.0)
 
     return ap_n.astype(np.float32), pa_n.astype(np.float32), float(scale)
 
@@ -453,11 +481,13 @@ def parse_args():
     p.add_argument("--poisson_ref_percentile", type=float, default=99.5,
                    help="Perzentil der rohen Projektionen, das auf poisson_max_counts gemappt wird.")
 
-    # AP/PA-Normierung
-    p.add_argument("--percentile", type=float, default=99.9,
-                   help="Perzentil für die robuste Normierung (z.B. 99.9)")
-    p.add_argument("--clip_to_one", action="store_true",
-                   help="Wenn gesetzt, werden AP/PA nach Normierung auf <=1.0 gecappt.")
+    # Manifest-Update (optional)
+    p.add_argument("--manifest", type=Path, default=None,
+                   help="Optional: Pfad zu manifest.csv, um proj_scale_joint_p99 zu speichern.")
+    p.add_argument("--patient-id", type=str, default=None,
+                   help="Patient-ID fuer das manifest (Default: Ordnername).")
+    p.add_argument("--manifest-id-column", type=str, default="patient_id",
+                   help="Spaltenname fuer die Patient-ID im manifest (default: patient_id).")
     p.add_argument("--apply_global_rot90", action="store_true",
                    help="Wenn gesetzt, werden alle Volumina (und AP/PA) global 90° CCW rotiert.")
 
@@ -606,13 +636,21 @@ def main():
     ap_norm, pa_norm, scale_auto = normalize_projections(
         ap_raw=ap_for_norm,
         pa_raw=pa_for_norm,
-        percentile=args.percentile,
-        clip_to_one=args.clip_to_one,
     )
 
+    ap_p999 = float(np.quantile(ap_norm.ravel(), 0.999)) if ap_norm.size > 0 else float("nan")
+    pa_p999 = float(np.quantile(pa_norm.ravel(), 0.999)) if pa_norm.size > 0 else float("nan")
     print("[RANGE] AP norm:", ap_norm.min(), ap_norm.max(),
           "PA norm:", pa_norm.min(), pa_norm.max())
-    print(f"[INFO] verwendeter Normalisierungsfaktor (Perzentil {args.percentile}): {scale_auto:.4e}")
+    print(f"[INFO] verwendeter Normalisierungsfaktor (joint p99.9): {scale_auto:.4e}")
+    print(f"[CHECK] p99.9(AP_norm)={ap_p999:.4f} | p99.9(PA_norm)={pa_p999:.4f}", flush=True)
+    tol = 0.10
+    if (abs(ap_p999 - 1.0) > tol) or (abs(pa_p999 - 1.0) > tol) or (abs(ap_p999 - pa_p999) > tol):
+        print(
+            "[WARN] p99.9(AP_norm) und p99.9(PA_norm) sind nicht konsistent "
+            f"(tol={tol:.2f}). Erwartet ~1.0 fuer beide bei joint p99.9.",
+            flush=True,
+        )
 
     # Kein zusätzlicher globaler LR-Flip mehr: orient_patch in gamma_camera_core liefert bereits das korrekte
     # Detektor-Koordinatensystem. Ein weiterer Flip hätte die AP/PA-Projektionen gegenüber den Volumina gespiegelt.
@@ -663,25 +701,42 @@ def main():
         "step_len": float(step_len),
         "kernel_mat": str(kernel_mat_path),
         "kernel_var": args.kernel_var,
-        "projection_normalization": {
-            "percentile": float(args.percentile),
-            "auto_scale": float(scale_auto),
-            "clip_to_one": bool(args.clip_to_one),
+        "proj_scale_joint_p99": float(scale_auto),
+        "projection_norm_stats": {
             "ap_raw_min": float(ap_raw.min()),
             "ap_raw_max": float(ap_raw.max()),
             "pa_raw_min": float(pa_raw.min()),
             "pa_raw_max": float(pa_raw.max()),
             "ap_norm_min": float(ap_norm.min()),
             "ap_norm_max": float(ap_norm.max()),
+            "ap_norm_p99_9": float(ap_p999),
             "pa_norm_min": float(pa_norm.min()),
             "pa_norm_max": float(pa_norm.max()),
-            "units_after_norm": "relative (counts/scale_auto)",
+            "pa_norm_p99_9": float(pa_p999),
             "poisson_max_counts": float(args.poisson_max_counts),
             "poisson_ref_percentile": float(args.poisson_ref_percentile),
         },
     }
     with open(out_dir / "meta_simple.json", "w") as f:
         json.dump(meta, f, indent=2)
+
+    if args.manifest is not None:
+        manifest_id = args.patient_id or base.name
+        if args.patient_id is None:
+            print(
+                f"[WARN] --patient-id nicht gesetzt, nutze Ordnername '{manifest_id}' fuer manifest-Update.",
+                flush=True,
+            )
+        update_manifest_scale(args.manifest, manifest_id, scale_auto, id_column=args.manifest_id_column)
+        print(
+            f"[MANIFEST] proj_scale_joint_p99={scale_auto:.4e} geschrieben fuer {manifest_id} in {args.manifest}",
+            flush=True,
+        )
+    else:
+        print(
+            "[WARN] Kein --manifest angegeben; proj_scale_joint_p99 wurde nur in meta_simple.json gespeichert.",
+            flush=True,
+        )
 
     print(f"[OUT] Gespeichert in {out_dir}: "
           f"spect_att.npy, ct_att.npy, act.npy, ap.npy, pa.npy, meta_simple.json")

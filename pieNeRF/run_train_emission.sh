@@ -33,14 +33,16 @@ srun python -u train_emission.py \
   --log-every 10 \
   --preview-every 100 \
   --save-every 100 \
+  --ct-padding-mode zeros \
+  --log-proj-metrics-physical \
   --bg-weight 1.0 \
   --weight-threshold 0.0 \
-  --act-loss-weight 0.02 \
+  --act-loss-weight 0.01 \
   --act-samples 16384 \
-  --act-pos-weight 5.0 \
-  --ct-loss-weight 0.005 \
+  --act-pos-weight 3.0 \
+  --ct-loss-weight 0.02 \
   --ct-threshold 0.02 \
-  --ct-samples 4096 \
+  --ct-samples 8192 \
   --z-reg-weight 0 \
   --tv-weight 0.0002 \
   --ray-tv-weight 1e-5 \
@@ -50,10 +52,10 @@ srun python -u train_emission.py \
   --bg-depth-mode integral \
   --grad-stats-every 10 \
   --ray-split-enable \
+  --ray-split-mode stratified_intensity \
+  --ray-fg-quantile 0.90 \
   --ray-split 0.8 \
   --ray-split-seed 123 \
-  --ray-split-tile 32 \
-  --ray-fg-thr 0.01 \
   --ray-train-fg-frac 0.9 \
   --log-quantiles-final-only True \
   --export-vol-res 128

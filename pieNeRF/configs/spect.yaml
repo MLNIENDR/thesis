@@ -16,8 +16,6 @@ data:
   # Fester Ray-Split für Train/Test (reproduzierbar via globalem Seed)
   ray_split_ratio: 0.8                          # Anteil der Rays pro View für das Training (Rest = Test)
 
-  # Projektionen werden pro Bild auf [0,1] normiert (wie im ursprünglichen Setup)
-  projection_normalization: none
   act_scale: 1.0                                # globaler λ-Faktor (keine Normierung; für konsistente Skalen zu Projekten anpassen)
 
 

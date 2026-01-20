@@ -22,36 +22,50 @@ class SpectDataset(torch.utils.data.Dataset):
         imsize=None,
         transform_img=None,
         transform_ct=None,
-        projection_normalization: str = "per_projection_max",
+        debug_proj_stats: bool = False,
         act_scale: float = 1.0,
     ):  
         super().__init__()
         self.manifest_path = Path(manifest_path)                                # manifest_path = Pfad zur csv mit Spalten phantom_id, ap_path, pa_path, ct_path
+        self._manifest_dir = self.manifest_path.parent
         self.imsize = imsize                                                    # momentan nicht genutzt
         self.transform_img = transform_img                                      # optionale Transformationsfunktionen für AP/PA und CT
         self.transform_ct = transform_ct                                        # "
-        self.projection_normalization = (projection_normalization or "none").lower()
         self.act_scale = float(act_scale)                                       # globaler Faktor für ACT/λ (keine Normierung)
         self._logged_debug = False                                               # sorgt dafür, dass Debug-Ausgabe nur einmal erfolgt
+        self._debug_proj_stats = bool(debug_proj_stats)
+        self._logged_debug_proj_stats = False
+        self._warned_scale_mismatch = False
 
         self.entries = []                                                       # Liste in der für jeden Fall ein kleines Dict mit Pfaden & ID steht
         with open(self.manifest_path, newline="") as f:                         # CSV öffnen
             reader = csv.DictReader(f)                                          # liest jede Zeile als dict
             for row in reader:
                 act_path = row.get("act_path")
-                if act_path is None:
+                if act_path is None or act_path == "":
                     # optional automatisch aus dem Ordner ableiten
-                    candidate = Path(row["ap_path"]).with_name("act.npy")
+                    candidate = self._resolve_path(row["ap_path"]).with_name("act.npy")
                     act_path = candidate if candidate.exists() else None
                 else:
-                    act_path = Path(act_path)
+                    act_path = self._resolve_path(act_path)
+
+                proj_scale = row.get("proj_scale_joint_p99")
+                proj_scale_val = None
+                if proj_scale is not None and proj_scale != "":
+                    try:
+                        proj_scale_val = float(proj_scale)
+                    except Exception:
+                        proj_scale_val = None
+                proj_scale_missing = proj_scale_val is None
 
                 self.entries.append({                                           # jeweils als Path-Objekte speichern: phantom_id, ap_path, pa_path, ct_path
                     "patient_id": row["patient_id"],
-                    "ap_path": Path(row["ap_path"]),
-                    "pa_path": Path(row["pa_path"]),
-                    "ct_path": Path(row["ct_path"]),
+                    "ap_path": self._resolve_path(row["ap_path"]),
+                    "pa_path": self._resolve_path(row["pa_path"]),
+                    "ct_path": self._resolve_path(row["ct_path"]),
                     "act_path": act_path,
+                    "proj_scale_joint_p99": proj_scale_val,
+                    "proj_scale_joint_p99_missing": proj_scale_missing,
                 })
 
     def __len__(self):
@@ -70,25 +84,6 @@ class SpectDataset(torch.utils.data.Dataset):
         )
 
 
-    def _normalize_ap_pa(self, ap: torch.Tensor, pa: torch.Tensor):
-        mode = self.projection_normalization
-        scale_ap = float(ap.max().item()) if ap.numel() > 0 else 1.0
-        scale_pa = float(pa.max().item()) if pa.numel() > 0 else 1.0
-        scale_joint = 1.0
-        if mode == "none":
-            return ap, pa, scale_ap, scale_pa, scale_joint
-        if mode == "per_projection_max":
-            scale_ap = max(scale_ap, 1e-8)
-            scale_pa = max(scale_pa, 1e-8)
-            return ap / scale_ap, pa / scale_pa, scale_ap, scale_pa, scale_joint
-        if mode == "joint_p99":
-            p_ap = float(torch.quantile(ap.view(-1), 0.999).item()) if ap.numel() > 0 else 1.0
-            p_pa = float(torch.quantile(pa.view(-1), 0.999).item()) if pa.numel() > 0 else 1.0
-            scale_joint = max(p_ap, p_pa, 1e-8)
-            return ap / scale_joint, pa / scale_joint, scale_ap, scale_pa, scale_joint
-        raise ValueError(f"Unknown projection_normalization: {mode}")
-
-
     def _load_npy_image(self, path):                                            # lädt .npy Array, z.B. [H,W] mit Counts
         arr = np.load(path).astype(np.float32)                                  # stellt sicher, dass float32
         
@@ -103,8 +98,6 @@ class SpectDataset(torch.utils.data.Dataset):
         
         vol = np.load(path).astype(np.float32)                                  # Original gespeichert als (LR, AP/Depth, SI)
         vol = np.transpose(vol, (1, 0, 2))                                      # Layout: (AP, LR, SI) = (D,H,W) für Renderer
-
-        vol *= 10.0                                                             # optionaler scale-factor
 
         return torch.from_numpy(vol)
 
@@ -131,9 +124,6 @@ class SpectDataset(torch.utils.data.Dataset):
 
         ap_pre_stats = self._tensor_stats(ap)
         pa_pre_stats = self._tensor_stats(pa)
-        ap, pa, ap_scale, pa_scale, proj_scale = self._normalize_ap_pa(ap, pa)
-        ap_post_stats = self._tensor_stats(ap)
-        pa_post_stats = self._tensor_stats(pa)
 
         if self.transform_img is not None:                                      # optionale zusätzliche Schritte (z.B. Resize, Cropping, ...)
             ap = self.transform_img(ap)
@@ -142,16 +132,17 @@ class SpectDataset(torch.utils.data.Dataset):
             ct = self.transform_ct(ct)
 
         # Debug-Ausgabe nur einmal pro Dataset-Instanz, um Skalen zu prüfen (kein Einfluss auf Verhalten).
-        if not self._logged_debug:
+        if self._debug_proj_stats and not self._logged_debug_proj_stats:
             print(
-                f"[DEBUG][norm] mode={self.projection_normalization} | "
-                f"AP pre min/max/p99.9={ap_pre_stats[0]:.3e}/{ap_pre_stats[1]:.3e}/{ap_pre_stats[2]:.3e} -> "
-                f"post {ap_post_stats[0]:.3e}/{ap_post_stats[1]:.3e}/{ap_post_stats[2]:.3e} | "
-                f"PA pre min/max/p99.9={pa_pre_stats[0]:.3e}/{pa_pre_stats[1]:.3e}/{pa_pre_stats[2]:.3e} -> "
-                f"post {pa_post_stats[0]:.3e}/{pa_post_stats[1]:.3e}/{pa_post_stats[2]:.3e} | "
-                f"ap_scale={ap_scale:.3e} pa_scale={pa_scale:.3e} joint_scale={proj_scale:.3e}",
+                f"[DEBUG][proj] AP min/max/p99.9={ap_pre_stats[0]:.3e}/{ap_pre_stats[1]:.3e}/{ap_pre_stats[2]:.3e} | "
+                f"PA min/max/p99.9={pa_pre_stats[0]:.3e}/{pa_pre_stats[1]:.3e}/{pa_pre_stats[2]:.3e} | "
+                f"proj_scale_joint_p99={e.get('proj_scale_joint_p99')} "
+                f"(missing={e.get('proj_scale_joint_p99_missing')})",
                 flush=True,
             )
+            self._logged_debug_proj_stats = True
+
+        if not self._logged_debug:
             print(
                 f"[DEBUG][datasets] AP min/max: {ap.min().item():.3e}/{ap.max().item():.3e} | "
                 f"PA min/max: {pa.min().item():.3e}/{pa.max().item():.3e} | "
@@ -167,6 +158,18 @@ class SpectDataset(torch.utils.data.Dataset):
             )
             self._logged_debug = True
 
+        ap_p999 = ap_pre_stats[2]
+        pa_p999 = pa_pre_stats[2]
+        hi = max(ap_p999, pa_p999)
+        lo = min(ap_p999, pa_p999)
+        if hi > 0.9 and lo < 0.3 and (hi / max(lo, 1e-8)) > 3.0 and not self._warned_scale_mismatch:
+            print(
+                "[WARN] AP/PA p99.9 stark unterschiedlich (moegliche per-view Normierung). "
+                "Bitte Preprocessing mit joint p99.9 erneut ausfuehren.",
+                flush=True,
+            )
+            self._warned_scale_mismatch = True
+
         return {                                                                # Rückgabe ist ein Dictionary   
             "ap": ap,
             "pa": pa,
@@ -178,17 +181,14 @@ class SpectDataset(torch.utils.data.Dataset):
                 "ap_path": str(e["ap_path"]),
                 "pa_path": str(e["pa_path"]),
                 "ct_path": str(e["ct_path"]),
-                "act_path": str(e["act_path"]) if e["act_path"] is not None else None,
-                "proj_norm": self.projection_normalization,
-                "proj_scale": float(proj_scale),
-                "ap_scale": float(ap_scale),
-                "pa_scale": float(pa_scale),
+                "act_path": str(e["act_path"]) if e["act_path"] is not None else "",
+                "act_path_missing": e["act_path"] is None,
+                "proj_scale_joint_p99": float(e["proj_scale_joint_p99"]) if e.get("proj_scale_joint_p99") is not None else float("nan"),
+                "proj_scale_joint_p99_missing": bool(e.get("proj_scale_joint_p99_missing")),
             },
         }
-
-    def _normalize_projection(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Einfache per-Projektion-Normierung auf [0,1], wie im ursprünglichen Code."""
-        maxv = tensor.max()
-        if maxv > 0:
-            tensor = tensor / maxv
-        return tensor
+    def _resolve_path(self, raw_path: str) -> Path:
+        path = Path(raw_path)
+        if path.is_absolute():
+            return path
+        return (self._manifest_dir / path).resolve()
