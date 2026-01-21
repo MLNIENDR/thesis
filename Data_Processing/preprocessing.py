@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 preprocessing.py
 
@@ -23,7 +24,7 @@ Erzeugt im out/-Ordner:
 
 Beispielaufruf:
 
-python preprocessing.py \
+python3 preprocessing.py \
   --base /home/mnguest12/projects/thesis/Data_Processing/phantom_01 \
   --spect_bin phantom_01_spect208keV.par_atn_1.bin \
   --ct_bin    phantom_01_ct80keV.par_atn_1.bin \
@@ -37,7 +38,7 @@ python preprocessing.py \
   --kernel_mat LEAP_Kernel.mat --kernel_var kernel_mat \
   --bin_order F \
   --activity_seed -1 \
-  --poisson_max_counts 3000 --poisson_ref_percentile 99.5 \
+  --poisson_max_counts 2000 --poisson_ref_percentile 99.5 \
   --manifest /home/mnguest12/projects/thesis/pieNeRF/data/manifest.csv \
   --patient-id phantom_01 \
   --manifest-id-column patient_id

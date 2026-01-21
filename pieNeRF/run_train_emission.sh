@@ -29,7 +29,7 @@ echo "🏋️ Running train_emission.py..."
 srun python -u train_emission.py \
   --config configs/spect.yaml \
   --max-steps 2000 \
-  --rays-per-step 16384 \
+  --rays-per-step 4096 \
   --log-every 10 \
   --preview-every 100 \
   --save-every 100 \
@@ -37,14 +37,14 @@ srun python -u train_emission.py \
   --log-proj-metrics-physical \
   --bg-weight 1.0 \
   --weight-threshold 0.0 \
-  --act-loss-weight 0.01 \
+  --act-loss-weight 0.02 \
   --act-samples 16384 \
   --act-pos-weight 3.0 \
-  --ct-loss-weight 0.02 \
+  --ct-loss-weight 0.005 \
   --ct-threshold 0.02 \
   --ct-samples 8192 \
   --z-reg-weight 0 \
-  --tv-weight 0.0002 \
+  --tv-weight 0.0005 \
   --ray-tv-weight 1e-5 \
   --ray-tv-edge-aware False \
   --bg-depth-mass-weight 5e-4 \
