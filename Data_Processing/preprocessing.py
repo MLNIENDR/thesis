@@ -421,9 +421,7 @@ def _process_view_phys(act_data: np.ndarray, atn_data: np.ndarray,
 
     # (4) z-Summation
     proj2d = np.sum(vol_coll, axis=2)
-    print("[DBG] proj2d pre-step_len stats:", _stats(proj2d))
-    proj2d = proj2d * step_len
-    print("[DBG] proj2d post-step_len stats:", _stats(proj2d))
+    print("[DBG] proj2d stats:", _stats(proj2d))
     return proj2d
 
 
@@ -586,13 +584,6 @@ def parse_args():
     p.add_argument("--projector_scale_rawsum_per_mbq", type=float, default=None,
                    help="Projektor-Rohsumme pro MBq (optional, z.B. aus calibration_calculate_S.py)")
 
-    # Poisson-Rauschen
-    p.add_argument("--poisson_max_counts", type=float, default=3000.0,
-                   help="Ziel-Maximum (Perzentil-basiert) der simulierten Counts in den Projektionen. "
-                        "Wenn <=0, kein Poisson-Rauschen.")
-    p.add_argument("--poisson_ref_percentile", type=float, default=99.5,
-                   help="Perzentil der rohen Projektionen, das auf poisson_max_counts gemappt wird.")
-
     # Manifest-Update (optional)
     p.add_argument("--manifest", type=Path, default=None,
                    help="Optional: Pfad zu manifest.csv, um proj_scale_joint_p99 zu speichern.")
@@ -747,7 +738,8 @@ def main():
     # Convert raw projection to MBq-equivalent and then to counts
     # Projektor-Scale: ap_raw/pa_raw sind projektor-interne Einheiten
     if args.projector_scale_rawsum_per_mbq is not None:
-        # raw -> MBq-aequivalent (Kalibrierung)
+        # raw -> MBq-equivalent (modellinterne Skalierung)
+        # projector_scale_rawsum_per_mbq = projector_rawsum_per_MBq (keine cps!)
         ap_mbq = ap_raw / float(args.projector_scale_rawsum_per_mbq)
         pa_mbq = pa_raw / float(args.projector_scale_rawsum_per_mbq)
     else:

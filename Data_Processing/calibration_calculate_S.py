@@ -6,8 +6,9 @@ calibration_calculate_S.py
 Kurzueberblick:
 Erzeugt ein einfaches Aktivitaets-Phantom mit bekannter Gesamtaktivitaet,
 projiziert es mit dem Forward-Projektor und berechnet daraus S_eff (cps/MBq).
-S_eff ist die Umrechnung von MBq zu erwarteten Counts pro Sekunde fuer das
-aktuelle Projektor-Setup (Kernel/Scatter/Attenuation/Geometrie).
+ap_raw/pa_raw sind modellinterne Projektor-Einheiten (keine cps!).
+Dieses Skript bestimmt einen Skalierungsfaktor "projector_rawsum_per_MBq"
+für das aktuelle Forward-Projektor-Setup (Kernel/Scatter/Attenuation/Geometrie).
 
 
 python3 calibration_calculate_S.py \
@@ -42,7 +43,7 @@ Z0_SLICES_DEFAULT = 29
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Berechne S_eff (cps/MBq) fuer den aktuellen Forward-Projektor."
+        description="Berechne projector_rawsum_per_MBq fuer den aktuellen Forward-Projektor."
     )
     p.add_argument("--shape", type=str, default="256,256,651",
                    help="Volumen-Shape als 'x,y,z' (default: 256,256,651)")
@@ -229,17 +230,16 @@ def main():
     print(f"sum(ap_raw) = {float(ap_raw.sum()):.6e}")
     print(f"sum(pa_raw) = {float(pa_raw.sum()):.6e}")
 
+    # projector_rawsum_per_MBq: modellinterne Projektor-Summe pro MBq Gesamtaktivität
     if args.view in ("AP", "both"):
-        cps_raw_ap = float(ap_raw.sum())
-        s_eff_ap = cps_raw_ap / float(args.A_total_MBq)
-        print(f"S_eff_AP (cps/MBq) = {s_eff_ap:.6e}")
+        rawsum_per_mbq_ap = float(ap_raw.sum()) / float(args.A_total_MBq)
+        print(f"projector_rawsum_per_MBq_AP = {rawsum_per_mbq_ap:.6e}")
     if args.view in ("PA", "both"):
-        cps_raw_pa = float(pa_raw.sum())
-        s_eff_pa = cps_raw_pa / float(args.A_total_MBq)
-        print(f"S_eff_PA (cps/MBq) = {s_eff_pa:.6e}")
+        rawsum_per_mbq_pa = float(pa_raw.sum()) / float(args.A_total_MBq)
+        print(f"projector_rawsum_per_MBq_PA = {rawsum_per_mbq_pa:.6e}")
     if args.view == "both":
-        s_eff_mean = 0.5 * (float(ap_raw.sum()) + float(pa_raw.sum())) / float(args.A_total_MBq)
-        print(f"S_eff_mean (cps/MBq) = {s_eff_mean:.6e}")
+        rawsum_per_mbq_mean = 0.5 * (float(ap_raw.sum()) + float(pa_raw.sum())) / float(args.A_total_MBq)
+        print(f"projector_rawsum_per_MBq_mean = {rawsum_per_mbq_mean:.6e}")
 
     # Optional: Rohprojektionen speichern (Debug/QA)
     if args.out_dir is not None:
