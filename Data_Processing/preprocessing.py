@@ -51,9 +51,9 @@ python3 preprocessing.py \
   --kernel_mat LEAP_Kernel.mat --kernel_var kernel_mat \
   --bin_order F \
   --activity_seed -1 \
-  --sensitivity_cps_per_mbq 32 \
+  --sensitivity_cps_per_mbq 65 \
   --acq_time_s 300 \
-  --projector_scale_rawsum_per_mbq 150000 \
+  --projector_scale_rawsum_per_mbq 4.095558e+04 \
   --manifest /home/mnguest12/projects/thesis/pieNeRF/data/manifest.csv \
   --patient-id phantom_01 \
   --manifest-id-column patient_id

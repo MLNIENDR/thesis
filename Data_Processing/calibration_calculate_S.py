@@ -16,10 +16,8 @@ python3 calibration_calculate_S.py \
   --shape 256,256,651 \
   --sd_mm 1.5 \
   --A_total_MBq 100 \
-  --phantom_type uniform_cylinder \
-  --radius_mm 100 \
-  --height_mm 200 \
-  --view both
+  --spect_att_npy /home/mnguest12/projects/thesis/Data_Processing/phantom_01/out/spect_att.npy
+
 
   
 """
@@ -37,7 +35,7 @@ try:
 except Exception:
     sio = None
 
-from preprocessing import gamma_camera_core
+from preprocessing import load_bin_xyz, convert_mu_units, gamma_camera_core
 
 Z0_SLICES_DEFAULT = 29
 
@@ -50,6 +48,15 @@ def parse_args():
                    help="Volumen-Shape als 'x,y,z' (default: 256,256,651)")
     p.add_argument("--sd_mm", type=float, default=1.5,
                    help="Voxelspacing in mm (isotrop angenommen)")
+    p.add_argument("--mu_bin", type=Path, default=None,
+                   help="Optionales µ-Volumen (BIN), gleiche Form wie shape")
+    p.add_argument("--mu_unit", type=str, choices=["per_mm", "per_cm"], default="per_mm",
+                   help="Einheit des µ-Volumens (1/mm oder 1/cm)")
+    p.add_argument("--mu_target_unit", type=str, choices=["per_mm", "per_cm"], default="per_cm",
+                   help="Ziel-Einheit fuer µ vor der Projektion")
+    p.add_argument("--spect_att_npy", type=Path, default=None,
+                   help="Optional: Pfad zu spect_att.npy (mu in 1/cm). "
+                        "Wenn gesetzt, wird die Phantom-Maske aus mu>0 erstellt.")
     p.add_argument("--kernel_mat", type=Path, required=True,
                    help="MATLAB-Datei mit LEAP-Kernel (enthaelt 3D-Array)")
     p.add_argument("--kernel_var", type=str, default="kernel_mat",
@@ -150,8 +157,11 @@ def main():
     args = parse_args()
     shape = _parse_shape(args.shape)
 
-    # Schrittweite entlang z (cm), konsistent mit der Projektionsrichtung
-    step_len = args.sd_mm / 10.0
+    # Schrittweite entlang z passend zur µ-Einheit
+    if args.mu_target_unit == "per_cm":
+        step_len = args.sd_mm / 10.0
+    else:
+        step_len = args.sd_mm
 
     # LEAP-Kernel laden
     if sio is None:
@@ -161,32 +171,54 @@ def main():
         raise KeyError(f"Variable '{args.kernel_var}' nicht in {args.kernel_mat} gefunden.")
     kernel_mat = kernel_md[args.kernel_var].astype(np.float32)
 
-    # Kein µ-Volumen: Kalibrierung ohne Abschwächung
-    mu_xyz = np.zeros(shape, dtype=np.float32)
+    # Optionales µ-Volumen fuer Attenuation (sonst 0 -> keine Dämpfung)
+    if args.spect_att_npy is not None:
+        mu_xyz = np.load(args.spect_att_npy).astype(np.float32)
+        if mu_xyz.shape != shape:
+            raise ValueError(f"spect_att_npy shape {mu_xyz.shape} passt nicht zu shape {shape}.")
+    elif args.mu_bin is not None:
+        mu_xyz = load_bin_xyz(args.mu_bin, args.shape, dtype="float32", order="F")
+        mu_xyz = convert_mu_units(mu_xyz, args.mu_unit, args.mu_target_unit)
+    else:
+        mu_xyz = np.zeros(shape, dtype=np.float32)
 
     # Aktivitaetsphantom in Bq/voxel
-    A_xyz_Bq = build_phantom_A_xyz_Bq(
-        shape=shape,
-        sd_mm=args.sd_mm,
-        phantom_type=args.phantom_type,
-        radius_mm=args.radius_mm,
-        height_mm=args.height_mm,
-        box_x_mm=args.box_x_mm,
-        box_y_mm=args.box_y_mm,
-        box_z_mm=args.box_z_mm,
-        A_total_MBq=args.A_total_MBq,
-    )
+    if args.spect_att_npy is not None:
+        # Maske direkt aus mu>0 (entspricht Phantom-Koerper)
+        mask = mu_xyz > 0.0
+        nvox = int(mask.sum())
+        if nvox <= 0:
+            raise ValueError("spect_att_npy Maske hat 0 Voxel (mu>0).")
+        total_Bq = float(args.A_total_MBq) * 1e6
+        bq_per_vox = total_Bq / float(nvox)
+        A_xyz_Bq = np.zeros(shape, dtype=np.float32)
+        A_xyz_Bq[mask] = bq_per_vox
+    else:
+        A_xyz_Bq = build_phantom_A_xyz_Bq(
+            shape=shape,
+            sd_mm=args.sd_mm,
+            phantom_type=args.phantom_type,
+            radius_mm=args.radius_mm,
+            height_mm=args.height_mm,
+            box_x_mm=args.box_x_mm,
+            box_y_mm=args.box_y_mm,
+            box_z_mm=args.box_z_mm,
+            A_total_MBq=args.A_total_MBq,
+        )
 
     # Forward-Projektion (AP/PA) im gleichen Modell wie preprocessing.py
     ap_raw, pa_raw = gamma_camera_core(
         act_data=A_xyz_Bq.astype(np.float32),
+        # Achtung: Hier wird entschieden, ob die Kalibrierung Attenuation enthaelt.
+        # Wenn mu_bin gesetzt ist, entspricht der Skalierungsfaktor dem *modellspezifischen*
+        # Verhalten inkl. Attenuation des Kalibrier-Phantoms.
         atn_data=mu_xyz.astype(np.float32),
         kernel_mat=kernel_mat,
         sigma=args.psf_sigma,
         z0_slices=Z0_SLICES_DEFAULT,
         step_len=step_len,
         comp_scatter=True,
-        atn_on=False,
+        atn_on=(args.mu_bin is not None or args.spect_att_npy is not None),
         coll_on=True,
     )
 
