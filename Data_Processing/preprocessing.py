@@ -3,6 +3,14 @@
 """
 preprocessing.py
 
+Kurzueberblick:
+Laedt SPECT/CT/Masken-BINs, baut Aktivitaetsvolumen, simuliert Gamma-Kamera-
+Projektionen und speichert Volumina/Projektionen als .npy plus meta_simple.json.
+Eingaben: µ-Volumina, Organmaske, LEAP-Kernel, Geometrie/Einheiten.
+Ausgaben: Volumina roh/norm und Projektionen roh/counts/norm (QA + NN-Input).
+Einheiten: act_xyz in kBq/mL, A_xyz_Bq in Bq/voxel, ap/pa in rel. Einheiten/Counts.
+Projektor-Kalibrierung: projector_scale_rawsum_per_mbq skaliert raw->MBq-aequivalent.
+
 Preprocessing-Schritt für XCAT-Phantome mit
 - physikalisch plausibler Aktivitätskonzentration (Lu-177-PSMA)
 - Gamma-Kamera-Forwardmodell (Scatter + Kollimator)
@@ -18,9 +26,14 @@ Erzeugt im out/-Ordner:
   spect_att.npy   — SPECT-Attenuation-Volumen (z.B. bei 208 keV), (x,y,z)
   ct_att.npy      — CT-Attenuation-Volumen (z.B. bei 80 keV), (x,y,z)
   act.npy         — Aktivitätskonzentration (kBq/mL), (x,y,z)
-  ap.npy          — AP-Projektion, RELATIVE Intensität (0..1 oder ähnlich)
-  pa.npy          — PA-Projektion, RELATIVE Intensität
-  meta_simple.json — Meta-Infos inkl. Normalisierungsfaktor
+  spect_att_norm.npy — SPECT-Attenuation-Volumen, robust normiert (p99.9)
+  ct_att_norm.npy    — CT-Attenuation-Volumen, robust normiert (p99.9)
+  act_norm.npy       — Aktivitätskonzentration, robust normiert (p99.9)
+  ap_counts.npy   — AP-Projektion als Counts (nach Poisson/Sensitivität)
+  pa_counts.npy   — PA-Projektion als Counts (nach Poisson/Sensitivität)
+  ap.npy          — AP-Projektion, robust normiert (joint p99.9, NN-Input)
+  pa.npy          — PA-Projektion, robust normiert (joint p99.9, NN-Input)
+  meta_simple.json — Meta-Infos inkl. Normalisierungsfaktoren
 
 Beispielaufruf:
 
@@ -38,10 +51,13 @@ python3 preprocessing.py \
   --kernel_mat LEAP_Kernel.mat --kernel_var kernel_mat \
   --bin_order F \
   --activity_seed -1 \
-  --poisson_max_counts 2000 --poisson_ref_percentile 99.5 \
+  --sensitivity_cps_per_mbq 32 \
+  --acq_time_s 300 \
+  --projector_scale_rawsum_per_mbq 150000 \
   --manifest /home/mnguest12/projects/thesis/pieNeRF/data/manifest.csv \
   --patient-id phantom_01 \
   --manifest-id-column patient_id
+
 
 """
 
@@ -171,6 +187,29 @@ def resolve_path(base: Path, src_dir: Path, p: Path) -> Path:
     raise FileNotFoundError(f"Datei nicht gefunden (weder in src noch in base): {p}")
 
 
+def normalize_volume_p999(x: np.ndarray) -> Tuple[np.ndarray, float, float]:
+    """Normiert ein Volumen via robustem p99.9-Scale über alle Voxels.
+
+    Inputs:
+      x: 3D-Volumen (µ oder Aktivitaet), beliebige Einheit.
+    Output:
+      x_norm: robust normiert, negativ geklippt.
+      scale: p99.9-Scale (Fallback auf 1.0 falls ungueltig).
+      p999: p99.9 von x_norm (QA-Check, typ. ~1).
+
+    Physik/Signal:
+      Getrennte Scales pro Modalitaet, damit µ- und Aktivitaetsbereiche
+      nicht vermischt werden; normierte Varianten sind fuer NN-Inputs.
+    """
+    x_clip = np.clip(x, 0, None)
+    scale = float(np.percentile(x_clip, 99.9))
+    if (not np.isfinite(scale)) or scale <= 0.0:
+        scale = 1.0
+    x_norm = np.clip(x_clip / scale, 0, None).astype(np.float32)
+    p999 = float(np.percentile(x_norm, 99.9))
+    return x_norm, scale, p999
+
+
 # -----------------
 # BIN-Loader
 # -----------------
@@ -178,9 +217,13 @@ def resolve_path(base: Path, src_dir: Path, p: Path) -> Path:
 def load_bin_xyz(path: Path, shape_str: str, dtype: str = "float32", order: str = "F") -> np.ndarray:
     """Liest ein rohes BIN-Volumen als (x,y,z).
 
-    shape_str: 'x,y,z', z.B. '256,256,651'
-    dtype:     Datentyp im Binärfile (z.B. float32, int16)
-    order:     'F' für MATLAB-(Fortran)-Order, 'C' für NumPy-Standard
+    Inputs:
+      path: Datei mit flachem Binär-Array.
+      shape_str: 'x,y,z', z.B. '256,256,651' (Geometrie in Voxeln).
+      dtype: Datentyp im Binärfile (z.B. float32, int16).
+      order: 'F' für MATLAB-(Fortran)-Order, 'C' für NumPy-Standard.
+    Output:
+      vol: (x,y,z) als float32, Einheiten bleiben unveraendert.
     """
     x, y, z = [int(s) for s in shape_str.split(",")]
     arr = np.fromfile(path, dtype=np.dtype(dtype))
@@ -200,12 +243,18 @@ def build_activity_from_mask(mask_xyz: np.ndarray,
                              rng_seed: int = 1234) -> Tuple[np.ndarray, Dict]:
     """Baut ein Aktivitätskonzentrationsvolumen aus einer Organ-Maske.
 
-    mask_xyz: Volumen mit Organ-IDs (gleiche Geometrie wie SPECT/CT), (x,y,z)
-    organ_ids_txt: Textdatei mit Zeilen der Form 'name = id'
+    Inputs:
+      mask_xyz: Volumen mit Organ-IDs (x,y,z), gleiche Geometrie wie SPECT/CT.
+      organ_ids_txt: Textdatei mit Zeilen der Form 'name = id'.
+      rng_seed: Seed fuer die organspezifischen Aktivitaetswerte.
 
     Rückgabe:
-      act_xyz: Aktivitätskonzentration (kBq/mL), gleiche Shape wie Maske
-      info:    Dictionary mit den zugewiesenen Werten pro Organ
+      act_xyz: Aktivitaetskonzentration (kBq/mL), gleiche Shape wie Maske.
+      info: Dictionary mit den zugewiesenen Werten pro Organ.
+
+    Physik/Modell:
+      Jedem Organ wird eine homogene Aktivitaet aus plausiblen
+      Lu-177-PSMA-Bereichen zugewiesen.
     """
     # 1) organ_ids.txt einlesen: name = id
     name_to_id: Dict[str, int] = {}
@@ -225,7 +274,6 @@ def build_activity_from_mask(mask_xyz: np.ndarray,
         raise FileNotFoundError(f"organ_ids.txt nicht gefunden: {organ_ids_txt}")
 
     # 2) Plausible Aktivitätskonzentrationen für Lu-177-PSMA (kBq/mL)
-    #    grobe Bereiche um einen 24–48h SPECT-Zeitpunkt.
     default_ranges_kBqml = {
         # Tumor/Prostata-Hotspot
         "prostate":     (2000.0, 6000.0),
@@ -265,7 +313,14 @@ def build_activity_from_mask(mask_xyz: np.ndarray,
 # -----------------
 
 def convert_mu_units(mu_xyz: np.ndarray, src_unit: str, tgt_unit: str) -> np.ndarray:
-    """µ-Einheiten umrechnen (1/mm <-> 1/cm)."""
+    """µ-Einheiten umrechnen (1/mm <-> 1/cm).
+
+    Inputs:
+      mu_xyz: Attenuationskoeffizienten-Volumen (x,y,z).
+      src_unit/tgt_unit: "per_mm" oder "per_cm".
+    Output:
+      µ-Volumen in Ziel-Einheit (float32).
+    """
     if src_unit == tgt_unit:
         return mu_xyz
     if src_unit == "per_mm" and tgt_unit == "per_cm":
@@ -295,8 +350,13 @@ def _process_view_phys(act_data: np.ndarray, atn_data: np.ndarray,
       (3) z-tiefenabhängige Kollimator-Faltung ab z0+1
       (4) Projektion: Summe über z
 
-    step_len: physikalische Schrittweite entlang der Projektionsrichtung
-              (gleiche Längeneinheit wie 1/µ, z.B. cm wenn µ in 1/cm).
+    Inputs:
+      act_data: Aktivitaet in Bq/voxel, Shape (x,y,z) der Sicht.
+      atn_data: µ in 1/cm, gleiche Shape wie act_data.
+      kernel_mat: PSF/Kernel (x,y,z) fuer Kollimatorfaltung.
+      sigma: Scatter-Gauss (Pixel).
+      z0_slices: Anzahl unverfilteter Slices vor PSF.
+      step_len: Schrittweite entlang Projektionsrichtung (cm oder mm).
 
     WICHTIG:
       - globaler Counts-Faktor wird hier nicht eingebaut (relative Einheiten)
@@ -305,24 +365,34 @@ def _process_view_phys(act_data: np.ndarray, atn_data: np.ndarray,
         raise RuntimeError("Für das Gamma-Kamera-Modell werden scipy.ndimage.gaussian_filter "
                            "und scipy.signal.{convolve2d,fftconvolve} benötigt.")
 
+    def _stats(arr: np.ndarray) -> str:
+        return (f"min={float(arr.min()):.4e}, max={float(arr.max()):.4e}, "
+                f"mean={float(arr.mean()):.4e}, sum={float(arr.sum()):.4e}")
+
+    print("[DBG] vol_in stats:", _stats(act_data))
+
     # (1) Scatter
     if comp_scatter:
         act_sc = np.empty_like(act_data, dtype=np.float32)
         for z in range(act_data.shape[2]):
             act_sc[:, :, z] = gaussian_filter(act_data[:, :, z],
                                               sigma=sigma, mode="nearest")
+        print("[DBG] after scatter (3D) stats:", _stats(act_sc))
     else:
         act_sc = act_data.astype(np.float32, copy=False)
 
-    # (2) Attenuation mit physikalischer Schrittweite
+    # (2) Attenuation: mu * step_len ist dimensionslos -> exponentielle Daempfung
     if atn_on:
-        # atn_data: µ (z.B. 1/cm), step_len: z-Schritt in gleicher Einheit (z.B. cm)
+        # atn_data: µ (1/cm), step_len: z-Schritt in gleicher Einheit (cm)
         mu_cum = np.cumsum(atn_data * step_len, axis=2)
         vol_atn = act_sc * np.exp(-mu_cum)
+        mid_z = vol_atn.shape[2] // 2
+        print("[DBG] after attenuation (mid slice) stats:", _stats(vol_atn[:, :, mid_z]))
+        print("[DBG] after attenuation (3D) stats:", _stats(vol_atn))
     else:
         vol_atn = act_sc
 
-    # (3) Kollimator-Faltung
+    # (3) Kollimator-Faltung (PSF), Normierung auf Summe=1 erhaelt Gesamtenergie
     if coll_on:
         Z = vol_atn.shape[2]
         vol_coll = np.zeros_like(vol_atn, dtype=np.float32)
@@ -333,13 +403,28 @@ def _process_view_phys(act_data: np.ndarray, atn_data: np.ndarray,
             else:
                 zz = min(z - z0_slices, kernel_mat.shape[2] - 1)
                 K = kernel_mat[:, :, zz]
+                k_sum = float(K.sum())
+                if k_sum > 0:
+                    K = K / k_sum
+                if z in (z0_slices, Z // 2):
+                    print("[DBG] kernel normalized sum (z=%d):" % z, float(K.sum()))
+                if z in (z0_slices, Z // 2, Z - 1):
+                    print("[DBG] kernel pre stats (z=%d): %s" % (z, _stats(vol_atn[:, :, z])))
+                    print("[DBG] kernel sum/min/max (z=%d): %s" %
+                          (z, f"{float(K.sum()):.4e}, {float(K.min()):.4e}, {float(K.max()):.4e}"))
                 vol_coll[:, :, z] = conv2(vol_atn[:, :, z], K,
                                           mode="same").astype(np.float32)
+                if z in (z0_slices, Z // 2, Z - 1):
+                    print("[DBG] kernel post stats (z=%d): %s" % (z, _stats(vol_coll[:, :, z])))
     else:
         vol_coll = vol_atn
 
     # (4) z-Summation
-    return np.sum(vol_coll, axis=2) * step_len
+    proj2d = np.sum(vol_coll, axis=2)
+    print("[DBG] proj2d pre-step_len stats:", _stats(proj2d))
+    proj2d = proj2d * step_len
+    print("[DBG] proj2d post-step_len stats:", _stats(proj2d))
+    return proj2d
 
 
 def gamma_camera_core(act_data: np.ndarray, atn_data: np.ndarray,
@@ -352,8 +437,19 @@ def gamma_camera_core(act_data: np.ndarray, atn_data: np.ndarray,
                       coll_on: bool = True) -> Tuple[np.ndarray, np.ndarray]:
     """Gamma-Kamera-Modell für AP/PA (wie in stratos.py).
 
-    Erwartet Volumina in Shape (nx,ny,nz) = (x,y,z).
-    Gibt AP/PA-Projektionen als 2D-Arrays zurück (relative Einheiten).
+    Inputs:
+      act_data: Aktivitaet in Bq/voxel, (x,y,z).
+      atn_data: µ in 1/cm (x,y,z).
+      kernel_mat: LEAP-PSF fuer Kollimator, (x,y,z).
+      sigma: Scatter-Gauss (Pixel).
+      z0_slices: Slice-Index, ab dem PSF greift.
+      step_len: physikalische Schrittweite entlang z.
+
+    Output:
+      proj_AP/proj_PA: 2D-Projektionen (relative Einheiten).
+
+    Physik/Modell:
+      Scatter (Gauss), Attenuation entlang z, Kollimator-PSF, Summe ueber z.
     """
     nx, ny, nz = act_data.shape
     assert atn_data.shape == (nx, ny, nz)
@@ -393,6 +489,15 @@ def normalize_projections(ap_raw: np.ndarray,
     Skala s = quantile_0.999(concat(AP, PA)) auf Arrays, die gespeichert werden sollen
     (post-noise, post-clipping falls angewandt).
     Guard: falls s <= 0 -> max(concat) -> 1.0.
+
+    Inputs:
+      ap_raw/pa_raw: Projektionen in Counts oder relativen Einheiten (2D).
+    Output:
+      ap_n/pa_n: robust normierte Projektionen (typisch ~[0..1]).
+      scale: gemeinsamer p99.9-Skalierungsfaktor.
+
+    Hinweis:
+      Joint-p99.9 erzwingt keine identischen p99.9 pro Sicht.
     """
     ap_raw = np.clip(ap_raw, 0.0, None)
     pa_raw = np.clip(pa_raw, 0.0, None)
@@ -474,6 +579,12 @@ def parse_args():
                    help="Sigma für den Scatter-Gauss (Pixel)")
     p.add_argument("--z0_slices", type=int, default=29,
                    help="Anzahl der 'ungefilterten' Schichten vor PSF-Faltung")
+    p.add_argument("--sensitivity_cps_per_mbq", type=float, default=6.0,
+                   help="System-Sensitivitaet (cps pro MBq) fuer absolute Counts")
+    p.add_argument("--acq_time_s", type=float, default=600.0,
+                   help="Akquisitionszeit in Sekunden fuer absolute Counts")
+    p.add_argument("--projector_scale_rawsum_per_mbq", type=float, default=None,
+                   help="Projektor-Rohsumme pro MBq (optional, z.B. aus calibration_calculate_S.py)")
 
     # Poisson-Rauschen
     p.add_argument("--poisson_max_counts", type=float, default=3000.0,
@@ -500,6 +611,7 @@ def parse_args():
 # -----------------
 
 def main():
+    # I/O and path setup
     args = parse_args()
     base = args.base.resolve()
     src_dir, out_dir = ensure_dirs(base)
@@ -528,6 +640,7 @@ def main():
     print(f"[INFO] organ_ids: {organ_ids_path}")
     print(f"[INFO] kernel:    {kernel_mat_path} (var='{args.kernel_var}')")
 
+    # Load volumes
     # Volumina laden (x,y,z)
     spect_xyz = load_bin_xyz(spect_bin_path, args.shape,
                              dtype=args.spect_dtype, order=args.bin_order)
@@ -541,6 +654,7 @@ def main():
 
     print(f"[SHAPE] Volumina: {spect_xyz.shape} (x,y,z)")
 
+    # Build activity (kBq/mL) -> A_xyz_Bq (Bq/voxel)
     # Seed wählen: fix oder aus Phantom-Namen abgeleitet
     if args.activity_seed < 0:
         h = hashlib.sha256(base.name.encode("utf-8")).hexdigest()
@@ -561,6 +675,7 @@ def main():
           f"min={act_xyz.min():.1f} kBq/mL, max={act_xyz.max():.1f} kBq/mL, "
           f"mean={act_xyz.mean():.1f} kBq/mL")
 
+    # Prepare attenuation (mu) and projector params
     # SPECT/CT-µ in Ziel-Einheit bringen (für Speicherung und Projektionen)
     spect_mu_xyz = convert_mu_units(spect_xyz, args.mu_unit, args.mu_target_unit)
     ct_mu_xyz = convert_mu_units(ct_xyz, args.mu_unit, args.mu_target_unit)
@@ -574,6 +689,24 @@ def main():
     print(f"[INFO] Gamma-Projektor: mu_unit_in={args.mu_unit} "
           f"-> mu_unit_out={args.mu_target_unit}, step_len={step_len:.4f}")
 
+    # Voxelvolumen: sd_mm -> cm -> mL (1 cm^3 = 1 mL)
+    voxel_cm = args.sd_mm / 10.0
+    V_voxel_ml = voxel_cm ** 3
+    # kBq/mL -> Bq/voxel (Volumenkonversion + kBq->Bq)
+    A_xyz_Bq = act_xyz * 1000.0 * V_voxel_ml
+    print(f"Voxel: sd_mm={float(args.sd_mm):.4f}, V_voxel_ml={float(V_voxel_ml):.6e}")
+    print("act_xyz kBq/ml: min/max/mean="
+          f"{float(act_xyz.min()):.4f}/"
+          f"{float(act_xyz.max()):.4f}/"
+          f"{float(act_xyz.mean()):.4f}, "
+          f"sum={float(act_xyz.sum()):.4e} (kBq/ml * voxels nur informativ)")
+    sum_Bq = float(A_xyz_Bq.sum())
+    print("A_xyz_Bq: min/max/mean="
+          f"{float(A_xyz_Bq.min()):.4f}/"
+          f"{float(A_xyz_Bq.max()):.4f}/"
+          f"{float(A_xyz_Bq.mean()):.4f}, "
+          f"sum_Bq={sum_Bq:.4e}, sum_MBq={sum_Bq / 1e6:.4e}")
+
     # Kernel laden
     if sio is None:
         raise RuntimeError("scipy.io (sio) wird für das Laden des LEAP-Kernels benötigt.")
@@ -582,9 +715,10 @@ def main():
         raise KeyError(f"Variable '{args.kernel_var}' nicht in {kernel_mat_path} gefunden.")
     kernel_mat = kernel_md[args.kernel_var].astype(np.float32)
 
+    # Forward projection (AP/PA)
     # Gamma-Kamera-Projektionen simulieren (AP/PA), relative Einheiten
     ap_raw, pa_raw = gamma_camera_core(
-        act_data=act_xyz.astype(np.float32),
+        act_data=A_xyz_Bq.astype(np.float32),
         atn_data=spect_mu_xyz.astype(np.float32),
         kernel_mat=kernel_mat,
         sigma=args.psf_sigma,
@@ -597,48 +731,78 @@ def main():
 
     print("[RANGE] AP raw:", ap_raw.min(), ap_raw.max(),
           "PA raw:", pa_raw.min(), pa_raw.max())
+    print("ap_raw: min/max/mean="
+          f"{float(ap_raw.min()):.4f}/"
+          f"{float(ap_raw.max()):.4f}/"
+          f"{float(ap_raw.mean()):.4f}, "
+          f"sum={float(ap_raw.sum()):.4e}")
+    print("pa_raw: min/max/mean="
+          f"{float(pa_raw.min()):.4f}/"
+          f"{float(pa_raw.max()):.4f}/"
+          f"{float(pa_raw.mean()):.4f}, "
+          f"sum={float(pa_raw.sum()):.4e}")
+    print("ratio sum ap/pa =",
+          float(ap_raw.sum()) / (float(pa_raw.sum()) + 1e-12))
 
-    # ---------------------------------------------------------
-    # Poisson-Rauschen (szintigraphie-gemäß)
-    # ---------------------------------------------------------
+    # Convert raw projection to MBq-equivalent and then to counts
+    # Projektor-Scale: ap_raw/pa_raw sind projektor-interne Einheiten
+    if args.projector_scale_rawsum_per_mbq is not None:
+        # raw -> MBq-aequivalent (Kalibrierung)
+        ap_mbq = ap_raw / float(args.projector_scale_rawsum_per_mbq)
+        pa_mbq = pa_raw / float(args.projector_scale_rawsum_per_mbq)
+    else:
+        # Ohne Kalibrierung bleiben relative Einheiten erhalten
+        ap_mbq = ap_raw
+        pa_mbq = pa_raw
+    print("sum(ap_mbq)=", float(ap_mbq.sum()), "sum(pa_mbq)=", float(pa_mbq.sum()))
+    # MBq-aequivalent -> erwartete Counts ueber Sensitivitaet und Akquisitionszeit
+    ap_lam = np.clip(ap_mbq, 0.0, None) * float(args.sensitivity_cps_per_mbq) * float(args.acq_time_s)
+    pa_lam = np.clip(pa_mbq, 0.0, None) * float(args.sensitivity_cps_per_mbq) * float(args.acq_time_s)
+    print("ap_lam: min/max/mean="
+          f"{float(ap_lam.min()):.4f}/"
+          f"{float(ap_lam.max()):.4f}/"
+          f"{float(ap_lam.mean()):.4f}, "
+          f"sum={float(ap_lam.sum()):.4e}  (expected total counts)")
+    print("pa_lam: min/max/mean="
+          f"{float(pa_lam.min()):.4f}/"
+          f"{float(pa_lam.max()):.4f}/"
+          f"{float(pa_lam.mean()):.4f}, "
+          f"sum={float(pa_lam.sum()):.4e}")
+
+    # Poisson sampling
+    # Poisson-Rauschen mit Lambda = erwartete Counts pro Pixel
     if args.poisson_max_counts > 0:
-        stacked_raw = np.concatenate([ap_raw.ravel(), pa_raw.ravel()])
-        ref_int = np.percentile(stacked_raw, args.poisson_ref_percentile)
-        if ref_int <= 0:
-            ref_int = stacked_raw.max()
-        if ref_int <= 0:
-            ref_int = 1.0
-
-        scale_to_counts = args.poisson_max_counts / ref_int
-
-        lam_ap = np.clip(ap_raw * scale_to_counts, 0.0, None)
-        lam_pa = np.clip(pa_raw * scale_to_counts, 0.0, None)
-
         rng_poiss = np.random.default_rng(rng_seed + 1)
-        ap_counts = rng_poiss.poisson(lam_ap).astype(np.float32)
-        pa_counts = rng_poiss.poisson(lam_pa).astype(np.float32)
-
-        print("[POISSON] ref_int (Perzentil "
-              f"{args.poisson_ref_percentile}) = {ref_int:.4e}")
-        print(f"[POISSON] scale_to_counts = {scale_to_counts:.4e}")
-        print("[POISSON] AP counts: min/max/mean = "
-              f"{ap_counts.min():.1f} / {ap_counts.max():.1f} / {ap_counts.mean():.1f}")
-        print("[POISSON] PA counts: min/max/mean = "
-              f"{pa_counts.min():.1f} / {pa_counts.max():.1f} / {pa_counts.mean():.1f}")
-
-        ap_for_norm = ap_counts
-        pa_for_norm = pa_counts
+        ap_counts = rng_poiss.poisson(ap_lam).astype(np.float32)
+        pa_counts = rng_poiss.poisson(pa_lam).astype(np.float32)
     else:
         print("[POISSON] Kein Poisson-Rauschen (poisson_max_counts <= 0).")
-        ap_for_norm = ap_raw
-        pa_for_norm = pa_raw
+        ap_counts = ap_lam.astype(np.float32)
+        pa_counts = pa_lam.astype(np.float32)
 
+    print("[COUNTS] AP counts: sum/min/max/mean = "
+          f"{ap_counts.sum():.4e} / {ap_counts.min():.1f} / {ap_counts.max():.1f} / {ap_counts.mean():.1f}")
+    print("[COUNTS] PA counts: sum/min/max/mean = "
+          f"{pa_counts.sum():.4e} / {pa_counts.min():.1f} / {pa_counts.max():.1f} / {pa_counts.mean():.1f}")
+    print("ap_counts: min/max/mean="
+          f"{float(ap_counts.min()):.4f}/"
+          f"{float(ap_counts.max()):.4f}/"
+          f"{float(ap_counts.mean()):.4f}, "
+          f"sum={float(ap_counts.sum()):.4e}")
+    print("pa_counts: min/max/mean="
+          f"{float(pa_counts.min()):.4f}/"
+          f"{float(pa_counts.max()):.4f}/"
+          f"{float(pa_counts.mean()):.4f}, "
+          f"sum={float(pa_counts.sum()):.4e}")
+
+    # Normalize projections for NN input
     # AP/PA robust normalisieren (rein relative Intensität)
     ap_norm, pa_norm, scale_auto = normalize_projections(
-        ap_raw=ap_for_norm,
-        pa_raw=pa_for_norm,
+        ap_raw=ap_counts,
+        pa_raw=pa_counts,
     )
 
+    # QA-Check: p99.9 nach joint-Scaling muss nicht exakt gleich fuer AP/PA sein
     ap_p999 = float(np.quantile(ap_norm.ravel(), 0.999)) if ap_norm.size > 0 else float("nan")
     pa_p999 = float(np.quantile(pa_norm.ravel(), 0.999)) if pa_norm.size > 0 else float("nan")
     print("[RANGE] AP norm:", ap_norm.min(), ap_norm.max(),
@@ -648,8 +812,8 @@ def main():
     tol = 0.10
     if (abs(ap_p999 - 1.0) > tol) or (abs(pa_p999 - 1.0) > tol) or (abs(ap_p999 - pa_p999) > tol):
         print(
-            "[WARN] p99.9(AP_norm) und p99.9(PA_norm) sind nicht konsistent "
-            f"(tol={tol:.2f}). Erwartet ~1.0 fuer beide bei joint p99.9.",
+            "[INFO] p99.9(AP_norm) und p99.9(PA_norm) sind nicht konsistent "
+            f"(tol={tol:.2f}). Unterschiede zwischen AP und PA sind bei joint p99.9 moeglich.",
             flush=True,
         )
 
@@ -669,10 +833,24 @@ def main():
         ap_out = np.rot90(ap_out, k=1)
         pa_out = np.rot90(pa_out, k=1)
 
+    # Normalize 3D volumes (separate scales per modality)
+    spect_norm, spect_scale_p999, spect_norm_p999 = normalize_volume_p999(spect_mu_xyz)
+    print(f"[INFO] spect_scale_p99.9={spect_scale_p999:.6e}")
+    ct_norm, ct_scale_p999, ct_norm_p999 = normalize_volume_p999(ct_mu_xyz)
+    print(f"[INFO] ct_scale_p99.9={ct_scale_p999:.6e}")
+    act_norm, act_scale_p999, act_norm_p999 = normalize_volume_p999(act_xyz)
+    print(f"[INFO] act_scale_p99.9={act_scale_p999:.6e}")
+
+    # Save outputs and metadata
     # Speichern als .npy im out-Ordner
     np.save(out_dir / "spect_att.npy", spect_mu_xyz.astype(np.float32))
     np.save(out_dir / "ct_att.npy",    ct_mu_xyz.astype(np.float32))
     np.save(out_dir / "act.npy",       act_xyz.astype(np.float32))
+    np.save(out_dir / "spect_att_norm.npy", spect_norm)
+    np.save(out_dir / "ct_att_norm.npy",    ct_norm)
+    np.save(out_dir / "act_norm.npy",       act_norm)
+    np.save(out_dir / "ap_counts.npy", ap_counts.astype(np.float32))
+    np.save(out_dir / "pa_counts.npy", pa_counts.astype(np.float32))
     np.save(out_dir / "ap.npy",        ap_out.astype(np.float32))
     np.save(out_dir / "pa.npy",        pa_out.astype(np.float32))
 
@@ -686,6 +864,8 @@ def main():
     save_png(ap_out, orientation_dir / "ap.png")
     save_png(pa_out, orientation_dir / "pa.png")
 
+    # Meta-Info: Summen/Skalen fuer QA, Reproduzierbarkeit und Kalibrier-Tracking.
+    # Raw-Outputs sind physikalisch interpretierbar; norm-Outputs fuer NN-Input.
     # Meta-Info
     meta = {
         "shape_xyz": list(map(int, spect_xyz.shape)),
@@ -702,7 +882,34 @@ def main():
         "step_len": float(step_len),
         "kernel_mat": str(kernel_mat_path),
         "kernel_var": args.kernel_var,
+        "sensitivity_cps_per_mbq": float(args.sensitivity_cps_per_mbq),
+        "acq_time_s": float(args.acq_time_s),
+        "V_voxel_ml": float(V_voxel_ml),
+        "projector_scale_rawsum_per_mbq": (
+            None if args.projector_scale_rawsum_per_mbq is None
+            else float(args.projector_scale_rawsum_per_mbq)
+        ),
+        "sum_activity_Bq": float(A_xyz_Bq.sum()),
+        "sum_activity_MBq": float(A_xyz_Bq.sum() / 1e6),
+        "sum_ap_raw": float(ap_raw.sum()),
+        "sum_pa_raw": float(pa_raw.sum()),
+        "sum_ap_mbq": float(ap_mbq.sum()),
+        "sum_pa_mbq": float(pa_mbq.sum()),
+        "sum_ap_expected_counts": float(ap_lam.sum()),
+        "sum_pa_expected_counts": float(pa_lam.sum()),
+        "sum_ap_counts": float(ap_counts.sum()),
+        "sum_pa_counts": float(pa_counts.sum()),
+        "max_ap_counts": float(ap_counts.max()),
+        "max_pa_counts": float(pa_counts.max()),
+        "mean_ap_counts": float(ap_counts.mean()),
+        "mean_pa_counts": float(pa_counts.mean()),
         "proj_scale_joint_p99": float(scale_auto),
+        "spect_scale_p99_9": float(spect_scale_p999),
+        "ct_scale_p99_9": float(ct_scale_p999),
+        "act_scale_p99_9": float(act_scale_p999),
+        "spect_norm_p99_9": float(spect_norm_p999),
+        "ct_norm_p99_9": float(ct_norm_p999),
+        "act_norm_p99_9": float(act_norm_p999),
         "projection_norm_stats": {
             "ap_raw_min": float(ap_raw.min()),
             "ap_raw_max": float(ap_raw.max()),
@@ -714,8 +921,6 @@ def main():
             "pa_norm_min": float(pa_norm.min()),
             "pa_norm_max": float(pa_norm.max()),
             "pa_norm_p99_9": float(pa_p999),
-            "poisson_max_counts": float(args.poisson_max_counts),
-            "poisson_ref_percentile": float(args.poisson_ref_percentile),
         },
     }
     with open(out_dir / "meta_simple.json", "w") as f:
