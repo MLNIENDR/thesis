@@ -8,14 +8,13 @@ Laedt SPECT/CT/Masken-BINs, baut Aktivitaetsvolumen, simuliert Gamma-Kamera-
 Projektionen und speichert Volumina/Projektionen als .npy plus meta_simple.json.
 Eingaben: µ-Volumina, Organmaske, LEAP-Kernel, Geometrie/Einheiten.
 Ausgaben: Volumina roh/norm und Projektionen roh/counts/norm (QA + NN-Input).
-Einheiten: act_xyz in kBq/mL, A_xyz_Bq in Bq/voxel, ap/pa in rel. Einheiten/Counts.
-Projektor-Kalibrierung: projector_scale_rawsum_per_mbq skaliert raw->MBq-aequivalent.
+Einheiten: act_xyz in kBq/mL, A_xyz_MBq in MBq/voxel, ap/pa in MBq-aequiv./Counts.
 
 Preprocessing-Schritt für XCAT-Phantome mit
 - physikalisch plausibler Aktivitätskonzentration (Lu-177-PSMA)
 - Gamma-Kamera-Forwardmodell (Scatter + Kollimator)
-- optionaler Poisson-Rauschsimulation in den Projektionen
-- rein RELATIVE Projektionen (AP/PA), global normalisiert
+- keine Rauschsimulation in den Projektionen
+- MBq-aequivalente Projektionen (AP/PA), global normalisiert
 
 Erwartete Ordnerstruktur:
   <base>/
@@ -29,8 +28,8 @@ Erzeugt im out/-Ordner:
   spect_att_norm.npy — SPECT-Attenuation-Volumen, robust normiert (p99.9)
   ct_att_norm.npy    — CT-Attenuation-Volumen, robust normiert (p99.9)
   act_norm.npy       — Aktivitätskonzentration, robust normiert (p99.9)
-  ap_counts.npy   — AP-Projektion als Counts (nach Poisson/Sensitivität)
-  pa_counts.npy   — PA-Projektion als Counts (nach Poisson/Sensitivität)
+  ap_counts.npy   — AP-Projektion als Counts (nach Sensitivität)
+  pa_counts.npy   — PA-Projektion als Counts (nach Sensitivität)
   ap.npy          — AP-Projektion, robust normiert (joint p99.9, NN-Input)
   pa.npy          — PA-Projektion, robust normiert (joint p99.9, NN-Input)
   meta_simple.json — Meta-Infos inkl. Normalisierungsfaktoren
@@ -53,7 +52,6 @@ python3 preprocessing.py \
   --activity_seed -1 \
   --sensitivity_cps_per_mbq 65 \
   --acq_time_s 300 \
-  --projector_scale_rawsum_per_mbq 4.095558e+04 \
   --manifest /home/mnguest12/projects/thesis/pieNeRF/data/manifest.csv \
   --patient-id phantom_01 \
   --manifest-id-column patient_id
@@ -351,7 +349,7 @@ def _process_view_phys(act_data: np.ndarray, atn_data: np.ndarray,
       (4) Projektion: Summe über z
 
     Inputs:
-      act_data: Aktivitaet in Bq/voxel, Shape (x,y,z) der Sicht.
+      act_data: Aktivitaet in MBq/voxel, Shape (x,y,z) der Sicht.
       atn_data: µ in 1/cm, gleiche Shape wie act_data.
       kernel_mat: PSF/Kernel (x,y,z) fuer Kollimatorfaltung.
       sigma: Scatter-Gauss (Pixel).
@@ -359,7 +357,7 @@ def _process_view_phys(act_data: np.ndarray, atn_data: np.ndarray,
       step_len: Schrittweite entlang Projektionsrichtung (cm oder mm).
 
     WICHTIG:
-      - globaler Counts-Faktor wird hier nicht eingebaut (relative Einheiten)
+      - globaler Counts-Faktor wird hier nicht eingebaut (MBq-aequivalent)
     """
     if gaussian_filter is None or convolve2d is None or fftconvolve is None:
         raise RuntimeError("Für das Gamma-Kamera-Modell werden scipy.ndimage.gaussian_filter "
@@ -436,7 +434,7 @@ def gamma_camera_core(act_data: np.ndarray, atn_data: np.ndarray,
     """Gamma-Kamera-Modell für AP/PA (wie in stratos.py).
 
     Inputs:
-      act_data: Aktivitaet in Bq/voxel, (x,y,z).
+      act_data: Aktivitaet in MBq/voxel, (x,y,z).
       atn_data: µ in 1/cm (x,y,z).
       kernel_mat: LEAP-PSF fuer Kollimator, (x,y,z).
       sigma: Scatter-Gauss (Pixel).
@@ -444,7 +442,7 @@ def gamma_camera_core(act_data: np.ndarray, atn_data: np.ndarray,
       step_len: physikalische Schrittweite entlang z.
 
     Output:
-      proj_AP/proj_PA: 2D-Projektionen (relative Einheiten).
+      proj_AP/proj_PA: 2D-Projektionen (MBq-aequivalent).
 
     Physik/Modell:
       Scatter (Gauss), Attenuation entlang z, Kollimator-PSF, Summe ueber z.
@@ -477,7 +475,7 @@ def gamma_camera_core(act_data: np.ndarray, atn_data: np.ndarray,
 
 
 # -----------------
-# Projektionen normieren (rein relativ)
+# Projektionen normieren (rein skaliert)
 # -----------------
 
 def normalize_projections(ap_raw: np.ndarray,
@@ -489,7 +487,7 @@ def normalize_projections(ap_raw: np.ndarray,
     Guard: falls s <= 0 -> max(concat) -> 1.0.
 
     Inputs:
-      ap_raw/pa_raw: Projektionen in Counts oder relativen Einheiten (2D).
+      ap_raw/pa_raw: Projektionen in Counts oder MBq-aequivalent (2D).
     Output:
       ap_n/pa_n: robust normierte Projektionen (typisch ~[0..1]).
       scale: gemeinsamer p99.9-Skalierungsfaktor.
@@ -522,7 +520,7 @@ def normalize_projections(ap_raw: np.ndarray,
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Converter: BIN -> spect_att.npy, ct_att.npy, act.npy (kBq/mL), ap.npy, pa.npy (relative, normalisiert)"
+        description="Converter: BIN -> spect_att.npy, ct_att.npy, act.npy (kBq/mL), ap.npy, pa.npy (normalisiert)"
     )
     p.add_argument("--base", type=Path, required=True,
                    help="Basisordner des Phantoms (z.B. /pfad/zu/phantom_01)")
@@ -581,8 +579,6 @@ def parse_args():
                    help="System-Sensitivitaet (cps pro MBq) fuer absolute Counts")
     p.add_argument("--acq_time_s", type=float, default=600.0,
                    help="Akquisitionszeit in Sekunden fuer absolute Counts")
-    p.add_argument("--projector_scale_rawsum_per_mbq", type=float, default=None,
-                   help="Projektor-Rohsumme pro MBq (optional, z.B. aus calibration_calculate_S.py)")
 
     # Manifest-Update (optional)
     p.add_argument("--manifest", type=Path, default=None,
@@ -645,7 +641,7 @@ def main():
 
     print(f"[SHAPE] Volumina: {spect_xyz.shape} (x,y,z)")
 
-    # Build activity (kBq/mL) -> A_xyz_Bq (Bq/voxel)
+    # Build activity (kBq/mL) -> A_xyz_MBq (MBq/voxel)
     # Seed wählen: fix oder aus Phantom-Namen abgeleitet
     if args.activity_seed < 0:
         h = hashlib.sha256(base.name.encode("utf-8")).hexdigest()
@@ -683,20 +679,20 @@ def main():
     # Voxelvolumen: sd_mm -> cm -> mL (1 cm^3 = 1 mL)
     voxel_cm = args.sd_mm / 10.0
     V_voxel_ml = voxel_cm ** 3
-    # kBq/mL -> Bq/voxel (Volumenkonversion + kBq->Bq)
-    A_xyz_Bq = act_xyz * 1000.0 * V_voxel_ml
+    # kBq/mL -> MBq/voxel (Volumenkonversion + kBq->MBq)
+    A_xyz_MBq = act_xyz * 1e-3 * V_voxel_ml
     print(f"Voxel: sd_mm={float(args.sd_mm):.4f}, V_voxel_ml={float(V_voxel_ml):.6e}")
     print("act_xyz kBq/ml: min/max/mean="
           f"{float(act_xyz.min()):.4f}/"
           f"{float(act_xyz.max()):.4f}/"
           f"{float(act_xyz.mean()):.4f}, "
           f"sum={float(act_xyz.sum()):.4e} (kBq/ml * voxels nur informativ)")
-    sum_Bq = float(A_xyz_Bq.sum())
-    print("A_xyz_Bq: min/max/mean="
-          f"{float(A_xyz_Bq.min()):.4f}/"
-          f"{float(A_xyz_Bq.max()):.4f}/"
-          f"{float(A_xyz_Bq.mean()):.4f}, "
-          f"sum_Bq={sum_Bq:.4e}, sum_MBq={sum_Bq / 1e6:.4e}")
+    sum_MBq = float(A_xyz_MBq.sum())
+    print("A_xyz_MBq: min/max/mean="
+          f"{float(A_xyz_MBq.min()):.4f}/"
+          f"{float(A_xyz_MBq.max()):.4f}/"
+          f"{float(A_xyz_MBq.mean()):.4f}, "
+          f"sum_MBq={sum_MBq:.4e}, sum_Bq={sum_MBq * 1e6:.4e}")
 
     # Kernel laden
     if sio is None:
@@ -707,9 +703,9 @@ def main():
     kernel_mat = kernel_md[args.kernel_var].astype(np.float32)
 
     # Forward projection (AP/PA)
-    # Gamma-Kamera-Projektionen simulieren (AP/PA), relative Einheiten
+    # Gamma-Kamera-Projektionen simulieren (AP/PA), MBq-aequivalent
     ap_raw, pa_raw = gamma_camera_core(
-        act_data=A_xyz_Bq.astype(np.float32),
+        act_data=A_xyz_MBq.astype(np.float32),
         atn_data=spect_mu_xyz.astype(np.float32),
         kernel_mat=kernel_mat,
         sigma=args.psf_sigma,
@@ -736,17 +732,8 @@ def main():
           float(ap_raw.sum()) / (float(pa_raw.sum()) + 1e-12))
 
     # Convert raw projection to MBq-equivalent and then to counts
-    # Projektor-Scale: ap_raw/pa_raw sind projektor-interne Einheiten
-    if args.projector_scale_rawsum_per_mbq is not None:
-        # raw -> MBq-equivalent (modellinterne Skalierung)
-        # projector_scale_rawsum_per_mbq = projector_rawsum_per_MBq (keine cps!)
-        ap_mbq = ap_raw / float(args.projector_scale_rawsum_per_mbq)
-        pa_mbq = pa_raw / float(args.projector_scale_rawsum_per_mbq)
-    else:
-        # Ohne Kalibrierung bleiben relative Einheiten erhalten
-        ap_mbq = ap_raw
-        pa_mbq = pa_raw
-    print("sum(ap_mbq)=", float(ap_mbq.sum()), "sum(pa_mbq)=", float(pa_mbq.sum()))
+    ap_mbq = ap_raw
+    pa_mbq = pa_raw
     # MBq-aequivalent -> erwartete Counts ueber Sensitivitaet und Akquisitionszeit
     ap_lam = np.clip(ap_mbq, 0.0, None) * float(args.sensitivity_cps_per_mbq) * float(args.acq_time_s)
     pa_lam = np.clip(pa_mbq, 0.0, None) * float(args.sensitivity_cps_per_mbq) * float(args.acq_time_s)
@@ -761,16 +748,9 @@ def main():
           f"{float(pa_lam.mean()):.4f}, "
           f"sum={float(pa_lam.sum()):.4e}")
 
-    # Poisson sampling
-    # Poisson-Rauschen mit Lambda = erwartete Counts pro Pixel
-    if args.poisson_max_counts > 0:
-        rng_poiss = np.random.default_rng(rng_seed + 1)
-        ap_counts = rng_poiss.poisson(ap_lam).astype(np.float32)
-        pa_counts = rng_poiss.poisson(pa_lam).astype(np.float32)
-    else:
-        print("[POISSON] Kein Poisson-Rauschen (poisson_max_counts <= 0).")
-        ap_counts = ap_lam.astype(np.float32)
-        pa_counts = pa_lam.astype(np.float32)
+    # Counts = erwartete Counts pro Pixel
+    ap_counts = ap_lam.astype(np.float32)
+    pa_counts = pa_lam.astype(np.float32)
 
     print("[COUNTS] AP counts: sum/min/max/mean = "
           f"{ap_counts.sum():.4e} / {ap_counts.min():.1f} / {ap_counts.max():.1f} / {ap_counts.mean():.1f}")
@@ -788,7 +768,7 @@ def main():
           f"sum={float(pa_counts.sum()):.4e}")
 
     # Normalize projections for NN input
-    # AP/PA robust normalisieren (rein relative Intensität)
+    # AP/PA robust normalisieren (rein skaliert, MBq-aequivalent/Counts)
     ap_norm, pa_norm, scale_auto = normalize_projections(
         ap_raw=ap_counts,
         pa_raw=pa_counts,
@@ -877,12 +857,8 @@ def main():
         "sensitivity_cps_per_mbq": float(args.sensitivity_cps_per_mbq),
         "acq_time_s": float(args.acq_time_s),
         "V_voxel_ml": float(V_voxel_ml),
-        "projector_scale_rawsum_per_mbq": (
-            None if args.projector_scale_rawsum_per_mbq is None
-            else float(args.projector_scale_rawsum_per_mbq)
-        ),
-        "sum_activity_Bq": float(A_xyz_Bq.sum()),
-        "sum_activity_MBq": float(A_xyz_Bq.sum() / 1e6),
+        "sum_activity_MBq": float(A_xyz_MBq.sum()),
+        "sum_activity_Bq": float(A_xyz_MBq.sum() * 1e6),
         "sum_ap_raw": float(ap_raw.sum()),
         "sum_pa_raw": float(pa_raw.sum()),
         "sum_ap_mbq": float(ap_mbq.sum()),
