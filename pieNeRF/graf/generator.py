@@ -347,7 +347,7 @@ class Generator(object):
 
         return proj_flat, disp_flat, acc_flat, extras
 
-    def build_ct_context(self, ct_volume, padding_mode: str = "border"):
+    def build_ct_context(self, ct_volume, padding_mode: str = "border", voxel_size_mm: float = 1.5, mu_scale_p99_9: float = 1.0):
         """
         Bereitet ein CT-Volumen für das Attenuation-Rendering vor.
         Annahme: Das Volumen ist zentriert und teilt sich den Bounding Cube [-radius, radius]^3 mit dem NeRF.
@@ -366,8 +366,10 @@ class Generator(object):
             vol = vol.unsqueeze(0)
         if vol.dim() != 5:
             raise ValueError(f"Expected CT data with D/H/W axes, got shape {tuple(ct_volume.shape)}")
+        if vol.shape[1] != 1:
+            raise ValueError(f"CT volume must be [B, C=1, D, H, W], got {tuple(vol.shape)}")
 
-        radius = self.radius
+        radius = self.radius  # world radius from config
         if isinstance(radius, tuple):
             radius = radius[1]
         radius = float(radius)
@@ -378,10 +380,30 @@ class Generator(object):
         vmax = float(vol.max().item())
         # μ-Werte werden hier unverändert (bis auf das vorab angewandte Skalieren, z. B. ×10) verwendet,
         # keine zusätzliche Normalisierung – value_range dient nur für Plausibilitätschecks.
+        if voxel_size_mm <= 0:
+            raise ValueError("voxel_size_mm must be > 0 for world_scale_cm.")
+        voxel_size_cm = float(voxel_size_mm) / 10.0
+        d, h, w = vol.shape[2:5]  # layout [B,C,D,H,W]
+        lx_cm = float(w) * voxel_size_cm
+        ly_cm = float(h) * voxel_size_cm
+        lz_cm = float(d) * voxel_size_cm
+        # world_scale_cm_xyz = physical_extent_cm / world_extent (2*radius) per axis
+        world_scale_cm_xyz = (
+            lx_cm / (2.0 * float(radius)),
+            ly_cm / (2.0 * float(radius)),
+            lz_cm / (2.0 * float(radius)),
+        )
+        if any(s <= 0 for s in world_scale_cm_xyz):
+            raise ValueError("world_scale_cm_xyz must be > 0 for all axes.")
+        if mu_scale_p99_9 <= 0:
+            raise ValueError("mu_scale_p99_9 must be > 0.")
         vol = vol.contiguous().to(self.device, non_blocking=True)
         return {
             "volume": vol,
             "grid_radius": radius,
             "value_range": (vmin, vmax),
             "padding_mode": padding_mode,
+            "world_scale_cm_xyz": world_scale_cm_xyz,
+            "mu_scale_p99_9": float(mu_scale_p99_9),
+            "volume_shape_dhw": (int(d), int(h), int(w)),
         }

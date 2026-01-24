@@ -41,14 +41,14 @@ srun python -u train_emission.py \
   --act-samples 16384 \
   --act-pos-weight 3.0 \
   --ct-loss-weight 0.005 \
-  --ct-threshold 0.02 \
+  --ct-threshold-norm 0.02 \
   --ct-samples 8192 \
   --z-reg-weight 0 \
   --tv-weight 0.0005 \
   --ray-tv-weight 1e-5 \
   --ray-tv-edge-aware False \
   --bg-depth-mass-weight 5e-4 \
-  --bg-depth-eps 1e-12 \
+  --bg-depth-eps-norm 1e-12 \
   --bg-depth-mode integral \
   --grad-stats-every 10 \
   --ray-split-enable \
@@ -58,5 +58,7 @@ srun python -u train_emission.py \
   --ray-split-seed 123 \
   --ray-train-fg-frac 0.9 \
   --log-quantiles-final-only True \
-  --export-vol-res 128
+  --export-vol-res 128 \
+  --atten-scale 1.0 \
+  --inputs-normalized True
 echo "✅ Training finished at: $(date)"

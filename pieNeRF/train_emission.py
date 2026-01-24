@@ -112,6 +112,12 @@ def parse_args():
         help="Schwellwert fuer Background-Kriterium (Target < eps).",
     )
     parser.add_argument(
+        "--bg-depth-eps-norm",
+        type=float,
+        default=None,
+        help="Background-EPS im normierten Raum (überschreibt bg-depth-eps bei normierten Inputs).",
+    )
+    parser.add_argument(
         "--bg-depth-mode",
         type=str,
         default="integral",
@@ -153,6 +159,12 @@ def parse_args():
         type=float,
         default=0.05,
         help="Gradienten-Schwelle in ct.npy, unterhalb derer ein Segment als konstant gilt.",
+    )
+    parser.add_argument(
+        "--ct-threshold-norm",
+        type=float,
+        default=None,
+        help="CT-Schwelle im normierten Raum (überschreibt ct-threshold bei normierten Inputs).",
     )
     parser.add_argument(
         "--ct-samples",
@@ -218,6 +230,14 @@ def parse_args():
         help="Anteil der Rays pro Bild für das Training (Rest = Test) beim stratifizierten Split.",
     )
     parser.add_argument(
+        "--inputs-normalized",
+        type=str2bool,
+        default=True,
+        nargs="?",
+        const=True,
+        help="True, wenn AP/PA (und optional CT/ACT) normiert eingespeist werden.",
+    )
+    parser.add_argument(
         "--ray-split-mode",
         type=str,
         default="tile_random",
@@ -241,6 +261,12 @@ def parse_args():
         type=str,
         default="0.0",
         help="Schwellwert für Vordergrund (target>thr). Zahl oder 'quantile'.",
+    )
+    parser.add_argument(
+        "--ray-fg-thr-norm",
+        type=float,
+        default=None,
+        help="Schwellwert für Vordergrund im normierten Raum (überschreibt ray-fg-thr bei normierten Inputs).",
     )
     parser.add_argument(
         "--ray-fg-quantile",
@@ -419,28 +445,6 @@ def export_activity_volume(generator, z_latent, out_path: Path, res: int, device
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(out_path, vol)
-
-
-def poisson_nll(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    eps: float = 1e-8,
-    clamp_max: float = 1e6,
-    weight: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """
-    Poisson Negative Log-Likelihood Loss für Emissions- oder Zähl-Daten.
-    Erwartet nichtnegative 'pred' und 'target' (z. B. Intensitäten).
-    Falls projizierte Zählraten global skaliert werden, müssen pred/target
-    konsistent dieselbe Skalierung durchlaufen – der Loss bleibt physikalisch
-    äquivalent (nur numerische Reskalierung).
-    """
-    # Stabilisierung über clamping, damit log() definiert bleibt
-    pred = pred.clamp_min(eps).clamp_max(clamp_max)
-    nll = pred - target * torch.log(pred)
-    if weight is not None:
-        nll = nll * weight
-    return nll.mean()
 
 
 def build_ray_split(num_pixels: int, split_ratio: float, device: torch.device) -> Dict[str, torch.Tensor]:
@@ -1051,14 +1055,19 @@ def evaluate_pixel_subsets(
 
             target_ap = ap_flat_proc[0, idx_ap].unsqueeze(0)
             target_pa = pa_flat_proc[0, idx_pa].unsqueeze(0)
-
             pred_ap = pred_ap.clamp_min(1e-8)
             pred_pa = pred_pa.clamp_min(1e-8)
 
             weight_ap = build_loss_weights(target_ap, bg_weight, weight_threshold)
             weight_pa = build_loss_weights(target_pa, bg_weight, weight_threshold)
-            loss_ap = poisson_nll(pred_ap, target_ap, weight=weight_ap)
-            loss_pa = poisson_nll(pred_pa, target_pa, weight=weight_pa)
+            diff_ap = (pred_ap - target_ap) ** 2
+            diff_pa = (pred_pa - target_pa) ** 2
+            if weight_ap is not None:
+                diff_ap = diff_ap * weight_ap
+            if weight_pa is not None:
+                diff_pa = diff_pa * weight_pa
+            loss_ap = diff_ap.mean()
+            loss_pa = diff_pa.mean()
             loss_total = 0.5 * (loss_ap + loss_pa)
 
             psnr_ap = compute_psnr(pred_ap, target_ap)
@@ -1265,6 +1274,16 @@ def train():
     data_cfg.setdefault("act_scale", 1.0)
     data_cfg["debug_proj_stats"] = bool(args.debug_proj_stats)
     data_cfg["ray_split_ratio"] = float(args.ray_split)
+    inputs_normalized = bool(args.inputs_normalized)
+    if (not inputs_normalized) and (args.ray_fg_thr_norm is not None):
+        raise ValueError("ray-fg-thr-norm set but inputs are not normalized.")
+    if (not inputs_normalized) and (args.bg_depth_eps_norm is not None):
+        raise ValueError("bg-depth-eps-norm set but inputs are not normalized.")
+    if (not inputs_normalized) and (args.ct_threshold_norm is not None):
+        raise ValueError("ct-threshold-norm set but inputs are not normalized.")
+    bg_depth_eps_used = args.bg_depth_eps_norm if (inputs_normalized and args.bg_depth_eps_norm is not None) else args.bg_depth_eps
+    ct_threshold_used = args.ct_threshold_norm if (inputs_normalized and args.ct_threshold_norm is not None) else args.ct_threshold
+    ray_fg_thr_norm = args.ray_fg_thr_norm if inputs_normalized else None
     training_cfg = config.setdefault("training", {})
     training_cfg.setdefault("val_interval", 0)
     training_cfg.setdefault("tv_weight", 0.001)
@@ -1399,6 +1418,10 @@ def train():
             raise
 
     ray_fg_thr_value, ray_fg_force_quantile = parse_fg_threshold(ray_fg_thr)
+    if ray_fg_thr_norm is not None:
+        if ray_fg_force_quantile:
+            raise ValueError("ray-fg-thr-norm cannot be combined with quantile mode.")
+        ray_fg_thr_value = float(ray_fg_thr_norm)
     if ray_split_mode not in ("tile_random", "stratified_intensity"):
         raise ValueError(f"Unknown ray_split_mode: {ray_split_mode}")
 
@@ -1445,6 +1468,7 @@ def train():
         else:
             print("   [pixel-split-debug] FG top-k: none (no FG pixels).", flush=True)
 
+    fg_thr_used = None
     if ray_split_enabled:
         ref_sample = dataset[0]
         ap_target_np = ref_sample["ap"].squeeze(0).numpy()
@@ -1463,6 +1487,7 @@ def train():
                 seed=ray_split_seed,
                 pa_xflip=pa_xflip,
                 topk_frac=0.10,
+                fg_threshold_norm=ray_fg_thr_norm,
             )
         else:
             fg_thr_value = ray_fg_thr_value
@@ -1477,9 +1502,11 @@ def train():
                 seed=ray_split_seed,
                 pa_xflip=pa_xflip,
                 topk_frac=0.10,
+                fg_threshold_norm=ray_fg_thr_norm,
             )
         score_img = np.maximum(ap_target_np, pa_target_np[:, ::-1] if pa_xflip else pa_target_np)
         _log_split(pixel_split_np, score_img, ray_split_mode)
+        fg_thr_used = float(pixel_split_np.thr_used)
 
         np.savez(
             outdir / "pixel_split.npz",
@@ -1544,8 +1571,7 @@ def train():
         list(generator.parameters()) + [z_train],
         lr=config["training"]["lr_g"],
     )
-    # Poisson-basierter Loss
-    loss_fn = poisson_nll
+    # MSE-Loss im normierten Raum (Poisson entfernt)
 
     amp_enabled = bool(config["training"].get("use_amp", False))
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
@@ -1573,15 +1599,27 @@ def train():
         meta = batch.get("meta")
         meta_scale = None
         meta_missing = False
+        mu_scale_p99_9 = 1.0
+        act_scale_p99_9 = 1.0
+        voxel_size_mm = 1.5
         if isinstance(meta, dict):
             meta_scale = meta.get("proj_scale_joint_p99")
             meta_missing = meta.get("proj_scale_joint_p99_missing", False)
+            mu_scale_p99_9 = meta.get("mu_scale_p99_9", meta.get("ct_scale_p99_9", 1.0))
+            act_scale_p99_9 = meta.get("act_scale_p99_9", 1.0)
+            voxel_size_mm = meta.get("voxel_size_mm", 1.5)
             if isinstance(meta_scale, (list, tuple)):
                 meta_scale = meta_scale[0] if meta_scale else None
             if torch.is_tensor(meta_scale):
                 meta_scale = meta_scale.item() if meta_scale.numel() > 0 else None
             if torch.is_tensor(meta_missing):
                 meta_missing = bool(meta_missing.item()) if meta_missing.numel() > 0 else False
+            if torch.is_tensor(mu_scale_p99_9):
+                mu_scale_p99_9 = mu_scale_p99_9.item() if mu_scale_p99_9.numel() > 0 else 1.0
+            if torch.is_tensor(act_scale_p99_9):
+                act_scale_p99_9 = act_scale_p99_9.item() if act_scale_p99_9.numel() > 0 else 1.0
+            if torch.is_tensor(voxel_size_mm):
+                voxel_size_mm = voxel_size_mm.item() if voxel_size_mm.numel() > 0 else 1.5
         if meta_scale is None or (isinstance(meta_scale, float) and math.isnan(meta_scale)) or meta_missing:
             scale_joint_used = 1.0
             if not scale_missing_warned:
@@ -1592,6 +1630,12 @@ def train():
                 scale_missing_warned = True
         else:
             scale_joint_used = float(meta_scale)
+        if mu_scale_p99_9 is None or not np.isfinite(float(mu_scale_p99_9)) or float(mu_scale_p99_9) <= 0:
+            raise ValueError("mu_scale_p99_9 must be > 0.")
+        if act_scale_p99_9 is None or not np.isfinite(float(act_scale_p99_9)) or float(act_scale_p99_9) <= 0:
+            raise ValueError("act_scale_p99_9 must be > 0.")
+        if voxel_size_mm is None or not np.isfinite(float(voxel_size_mm)) or float(voxel_size_mm) <= 0:
+            raise ValueError("voxel_size_mm must be > 0.")
         scale_ap_used = scale_joint_used
         scale_pa_used = scale_joint_used
         if step == 1:
@@ -1605,10 +1649,21 @@ def train():
                 act_vol = None
             else:
                 act_vol = act_vol.to(device, non_blocking=True)
+                if act_scale_p99_9 != 1.0 and float(data_cfg.get("act_scale", 1.0)) != 1.0:
+                    raise ValueError("act_scale_p99_9 and data.act_scale both set (double-scaling).")
         ct_vol = batch.get("ct")
         if ct_vol is not None:
             ct_vol = ct_vol.to(device, non_blocking=True).float()
-        ct_context = generator.build_ct_context(ct_vol, padding_mode=args.ct_padding_mode) if ct_vol is not None else None
+        ct_context = (
+            generator.build_ct_context(
+                ct_vol,
+                padding_mode=args.ct_padding_mode,
+                voxel_size_mm=float(voxel_size_mm),
+                mu_scale_p99_9=float(mu_scale_p99_9),
+            )
+            if ct_vol is not None
+            else None
+        )
 
         # Wichtig: Flatten-Order ist (y * W + x), identisch zu den Ray-Indizes aus make_stratified_tile_split.
         # Keine permute/transpose zwischen (H, W) und reshape(-1), damit Target/Predict exakt die gleiche Reihenfolge teilen.
@@ -1648,6 +1703,19 @@ def train():
 
             target_ap = ap_flat_proc[0, idx_ap].unsqueeze(0)
             target_pa = pa_flat_proc[0, idx_pa].unsqueeze(0)
+            if DEBUG_PRINTS and (step % args.log_every == 0):
+                with torch.no_grad():
+                    q_ap = float(torch.quantile(target_ap.view(-1), 0.999).item()) if target_ap.numel() > 0 else float("nan")
+                    q_pa = float(torch.quantile(target_pa.view(-1), 0.999).item()) if target_pa.numel() > 0 else float("nan")
+                    min_ap = float(target_ap.min().item()) if target_ap.numel() > 0 else float("nan")
+                    max_ap = float(target_ap.max().item()) if target_ap.numel() > 0 else float("nan")
+                    min_pa = float(target_pa.min().item()) if target_pa.numel() > 0 else float("nan")
+                    max_pa = float(target_pa.max().item()) if target_pa.numel() > 0 else float("nan")
+                print(
+                    f"[norm-check] target_ap min/max={min_ap:.3e}/{max_ap:.3e} p99.9={q_ap:.3e} | "
+                    f"target_pa min/max={min_pa:.3e}/{max_pa:.3e} p99.9={q_pa:.3e}",
+                    flush=True,
+                )
 
             # Poisson-NLL erwartet pred >= 0
             pred_ap_raw = pred_ap.clamp_min(1e-8)
@@ -1659,8 +1727,23 @@ def train():
             weight_ap = build_loss_weights(target_ap, args.bg_weight, args.weight_threshold)
             weight_pa = build_loss_weights(target_pa, args.bg_weight, args.weight_threshold)
 
-            loss_ap = poisson_nll(pred_ap, target_ap, weight=weight_ap)
-            loss_pa = poisson_nll(pred_pa, target_pa, weight=weight_pa)
+            if DEBUG_PRINTS and fg_thr_used is not None and (step % args.log_every == 0):
+                with torch.no_grad():
+                    score = torch.maximum(target_ap, target_pa)
+                    fg_frac = float((score > fg_thr_used).float().mean().item()) if score.numel() > 0 else 0.0
+                print(
+                    f"[fg-check] fg_frac={fg_frac:.3f} (thr={fg_thr_used:.3e})",
+                    flush=True,
+                )
+
+            diff_ap = (pred_ap - target_ap) ** 2
+            diff_pa = (pred_pa - target_pa) ** 2
+            if weight_ap is not None:
+                diff_ap = diff_ap * weight_ap
+            if weight_pa is not None:
+                diff_pa = diff_pa * weight_pa
+            loss_ap = diff_ap.mean()
+            loss_pa = diff_pa.mean()
             loss = 0.5 * (loss_ap + loss_pa)
             if DEBUG_PRINTS and (step % 50 == 0):
                 print(
@@ -1677,11 +1760,11 @@ def train():
             if args.bg_depth_mass_weight > 0.0:
                 bg_mask = None
                 if target_ap is not None and target_pa is not None:
-                    bg_mask = (target_ap < args.bg_depth_eps) & (target_pa < args.bg_depth_eps)
+                    bg_mask = (target_ap < bg_depth_eps_used) & (target_pa < bg_depth_eps_used)
                 elif target_ap is not None:
-                    bg_mask = target_ap < args.bg_depth_eps
+                    bg_mask = target_ap < bg_depth_eps_used
                 elif target_pa is not None:
-                    bg_mask = target_pa < args.bg_depth_eps
+                    bg_mask = target_pa < bg_depth_eps_used
                 if bg_mask is not None:
                     bg_mask_flat = bg_mask.reshape(-1)
                     bg_depth_frac_t = bg_mask_flat.float().mean()
@@ -1725,6 +1808,9 @@ def train():
                 )
                 pred_act = query_emission_at_points(generator, z_latent, coords)
                 if pred_act.numel() > 0:
+                    if act_scale_p99_9 != 1.0:
+                        pred_act = pred_act * float(act_scale_p99_9)
+                        act_samples = act_samples * float(act_scale_p99_9)
                     weights_act = torch.where(
                         pos_flags,
                         torch.full_like(pred_act, args.act_pos_weight),
@@ -1739,7 +1825,7 @@ def train():
                 radius = generator.radius
                 if isinstance(radius, tuple):
                     radius = radius[1]
-                ct_pairs = sample_ct_pairs(ct_vol, args.ct_samples, args.ct_threshold, radius=radius)
+                ct_pairs = sample_ct_pairs(ct_vol, args.ct_samples, ct_threshold_used, radius=radius)
                 if ct_pairs is not None:
                     coords1, coords2, weights = ct_pairs
                     pred1 = query_emission_at_points(generator, z_latent, coords1)

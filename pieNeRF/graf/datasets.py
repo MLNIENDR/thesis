@@ -1,6 +1,7 @@
 """Dataset utilities for SPECT data: load AP/PA projections, CT/act volumes from manifest CSV."""
 
 import glob
+import json
 import numpy as np
 from PIL import Image
 from pathlib import Path
@@ -36,6 +37,8 @@ class SpectDataset(torch.utils.data.Dataset):
         self._debug_proj_stats = bool(debug_proj_stats)
         self._logged_debug_proj_stats = False
         self._warned_scale_mismatch = False
+        self._warned_missing_scales = False
+        self._meta_cache = {}
 
         self.entries = []                                                       # Liste in der für jeden Fall ein kleines Dict mit Pfaden & ID steht
         with open(self.manifest_path, newline="") as f:                         # CSV öffnen
@@ -58,6 +61,44 @@ class SpectDataset(torch.utils.data.Dataset):
                         proj_scale_val = None
                 proj_scale_missing = proj_scale_val is None
 
+                mu_scale_val = self._parse_float(row.get("mu_scale_p99_9"))
+                if mu_scale_val is None:
+                    mu_scale_val = self._parse_float(row.get("ct_scale_p99_9"))
+                act_scale_val = self._parse_float(row.get("act_scale_p99_9"))
+                voxel_size_mm = self._parse_float(row.get("voxel_size_mm"))
+                if voxel_size_mm is None:
+                    voxel_size_mm = self._parse_float(row.get("sd_mm"))
+
+                meta = None
+                if mu_scale_val is None or act_scale_val is None or voxel_size_mm is None:
+                    meta = self._load_meta_simple(self._resolve_path(row["ap_path"]))
+                if mu_scale_val is None and meta is not None:
+                    mu_scale_val = self._parse_float(meta.get("mu_scale_p99_9"))
+                    if mu_scale_val is None:
+                        mu_scale_val = self._parse_float(meta.get("ct_scale_p99_9"))
+                if act_scale_val is None and meta is not None:
+                    act_scale_val = self._parse_float(meta.get("act_scale_p99_9"))
+                if voxel_size_mm is None and meta is not None:
+                    voxel_size_mm = self._parse_float(meta.get("sd_mm"))
+
+                if mu_scale_val is None:
+                    mu_scale_val = 1.0
+                if act_scale_val is None:
+                    act_scale_val = 1.0
+                if voxel_size_mm is None:
+                    voxel_size_mm = 1.5
+
+                if not self._warned_missing_scales and meta is None:
+                    missing_mu = ("mu_scale_p99_9" not in row) and ("ct_scale_p99_9" not in row)
+                    missing_act = "act_scale_p99_9" not in row
+                    missing_voxel = "voxel_size_mm" not in row and "sd_mm" not in row
+                    if missing_mu or missing_act or missing_voxel:
+                        print(
+                            "[WARN] Missing mu/act scale or voxel_size in CSV and meta_simple.json not found. Using defaults.",
+                            flush=True,
+                        )
+                        self._warned_missing_scales = True
+
                 self.entries.append({                                           # jeweils als Path-Objekte speichern: phantom_id, ap_path, pa_path, ct_path
                     "patient_id": row["patient_id"],
                     "ap_path": self._resolve_path(row["ap_path"]),
@@ -66,6 +107,9 @@ class SpectDataset(torch.utils.data.Dataset):
                     "act_path": act_path,
                     "proj_scale_joint_p99": proj_scale_val,
                     "proj_scale_joint_p99_missing": proj_scale_missing,
+                    "mu_scale_p99_9": float(mu_scale_val),
+                    "act_scale_p99_9": float(act_scale_val),
+                    "voxel_size_mm": float(voxel_size_mm),
                 })
 
     def __len__(self):
@@ -77,11 +121,42 @@ class SpectDataset(torch.utils.data.Dataset):
         if t.numel() == 0:
             return float("nan"), float("nan"), float("nan")
         t = t.detach()
+        flat = t.reshape(-1)
         return (
             float(t.min().item()),
             float(t.max().item()),
-            float(torch.quantile(t.view(-1), 0.999).item()),
+            float(torch.quantile(flat, 0.999).item()),
         )
+
+    @staticmethod
+    def _parse_float(value):
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        raw = str(value).strip()
+        if raw == "":
+            return None
+        try:
+            return float(raw)
+        except Exception:
+            return None
+
+    def _load_meta_simple(self, sample_path: Path):
+        candidate = sample_path.parent / "meta_simple.json"
+        if candidate in self._meta_cache:
+            return self._meta_cache[candidate]
+        if not candidate.exists():
+            self._meta_cache[candidate] = None
+            return None
+        try:
+            with candidate.open("r", encoding="utf-8") as f:
+                meta = json.load(f)
+            self._meta_cache[candidate] = meta
+            return meta
+        except Exception:
+            self._meta_cache[candidate] = None
+            return None
 
 
     def _load_npy_image(self, path):                                            # lädt .npy Array, z.B. [H,W] mit Counts
@@ -185,6 +260,9 @@ class SpectDataset(torch.utils.data.Dataset):
                 "act_path_missing": e["act_path"] is None,
                 "proj_scale_joint_p99": float(e["proj_scale_joint_p99"]) if e.get("proj_scale_joint_p99") is not None else float("nan"),
                 "proj_scale_joint_p99_missing": bool(e.get("proj_scale_joint_p99_missing")),
+                "mu_scale_p99_9": float(e.get("mu_scale_p99_9", 1.0)),
+                "act_scale_p99_9": float(e.get("act_scale_p99_9", 1.0)),
+                "voxel_size_mm": float(e.get("voxel_size_mm", 1.5)),
             },
         }
     def _resolve_path(self, raw_path: str) -> Path:

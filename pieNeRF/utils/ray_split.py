@@ -71,6 +71,7 @@ def make_pixel_split_from_ap_pa(
     seed: int,
     pa_xflip: bool,
     topk_frac: float = 0.10,
+    fg_threshold_norm: Optional[float] = None,
 ) -> PixelSplit:
     if target_ap.shape != target_pa.shape:
         raise ValueError(f"AP/PA shapes differ: {target_ap.shape} vs {target_pa.shape}")
@@ -81,7 +82,12 @@ def make_pixel_split_from_ap_pa(
     ratio = float(np.clip(train_frac, 0.0, 1.0))
 
     score = _compute_score(target_ap, target_pa, pa_xflip)
-    thr_used = _resolve_threshold(score, thr)
+    if fg_threshold_norm is not None:
+        if thr not in (0.0, None):
+            raise ValueError("fg_threshold_norm set; do not also set thr.")
+        thr_used = float(fg_threshold_norm)
+    else:
+        thr_used = _resolve_threshold(score, thr)
 
     train_fg, train_bg, test_fg, test_bg = [], [], [], []
     tile_id = 0
@@ -172,6 +178,7 @@ def make_pixel_split_stratified_intensity(
     seed: int,
     pa_xflip: bool,
     topk_frac: float = 0.10,
+    fg_threshold_norm: Optional[float] = None,
 ) -> PixelSplit:
     if target_ap.shape != target_pa.shape:
         raise ValueError(f"AP/PA shapes differ: {target_ap.shape} vs {target_pa.shape}")
@@ -182,7 +189,14 @@ def make_pixel_split_stratified_intensity(
     score = _compute_score(target_ap, target_pa, pa_xflip)
     score_flat = score.reshape(-1)
 
-    use_quantile = fg_threshold <= 0.0
+    if fg_threshold_norm is not None:
+        if fg_threshold not in (0.0, None):
+            raise ValueError("fg_threshold_norm set; do not also set fg_threshold.")
+        thr_used = float(fg_threshold_norm)
+        fg_mask = score_flat >= thr_used
+        use_quantile = False
+    else:
+        use_quantile = fg_threshold <= 0.0
     if use_quantile:
         q = float(np.clip(fg_quantile, 0.0, 1.0))
         thr_used = float(np.quantile(score_flat, q)) if score_flat.size > 0 else 0.0

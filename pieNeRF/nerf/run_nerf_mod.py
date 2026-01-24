@@ -9,6 +9,8 @@ from .run_nerf_helpers_mod import *
 
 np.random.seed(0)                   # fixiere Zufallszahlen (Reproduzierbarkeit)
 _ATTENUATION_WARNED = False         # Flag um eine Warnung nur einmal auszugeben
+_ATTEN_DEBUG_LOGGED = False         # Flag fuer einmaliges Attenuation-Debug
+_ATTEN_SHAPE_LOGGED = False         # Flag fuer einmalige Shape-Logs
 
 
 # ---------------------------
@@ -262,6 +264,9 @@ def raw2outputs_emission(
     use_attenuation=False,
     atten_scale: float = 25.0,
     return_dists: bool = False,
+    world_scale_cm_xyz=None,
+    mu_scale_p99_9: float = 1.0,
+    attenuation_debug: bool = False,
 ):
     """
     Emissions-NeRF:
@@ -313,6 +318,7 @@ def raw2outputs_emission(
 
     transmission = None
     # Grundfall: keine Attenuation → einfache Gewichte = e * Δs
+    # Annahme: lambda_vals ist Emissionsdichte pro Laengeneinheit, daher Gewichtung mit dl (oder dl_cm).
     weights = lambda_vals * dists
     if use_attenuation:
         if mu_vals is None:
@@ -324,8 +330,27 @@ def raw2outputs_emission(
             if mu.shape != lambda_vals.shape:
                 raise ValueError(f"CT samples have wrong shape {mu.shape}, expected {lambda_vals.shape}.")
 
+            if mu_scale_p99_9 <= 0:
+                raise ValueError("mu_scale_p99_9 must be > 0 for attenuation.")
+            use_phys_dists = world_scale_cm_xyz is not None
+            if use_phys_dists:
+                if abs(float(atten_scale) - 1.0) > 1e-6:
+                    raise ValueError("atten_scale must be 1.0 when world_scale_cm is used (avoid double-scaling).")
+                sx, sy, sz = world_scale_cm_xyz
+                if min(sx, sy, sz) <= 0:
+                    raise ValueError("world_scale_cm_xyz must be > 0 for all axes.")
+                dir_norm = rays_d / (ray_norm + 1e-8)
+                dir_abs = torch.abs(dir_norm)
+                scale = dir_abs[..., 0] * float(sx) + dir_abs[..., 1] * float(sy) + dir_abs[..., 2] * float(sz)
+                dists_cm = dists * scale[..., None]
+                mu_phys = mu * float(mu_scale_p99_9)
+            else:
+                dists_cm = dists
+                mu_phys = mu * float(mu_scale_p99_9)
+
             # µ * Δs → lineare Dämpfung pro Segment
-            mu_dists = mu * dists                                # [N_rays, N_samples]
+            mu_dists = mu_phys * dists_cm                        # [N_rays, N_samples]
+            dists_for_weights = dists_cm if use_phys_dists else dists
 
             # Kumulative Attenuation ∫ µ ds (diskret: kumulierte Summe)
             # Attenuation scaling:
@@ -342,7 +367,34 @@ def raw2outputs_emission(
             transmission = torch.exp(-attenuation)               # [N_rays, N_samples]
 
             # Gewichte jetzt: e * T * Δs
-            weights = lambda_vals * transmission * dists
+            weights = lambda_vals * transmission * dists_for_weights
+
+            global _ATTEN_DEBUG_LOGGED, _ATTEN_SHAPE_LOGGED
+            if attenuation_debug and use_phys_dists and not _ATTEN_SHAPE_LOGGED:
+                _ATTEN_SHAPE_LOGGED = True
+                assert dists_cm.shape == dists.shape, "dists_cm must match dists shape"
+                assert scale.shape == dists.shape[:-1], "scale must be [N_rays]"
+                print(
+                    f"[atten_debug_shapes] rays_d={tuple(rays_d.shape)} dists={tuple(dists.shape)} "
+                    f"scale={tuple(scale.shape)} dists_cm={tuple(dists_cm.shape)} mu={tuple(mu.shape)}",
+                    flush=True,
+                )
+            if attenuation_debug and not _ATTEN_DEBUG_LOGGED:
+                _ATTEN_DEBUG_LOGGED = True
+                mu_mean = float(mu_phys.mean().detach().cpu().item())
+                dl_mean = float(dists_cm.mean().detach().cpu().item())
+                att_mean = float(attenuation.mean().detach().cpu().item())
+                trans_mean = float(transmission.mean().detach().cpu().item())
+                lam_mean = float(lambda_vals.mean().detach().cpu().item())
+                print(
+                    f"[atten_debug] lambda_mean={lam_mean:.3e}  mu_mean={mu_mean:.3e}  "
+                    f"dl_cm_mean={dl_mean:.3e}  atten_mean={att_mean:.3e}  T_mean={trans_mean:.3e}",
+                    flush=True,
+                )
+                if trans_mean < 1e-4 or trans_mean > 0.999:
+                    warnings.warn(
+                        f"Transmission mean out of range: {trans_mean:.3e} (possible scale issue)."
+                    )
 
     # Line-Integral entlang des Strahls
     proj_map = torch.sum(weights, dim=-1)                        # [N_rays]
@@ -426,6 +478,8 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
     use_attenuation = bool(kwargs.get("use_attenuation", False))
     atten_scale = float(kwargs.get("atten_scale", 25.0))
     mu_vals = None
+    world_scale_cm_xyz = None
+    mu_scale_p99_9 = 1.0
 
     # Falls Attenuation aktiv: µ aus CT sampeln
     if ct_context is not None and use_attenuation:
@@ -446,6 +500,8 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
             if not ct_context.get("_range_warned", False):
                 warnings.warn("CT attenuation samples outside expected range (no reference range available).")
                 ct_context["_range_warned"] = True
+        world_scale_cm_xyz = ct_context.get("world_scale_cm_xyz")
+        mu_scale_p99_9 = float(ct_context.get("mu_scale_p99_9", 1.0))
     elif use_attenuation and ct_context is None:
         # use_attenuation=True, aber kein CT → einmalige Warnung, dann deaktiviere Attenuation intern
         global _ATTENUATION_WARNED
@@ -465,6 +521,9 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
             use_attenuation=use_attenuation,
             atten_scale=atten_scale,
             return_dists=retraw,
+            world_scale_cm_xyz=world_scale_cm_xyz,
+            mu_scale_p99_9=mu_scale_p99_9,
+            attenuation_debug=kwargs.get("attenuation_debug", False),
         )
         if retraw:
             proj_map, disp_map, acc_map, tv_base_loss, dists_out = outputs
