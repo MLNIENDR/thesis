@@ -54,6 +54,7 @@ def get_data(config):
         transform_ct=None,
         debug_proj_stats=bool(config["data"].get("debug_proj_stats", False)),
         act_scale=float(config["data"].get("act_scale", 1.0)),
+        ct_prefer_raw=bool(config["data"].get("ct_prefer_raw", False)),
     )
 
     # 2) H und W aus einem Beispiel-AP-Bild ableiten

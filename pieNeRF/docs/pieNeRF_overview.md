@@ -18,7 +18,7 @@ This document audits the current pipeline and critical claims against the codeba
 - [CONFIRMED] Slurm wrapper launches `train_emission.py` with CLI flags.
   - File: `pieNeRF/run_train_emission.sh`
   ```bash
-  srun python -u train_emission.py \
+  srun python3 -u train_emission.py \
       --config configs/spect.yaml \
       --max-steps 2000 \
       --rays-per-step 16384 \

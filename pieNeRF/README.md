@@ -182,7 +182,7 @@ In diesem Repository gibt es keine Datei mit diesem Namen; falls benötigt, müs
 ---
 
 ## Hinweise zur Nutzung
-- Training starten: `python train_emission.py --config configs/spect.yaml --max-steps 1000 ...` (siehe `run_train_emission.sh` für sinnvolle Defaults).  
+- Training starten: `python3 train_emission.py --config configs/spect.yaml --max-steps 1000 ...` (siehe `run_train_emission.sh` für sinnvolle Defaults).  
 - GPU erforderlich; Attenuation benötigt ein CT-Volumen (`ct.npy`) im Manifest.  
 - Previews/CSV/Checkpoints landen standardmäßig unter `results_spect/`.  
 - Debug: `--debug-attenuation-ray` loggt λ/μ/T für einen Beispielstrahl; `--debug-zero-var` speichert Tensors, falls Vorhersagen kollabieren.
