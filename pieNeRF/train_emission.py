@@ -128,15 +128,8 @@ def parse_args():
     parser.add_argument(
         "--final-act-compare-axial",
         action="store_true",
-        help="Verwende fuer die finale Compare-PNG axiale Slices (axis2) statt sagittale (axis0).",
-    )
-    parser.add_argument(
-        "--final-act-compare-axis0-idx",
-        type=int,
-        nargs=3,
-        default=[80, 128, 200],
-        metavar=("IDX0", "IDX1", "IDX2"),
-        help="Drei feste axis0-Indizes fuer die finale Activity-Compare Visualisierung (wie in test.py).",
+        default=True,
+        help="Finale Compare-PNG verwendet axialen Vergleich (axis2). Flag ist aus Kompatibilitaetsgruenden akzeptiert.",
     )
     parser.add_argument(
         "--final-act-compare-axis2-idx",
@@ -145,12 +138,6 @@ def parse_args():
         default=[65, 260, 325],
         metavar=("Z0", "Z1", "Z2"),
         help="Drei feste axis2-Indizes fuer den axialen finalen Compare-Plot.",
-    )
-    parser.add_argument(
-        "--final-act-compare-out",
-        type=str,
-        default="final_act_compare_sagittal.png",
-        help="Dateiname fuer die finale Activity-Compare PNG (in outdir/preview/).",
     )
     parser.add_argument(
         "--final-act-compare-scale",
@@ -2658,9 +2645,10 @@ def save_final_act_compare_volume_slicing(
 
     preview_dir = outdir / "preview"
     preview_dir.mkdir(parents=True, exist_ok=True)
-    axial_mode = bool(getattr(args, "final_act_compare_axial", False))
-    # Immer eine eindeutige Datei schreiben, die nicht mit final_sagittal kollidiert.
-    out_path = preview_dir / ("final_act_compare_axial.png" if axial_mode else "final_act_compare_sagittal.png")
+    # Axial ist der Default; das Flag wird aus Kompatibilitaetsgruenden gelesen.
+    _ = bool(getattr(args, "final_act_compare_axial", True))
+    # Finale Compare-PNG ist axial und kollidiert nicht mit final_sagittal.
+    out_path = preview_dir / "final_act_compare_axial.png"
 
     act_t = act_vol.detach()
     if act_t.dim() == 4:
@@ -2692,43 +2680,9 @@ def save_final_act_compare_volume_slicing(
     gt_shape = tuple(int(x) for x in gt_np.shape)
     pred_shape = tuple(int(x) for x in pred_np.shape)
     print(
-        f"[final-act-compare] GT shape={gt_shape} | Pred shape={pred_shape} | mode={'axial' if axial_mode else 'sagittal'}",
+        f"[final-act-compare] GT shape={gt_shape} | Pred shape={pred_shape} | mode=axial",
         flush=True,
     )
-
-    def _linspace_norm(n: int, device: torch.device) -> torch.Tensor:
-        if n <= 1:
-            return torch.zeros((1,), device=device, dtype=torch.float32)
-        return torch.linspace(-1.0, 1.0, n, device=device, dtype=torch.float32)
-
-    def _resample_gt_to_pred_grid(gt_arr: np.ndarray, pred_shape: Tuple[int, int, int]) -> np.ndarray:
-        """Resample GT (A,B,C) -> pred grid (A2,B2,C2) via grid_sample (trilinear)."""
-        device = torch.device("cpu")
-        gt_t = torch.from_numpy(gt_arr.astype(np.float32, copy=False)).to(device)
-        gt_t = gt_t.unsqueeze(0).unsqueeze(0)  # [1,1,A,B,C]
-        A2, B2, C2 = (int(pred_shape[0]), int(pred_shape[1]), int(pred_shape[2]))
-        z_norm = _linspace_norm(A2, device)
-        y_norm = _linspace_norm(B2, device)
-        x_norm = _linspace_norm(C2, device)
-        zz, yy, xx = torch.meshgrid(z_norm, y_norm, x_norm, indexing="ij")
-        grid = torch.stack((xx, yy, zz), dim=-1).unsqueeze(0)  # [1,A2,B2,C2,3] mit (x,y,z)
-        gt_rs = F.grid_sample(
-            gt_t,
-            grid,
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
-        )
-        gt_rs = gt_rs.squeeze(0).squeeze(0)  # [A2,B2,C2]
-        return gt_rs.cpu().numpy().astype(np.float32, copy=False)
-
-    def _map_axis0_idx(idx_gt: int, A: int, A2: int) -> int:
-        idx_gt = int(idx_gt)
-        if A <= 1 or A2 <= 1:
-            return int(np.clip(idx_gt, 0, max(A2 - 1, 0)))
-        scale = float(A2 - 1) / float(A - 1)
-        idx_pred = int(round(float(idx_gt) * scale))
-        return int(np.clip(idx_pred, 0, A2 - 1))
 
     def _robust_limits(arr: np.ndarray) -> Tuple[float, float]:
         finite = np.isfinite(arr)
@@ -2761,267 +2715,145 @@ def save_final_act_compare_volume_slicing(
         nz_frac = float(np.mean(np.abs(vals) > 1e-8))
         return float(np.min(vals)), float(np.mean(vals)), float(np.max(vals)), nz_frac, float(np.std(vals))
 
-    if axial_mode:
-        A, B, C = gt_shape
-        R = int(pred_shape[0])
-        z_list_raw = list(getattr(args, "final_act_compare_axis2_idx", [65, 260, 325]))
+    A, B, C = gt_shape
+    R = int(pred_shape[0])
+    z_list_raw = list(getattr(args, "final_act_compare_axis2_idx", [65, 260, 325]))
 
-        def _map_axis2_idx(z_gt: int, C_gt: int, R_pred: int) -> int:
-            z_gt = int(z_gt)
-            if C_gt <= 1 or R_pred <= 1:
-                return int(np.clip(z_gt, 0, max(R_pred - 1, 0)))
-            scale = float(R_pred - 1) / float(C_gt - 1)
-            z_pred = int(round(float(z_gt) * scale))
-            return int(np.clip(z_pred, 0, R_pred - 1))
+    def _map_axis2_idx(z_gt: int, C_gt: int, R_pred: int) -> int:
+        z_gt = int(z_gt)
+        if C_gt <= 1 or R_pred <= 1:
+            return int(np.clip(z_gt, 0, max(R_pred - 1, 0)))
+        scale = float(R_pred - 1) / float(C_gt - 1)
+        z_pred = int(round(float(z_gt) * scale))
+        return int(np.clip(z_pred, 0, R_pred - 1))
 
-        z_pairs: list[Tuple[int, int]] = []
-        for z_gt in z_list_raw:
-            z_i = int(z_gt)
-            if 0 <= z_i < C:
-                z_pairs.append((z_i, _map_axis2_idx(z_i, C, R)))
-            else:
-                print(
-                    f"[final-act-compare][WARN] axis2 idx_gt={z_i} out of bounds fuer C_gt={C}; ignoriere.",
-                    flush=True,
-                )
-        if not z_pairs:
-            print("[final-act-compare][WARN] Keine gueltigen axis2-Indizes; skippe.", flush=True)
-            return
-
-        x_step_gt = max(1, B // 10)
-        y_step_gt = max(1, A // 10)
-        x_ticks_gt = np.arange(0, B, x_step_gt)
-        y_ticks_gt = np.arange(0, A, y_step_gt)
-
-        x_step_pr = max(1, R // 10)
-        y_step_pr = max(1, R // 10)
-        x_ticks_pr = np.arange(0, R, x_step_pr)
-        y_ticks_pr = np.arange(0, R, y_step_pr)
-
-        scale_mode = str(getattr(args, "final_act_compare_scale", "shared"))
-        shared_vmin = shared_vmax = None
-        if scale_mode == "shared":
-            vals_list = []
-            for z_gt, z_pred in z_pairs:
-                gt_img = gt_np[:, :, z_gt]
-                pr_img = pred_np[:, :, z_pred]
-                gt_vals = gt_img[np.isfinite(gt_img)].ravel()
-                pr_vals = pr_img[np.isfinite(pr_img)].ravel()
-                if gt_vals.size:
-                    vals_list.append(gt_vals)
-                if pr_vals.size:
-                    vals_list.append(pr_vals)
-            if vals_list:
-                shared_vals = np.concatenate(vals_list, axis=0)
-                shared_vmin, shared_vmax = _robust_limits(shared_vals)
-            else:
-                shared_vmin, shared_vmax = 0.0, 1.0
-
-        rows = len(z_pairs)
-        fig, axs = plt.subplots(rows, 2, figsize=(12, 4 * rows), constrained_layout=True)
-        axs = np.asarray(axs)
-        if axs.ndim == 1:
-            axs = axs.reshape(1, 2)
-
-        im_gt_first = None
-        im_pr_first = None
-        for row, (z_gt, z_pred) in enumerate(z_pairs):
-            ax_gt = axs[row, 0]
-            ax_pr = axs[row, 1]
-
-            gt_img = gt_np[:, :, z_gt].astype(np.float32, copy=False)
-            pr_img = pred_np[:, :, z_pred].astype(np.float32, copy=False)
-
-            gt_min, gt_mean, gt_max, gt_nz, gt_std = _slice_stats(gt_img)
-            pr_min, pr_mean, pr_max, pr_nz, pr_std = _slice_stats(pr_img)
-            print(
-                f"[final-act-compare][axial axis2_gt={z_gt} -> axis2_pred={z_pred}] "
-                f"GT min/mean/max={gt_min:.3e}/{gt_mean:.3e}/{gt_max:.3e} std={gt_std:.3e} nz_frac={gt_nz:.3f} | "
-                f"Pred min/mean/max={pr_min:.3e}/{pr_mean:.3e}/{pr_max:.3e} std={pr_std:.3e} nz_frac={pr_nz:.3f}",
-                flush=True,
-            )
-            if np.isfinite(pr_std) and pr_std < 1e-8:
-                print(
-                    f"[final-act-compare][WARN] Pred axial slice axis2_pred={z_pred} ist nahezu konstant (std={pr_std:.3e}).",
-                    flush=True,
-                )
-
-            if scale_mode == "shared":
-                gt_vmin, gt_vmax = float(shared_vmin), float(shared_vmax)
-                pr_vmin, pr_vmax = float(shared_vmin), float(shared_vmax)
-            else:
-                gt_vmin, gt_vmax = _robust_limits(gt_img)
-                pr_vmin, pr_vmax = _robust_limits(pr_img)
-
-            im_gt = ax_gt.imshow(
-                gt_img,
-                origin="upper",
-                extent=[0, B - 1, A - 1, 0],
-                aspect="equal",
-                cmap="viridis",
-                vmin=gt_vmin,
-                vmax=gt_vmax,
-            )
-            im_pr = ax_pr.imshow(
-                pr_img,
-                origin="upper",
-                extent=[0, R - 1, R - 1, 0],
-                aspect="equal",
-                cmap="viridis",
-                vmin=pr_vmin,
-                vmax=pr_vmax,
-            )
-
-            if im_gt_first is None:
-                im_gt_first = im_gt
-            if im_pr_first is None:
-                im_pr_first = im_pr
-
-            ax_gt.set_title(f"GT axial (act) @ axis2={z_gt}")
-            ax_pr.set_title(f"Pred axial (act_pred) @ axis2_pred={z_pred} (from {z_gt})")
-
-            ax_gt.set_xlabel("axis1 (x-like)")
-            ax_pr.set_xlabel("axis1 (x-like)")
-            ax_gt.set_ylabel("axis0 (y-like)")
-            ax_pr.set_ylabel("axis0 (y-like)")
-
-            ax_gt.set_xticks(x_ticks_gt)
-            ax_gt.set_yticks(y_ticks_gt)
-            ax_pr.set_xticks(x_ticks_pr)
-            ax_pr.set_yticks(y_ticks_pr)
-
-        if scale_mode == "shared":
-            if im_gt_first is not None:
-                cbar = fig.colorbar(im_gt_first, ax=axs.ravel().tolist(), shrink=0.92)
-                cbar.set_label("Activity (shared robust scale)")
-        else:
-            if im_gt_first is not None:
-                cbar_gt = fig.colorbar(im_gt_first, ax=axs[:, 0].ravel().tolist(), shrink=0.92)
-                cbar_gt.set_label("GT activity (robust scale)")
-            if im_pr_first is not None:
-                cbar_pr = fig.colorbar(im_pr_first, ax=axs[:, 1].ravel().tolist(), shrink=0.92)
-                cbar_pr.set_label("Pred activity (robust scale)")
-
-        fig.savefig(out_path, dpi=200)
-        plt.close(fig)
-        print(f"[final-act-compare] Saved {out_path.resolve()}", flush=True)
-        return
-
-    resampling_active = gt_shape != pred_shape
-    if resampling_active:
-        gt_vis_np = _resample_gt_to_pred_grid(gt_np, pred_shape)
-    else:
-        gt_vis_np = gt_np.astype(np.float32, copy=False)
-
-    A_gt = gt_shape[0]
-    A_vis, B_vis, C_vis = pred_shape
-    idx_list_raw = list(getattr(args, "final_act_compare_axis0_idx", [80, 128, 200]))
-    idx_pairs: list[Tuple[int, int]] = []
-    for idx in idx_list_raw:
-        idx_i = int(idx)
-        if 0 <= idx_i < A_gt:
-            idx_pairs.append((idx_i, _map_axis0_idx(idx_i, A_gt, A_vis)))
+    z_pairs: list[Tuple[int, int]] = []
+    for z_gt in z_list_raw:
+        z_i = int(z_gt)
+        if 0 <= z_i < C:
+            z_pairs.append((z_i, _map_axis2_idx(z_i, C, R)))
         else:
             print(
-                f"[final-act-compare][WARN] axis0 idx_gt={idx_i} out of bounds fuer A_gt={A_gt}; ignoriere.",
+                f"[final-act-compare][WARN] axis2 idx_gt={z_i} out of bounds fuer C_gt={C}; ignoriere.",
                 flush=True,
             )
-    if not idx_pairs:
-        print("[final-act-compare][WARN] Keine gueltigen axis0-Indizes; skippe.", flush=True)
+    if not z_pairs:
+        print("[final-act-compare][WARN] Keine gueltigen axis2-Indizes; skippe.", flush=True)
         return
 
-    y_step = max(1, B_vis // 10)
-    z_step = max(1, C_vis // 10)
-    y_ticks = np.arange(0, B_vis, y_step)
-    z_ticks = np.arange(0, C_vis, z_step)
+    x_step_gt = max(1, B // 10)
+    y_step_gt = max(1, A // 10)
+    x_ticks_gt = np.arange(0, B, x_step_gt)
+    y_ticks_gt = np.arange(0, A, y_step_gt)
+
+    x_step_pr = max(1, R // 10)
+    y_step_pr = max(1, R // 10)
+    x_ticks_pr = np.arange(0, R, x_step_pr)
+    y_ticks_pr = np.arange(0, R, y_step_pr)
 
     scale_mode = str(getattr(args, "final_act_compare_scale", "shared"))
+    shared_vmin = shared_vmax = None
     if scale_mode == "shared":
-        gt_vals = gt_vis_np[np.isfinite(gt_vis_np)].ravel()
-        pred_vals = pred_np[np.isfinite(pred_np)].ravel()
-        if gt_vals.size == 0 and pred_vals.size == 0:
-            print("[final-act-compare][WARN] Keine finiten Werte fuer Skalierung; skippe.", flush=True)
-            return
-        if gt_vals.size == 0:
-            shared_vals = pred_vals
-        elif pred_vals.size == 0:
-            shared_vals = gt_vals
+        vals_list = []
+        for z_gt, z_pred in z_pairs:
+            gt_img = gt_np[:, :, z_gt]
+            pr_img = pred_np[:, :, z_pred]
+            gt_vals = gt_img[np.isfinite(gt_img)].ravel()
+            pr_vals = pr_img[np.isfinite(pr_img)].ravel()
+            if gt_vals.size:
+                vals_list.append(gt_vals)
+            if pr_vals.size:
+                vals_list.append(pr_vals)
+        if vals_list:
+            shared_vals = np.concatenate(vals_list, axis=0)
+            shared_vmin, shared_vmax = _robust_limits(shared_vals)
         else:
-            shared_vals = np.concatenate([gt_vals, pred_vals], axis=0)
-        shared_vmin, shared_vmax = _robust_limits(shared_vals)
-        gt_vmin, gt_vmax = shared_vmin, shared_vmax
-        pred_vmin, pred_vmax = shared_vmin, shared_vmax
-    else:
-        gt_vmin, gt_vmax = _robust_limits(gt_vis_np)
-        pred_vmin, pred_vmax = _robust_limits(pred_np)
+            shared_vmin, shared_vmax = 0.0, 1.0
 
-    rows = len(idx_pairs)
+    rows = len(z_pairs)
     fig, axs = plt.subplots(rows, 2, figsize=(12, 4 * rows), constrained_layout=True)
     axs = np.asarray(axs)
     if axs.ndim == 1:
         axs = axs.reshape(1, 2)
 
     im_gt_first = None
-    for row, (idx_gt, idx_pred) in enumerate(idx_pairs):
+    im_pr_first = None
+    for row, (z_gt, z_pred) in enumerate(z_pairs):
         ax_gt = axs[row, 0]
-        ax_pred = axs[row, 1]
+        ax_pr = axs[row, 1]
 
-        img_gt = gt_vis_np[idx_pred, :, :].astype(np.float32, copy=False)
-        img_pred = pred_np[idx_pred, :, :].astype(np.float32, copy=False)
+        gt_img = gt_np[:, :, z_gt].astype(np.float32, copy=False)
+        pr_img = pred_np[:, :, z_pred].astype(np.float32, copy=False)
 
-        gt_min, gt_mean, gt_max, gt_nz, _ = _slice_stats(img_gt)
-        pr_min, pr_mean, pr_max, pr_nz, _ = _slice_stats(img_pred)
+        gt_min, gt_mean, gt_max, gt_nz, gt_std = _slice_stats(gt_img)
+        pr_min, pr_mean, pr_max, pr_nz, pr_std = _slice_stats(pr_img)
         print(
-            f"[final-act-compare][axis0_gt={idx_gt} -> axis0_pred={idx_pred}] "
-            f"GT min/mean/max={gt_min:.3e}/{gt_mean:.3e}/{gt_max:.3e} nz_frac={gt_nz:.3f} | "
-            f"Pred min/mean/max={pr_min:.3e}/{pr_mean:.3e}/{pr_max:.3e} nz_frac={pr_nz:.3f}",
+            f"[final-act-compare][axial axis2_gt={z_gt} -> axis2_pred={z_pred}] "
+            f"GT min/mean/max={gt_min:.3e}/{gt_mean:.3e}/{gt_max:.3e} std={gt_std:.3e} nz_frac={gt_nz:.3f} | "
+            f"Pred min/mean/max={pr_min:.3e}/{pr_mean:.3e}/{pr_max:.3e} std={pr_std:.3e} nz_frac={pr_nz:.3f}",
             flush=True,
         )
+        if np.isfinite(pr_std) and pr_std < 1e-8:
+            print(
+                f"[final-act-compare][WARN] Pred axial slice axis2_pred={z_pred} ist nahezu konstant (std={pr_std:.3e}).",
+                flush=True,
+            )
+
+        if scale_mode == "shared":
+            gt_vmin, gt_vmax = float(shared_vmin), float(shared_vmax)
+            pr_vmin, pr_vmax = float(shared_vmin), float(shared_vmax)
+        else:
+            gt_vmin, gt_vmax = _robust_limits(gt_img)
+            pr_vmin, pr_vmax = _robust_limits(pr_img)
 
         im_gt = ax_gt.imshow(
-            img_gt,
+            gt_img,
             origin="upper",
-            extent=[0, C_vis - 1, B_vis - 1, 0],
+            extent=[0, B - 1, A - 1, 0],
             aspect="equal",
             cmap="viridis",
             vmin=gt_vmin,
             vmax=gt_vmax,
         )
-        im_pred = ax_pred.imshow(
-            img_pred,
+        im_pr = ax_pr.imshow(
+            pr_img,
             origin="upper",
-            extent=[0, C_vis - 1, B_vis - 1, 0],
+            extent=[0, R - 1, R - 1, 0],
             aspect="equal",
             cmap="viridis",
-            vmin=pred_vmin,
-            vmax=pred_vmax,
+            vmin=pr_vmin,
+            vmax=pr_vmax,
         )
 
         if im_gt_first is None:
             im_gt_first = im_gt
+        if im_pr_first is None:
+            im_pr_first = im_pr
 
-        if resampling_active and idx_pred != idx_gt:
-            ax_gt.set_title(f"GT sagittal (act→pred grid) @ axis0_gt={idx_gt} → {idx_pred}")
-        else:
-            ax_gt.set_title(f"GT sagittal (act) @ axis0={idx_gt}")
-        ax_pred.set_title(f"Pred sagittal (act_pred) @ axis0={idx_pred}")
+        ax_gt.set_title(f"GT axial (act) @ axis2={z_gt}")
+        ax_pr.set_title(f"Pred axial (act_pred) @ axis2_pred={z_pred} (from {z_gt})")
 
-        ax_gt.set_xlabel("axis2 (z-like)")
-        ax_pred.set_xlabel("axis2 (z-like)")
-        ax_gt.set_ylabel("axis1 (y-like)")
-        ax_pred.set_ylabel("axis1 (y-like)")
+        ax_gt.set_xlabel("axis1 (x-like)")
+        ax_pr.set_xlabel("axis1 (x-like)")
+        ax_gt.set_ylabel("axis0 (y-like)")
+        ax_pr.set_ylabel("axis0 (y-like)")
 
-        ax_gt.set_xticks(z_ticks)
-        ax_gt.set_yticks(y_ticks)
-        ax_pred.set_xticks(z_ticks)
-        ax_pred.set_yticks(y_ticks)
+        ax_gt.set_xticks(x_ticks_gt)
+        ax_gt.set_yticks(y_ticks_gt)
+        ax_pr.set_xticks(x_ticks_pr)
+        ax_pr.set_yticks(y_ticks_pr)
 
-    if im_gt_first is not None:
-        cbar = fig.colorbar(im_gt_first, ax=axs.ravel().tolist(), shrink=0.92)
-        if scale_mode == "shared":
+    if scale_mode == "shared":
+        if im_gt_first is not None:
+            cbar = fig.colorbar(im_gt_first, ax=axs.ravel().tolist(), shrink=0.92)
             cbar.set_label("Activity (shared robust scale)")
-        else:
-            cbar.set_label("Activity (robust scale; separate per side)")
+    else:
+        if im_gt_first is not None:
+            cbar_gt = fig.colorbar(im_gt_first, ax=axs[:, 0].ravel().tolist(), shrink=0.92)
+            cbar_gt.set_label("GT activity (robust scale)")
+        if im_pr_first is not None:
+            cbar_pr = fig.colorbar(im_pr_first, ax=axs[:, 1].ravel().tolist(), shrink=0.92)
+            cbar_pr.set_label("Pred activity (robust scale)")
 
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
