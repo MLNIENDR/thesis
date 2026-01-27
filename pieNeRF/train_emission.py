@@ -3,8 +3,10 @@ import argparse
 import csv
 import math
 import logging
+import signal
 import subprocess
 import time
+import traceback
 from pathlib import Path
 from typing import Optional, Tuple, Dict
 
@@ -81,6 +83,24 @@ def parse_args():
         type=int,
         default=50,
         help="If >0 renders and stores full AP/PA previews every N steps (slow, full-frame render).",
+    )
+    parser.add_argument(
+        "--depth-profile-signal-quantile",
+        type=float,
+        default=0.99,
+        help="Quantil fuer Signal-Kandidaten in Depth-Profile-Plots (auf Target-Score).",
+    )
+    parser.add_argument(
+        "--depth-profile-bg-quantile",
+        type=float,
+        default=0.10,
+        help="Quantil fuer Background-Kandidaten in Depth-Profile-Plots (auf Target-Score).",
+    )
+    parser.add_argument(
+        "--depth-profile-seed",
+        type=int,
+        default=123,
+        help="Seed fuer deterministische Auswahl der Depth-Profile-Strahlen.",
     )
     parser.add_argument(
         "--save-every",
@@ -197,6 +217,12 @@ def parse_args():
         help="Gewicht fuer Gain-Regularisierung (log-gain prior).",
     )
     parser.add_argument(
+        "--gain-reg-scale",
+        type=float,
+        default=1.0,
+        help="Skalierung fuer Gain-Regularisierung (1.0 = unveraendert).",
+    )
+    parser.add_argument(
         "--gain-prior-mode",
         type=str,
         default="ema_init",
@@ -212,13 +238,13 @@ def parse_args():
     parser.add_argument(
         "--gain-clamp-min",
         type=float,
-        default=1e-3,
+        default=0.05,
         help="Optionales Minimum fuer Gain (nur im proj-loss Pfad).",
     )
     parser.add_argument(
         "--gain-clamp-max",
         type=float_or_none,
-        default=None,
+        default=5.0,
         help="Optionales Maximum fuer Gain (nur im proj-loss Pfad). Setze 'none' fuer aus.",
     )
     parser.add_argument(
@@ -353,6 +379,18 @@ def parse_args():
         type=float,
         default=0.0,
         help="Optionales Minimum fuer edge-aware TV-Gewichte (z.B. 0.2).",
+    )
+    parser.add_argument(
+        "--depth-sanity-every",
+        type=int,
+        default=50,
+        help="Depth-Checks/Abbruch alle N Schritte (0 = deaktiviert).",
+    )
+    parser.add_argument(
+        "--proj-collapse-patience",
+        type=int,
+        default=0,
+        help="Abbruch erst nach N aufeinanderfolgenden Projection-Collapses (0 = nie aborten).",
     )
     parser.add_argument(
         "--grad-stats-every",
@@ -1038,6 +1076,7 @@ def log_effective_config(outdir: Path, config: dict, args):
             f"| proj_warmup_steps={args.proj_warmup_steps} | proj_weight_min={args.proj_weight_min} "
             f"| proj_ramp_steps={args.proj_ramp_steps} | proj_target_source={args.proj_target_source} "
             f"| proj_gain_source={args.proj_gain_source} | gain_reg_weight={args.gain_reg_weight} "
+            f"| gain_reg_scale={args.gain_reg_scale} "
             f"| gain_prior_mode={args.gain_prior_mode} | gain_prior_value={args.gain_prior_value} "
             f"| gain_clamp_min={args.gain_clamp_min} | gain_clamp_max={args.gain_clamp_max} "
             f"| encoder_proj_transform={args.encoder_proj_transform} "
@@ -1149,6 +1188,10 @@ def maybe_render_preview(
     ct_volume=None,
     act_volume=None,
     ct_context=None,
+    target_ap=None,
+    target_pa=None,
+    target_ap_counts=None,
+    target_pa_counts=None,
 ):
     # Volle AP/PA-Renderings sind teuer; nur alle N Schritte ausführen
     if args.preview_every <= 0 or (step % args.preview_every) != 0:
@@ -1169,7 +1212,23 @@ def maybe_render_preview(
     out_dir.mkdir(parents=True, exist_ok=True)
     save_img(ap_np, out_dir / f"step_{step:05d}_AP.png", title=f"AP @ step {step}")
     save_img(pa_np, out_dir / f"step_{step:05d}_PA.png", title=f"PA @ step {step}")
-    save_depth_profile(step, generator, z_eval, ct_volume, act_volume, out_dir, proj_ap=proj_ap, proj_pa=proj_pa)
+    save_depth_profile(
+        step,
+        generator,
+        z_eval,
+        ct_volume,
+        act_volume,
+        out_dir,
+        proj_ap=proj_ap,
+        proj_pa=proj_pa,
+        target_ap=target_ap,
+        target_pa=target_pa,
+        target_ap_counts=target_ap_counts,
+        target_pa_counts=target_pa_counts,
+        signal_quantile=args.depth_profile_signal_quantile,
+        bg_quantile=args.depth_profile_bg_quantile,
+        seed=args.depth_profile_seed,
+    )
     print("🖼️ Preview gespeichert:", flush=True)
     print("   ", (out_dir / f"step_{step:05d}_AP.png").resolve(), flush=True)
     print("   ", (out_dir / f"step_{step:05d}_PA.png").resolve(), flush=True)
@@ -1277,10 +1336,10 @@ def init_hybrid_log_file(path: Path):
                 "pred_pa_mean",
                 "pred_pa_p95",
                 "pred_pa_max",
-                "lambda_min",
-                "lambda_mean",
-                "lambda_p95",
-                "lambda_max",
+                "lambda_ray_min",
+                "lambda_ray_mean",
+                "lambda_ray_p95",
+                "lambda_ray_max",
                 "mu_min",
                 "mu_mean",
                 "mu_p95",
@@ -1344,7 +1403,23 @@ def compute_psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
     return -10.0 * math.log10(mse + 1e-12)
 
 
-def save_depth_profile(step, generator, z_latent, ct_vol, act_vol, outdir: Path, proj_ap=None, proj_pa=None):
+def save_depth_profile(
+    step,
+    generator,
+    z_latent,
+    ct_vol,
+    act_vol,
+    outdir: Path,
+    proj_ap=None,
+    proj_pa=None,
+    target_ap=None,
+    target_pa=None,
+    target_ap_counts=None,
+    target_pa_counts=None,
+    signal_quantile: float = 0.99,
+    bg_quantile: float = 0.10,
+    seed: int = 123,
+):
     """
     Speichert Tiefenprofile (λ/μ/Prediction) entlang ausgewählter Strahlen für Analyse/Debugging.
     """
@@ -1352,6 +1427,53 @@ def save_depth_profile(step, generator, z_latent, ct_vol, act_vol, outdir: Path,
 
     ap_img = proj_ap.detach().view(H, W).cpu().numpy() if proj_ap is not None else None
     pa_img = proj_pa.detach().view(H, W).cpu().numpy() if proj_pa is not None else None
+
+    def proj_to_img(t: Optional[torch.Tensor]):
+        if t is None:
+            return None
+        t = t.detach()
+        if t.numel() == H * W:
+            t = t.view(H, W)
+        elif t.dim() >= 2 and t.shape[-2:] == (H, W):
+            t = t.reshape(-1, H, W)[0]
+        else:
+            return None
+        return t.cpu().numpy()
+
+    ap_counts_img = proj_to_img(target_ap_counts)
+    pa_counts_img = proj_to_img(target_pa_counts)
+    ap_target_img = proj_to_img(target_ap)
+    pa_target_img = proj_to_img(target_pa)
+
+    use_counts_targets = ap_counts_img is not None and pa_counts_img is not None
+    if use_counts_targets:
+        target_ap_img = ap_counts_img
+        target_pa_img = pa_counts_img
+        target_kind = "counts"
+    else:
+        target_ap_img = ap_target_img
+        target_pa_img = pa_target_img
+        target_kind = "norm" if (target_ap_img is not None or target_pa_img is not None) else "none"
+
+    if target_ap_img is not None and target_pa_img is not None:
+        score_map = np.maximum(target_ap_img, target_pa_img)
+    elif target_ap_img is not None:
+        score_map = target_ap_img.copy()
+    elif target_pa_img is not None:
+        score_map = target_pa_img.copy()
+    else:
+        score_map = None
+
+    ap_title_img = target_ap_img
+    pa_title_img = target_pa_img
+    if ap_title_img is None:
+        ap_title_img = proj_to_img(proj_ap)
+    if pa_title_img is None:
+        pa_title_img = proj_to_img(proj_pa)
+
+    signal_quantile = float(np.clip(signal_quantile, 0.0, 1.0))
+    bg_quantile = float(np.clip(bg_quantile, 0.0, 1.0))
+    rng = np.random.default_rng(int(seed))
 
     act_data = act_vol.detach().cpu().numpy() if act_vol is not None else None
     act_masks = None
@@ -1393,6 +1515,74 @@ def save_depth_profile(step, generator, z_latent, ct_vol, act_vol, outdir: Path,
 
         def is_far_enough(idx):
             return all(dist(idx, c) > 8 for c in chosen)
+
+        # Deterministische, target-basierte Auswahl: 1x Background (niedrig),
+        # 3x Signal (oberstes Quantil), bevorzugt mit Count-Targets.
+        if score_map is not None and np.isfinite(score_map).any():
+            valid_mask = np.isfinite(score_map)
+            scores_valid = score_map[valid_mask]
+            if scores_valid.size > 0:
+                q_sig = float(np.quantile(scores_valid, signal_quantile))
+                q_bg = float(np.quantile(scores_valid, bg_quantile))
+
+                zero_mask = (score_map == 0) & valid_mask
+                valid_count = int(scores_valid.size)
+                zero_count = int(zero_mask.sum())
+                bg_needed = max(1, int(math.ceil(bg_quantile * valid_count)))
+                many_zeros = zero_count >= bg_needed or q_bg <= 0.0
+                bg_mask = zero_mask if many_zeros else ((score_map <= q_bg) & valid_mask)
+                sig_mask = (score_map >= q_sig) & valid_mask
+
+                def sample_from_coords(coords: np.ndarray):
+                    if coords.size == 0:
+                        return None
+                    idx = int(rng.integers(0, len(coords)))
+                    y, x = coords[idx]
+                    return int(y), int(x)
+
+                bg_idx = None
+                bg_coords = np.argwhere(bg_mask)
+                if bg_coords.size > 0:
+                    bg_scores = score_map[bg_mask]
+                    median_val = float(np.median(bg_scores))
+                    diffs = np.abs(bg_scores - median_val)
+                    min_diff = float(diffs.min())
+                    near_idx = np.flatnonzero(np.isclose(diffs, min_diff, rtol=0.0, atol=1e-12))
+                    bg_idx = sample_from_coords(bg_coords[near_idx]) if near_idx.size > 0 else sample_from_coords(bg_coords)
+                if bg_idx is None:
+                    min_val = float(np.min(scores_valid))
+                    min_mask = valid_mask & np.isclose(score_map, min_val, rtol=0.0, atol=1e-12)
+                    bg_idx = sample_from_coords(np.argwhere(min_mask if min_mask.any() else valid_mask))
+                add_unique(bg_idx)
+
+                sig_coords = np.argwhere(sig_mask)
+                if sig_coords.size > 0:
+                    sig_scores = score_map[sig_mask]
+                    order = np.argsort(sig_scores)[::-1]
+                    for idx in order:
+                        if len(chosen) >= num_zero + num_active:
+                            break
+                        y, x = sig_coords[int(idx)]
+                        add_unique((int(y), int(x)))
+
+                if len(chosen) < num_zero + num_active:
+                    valid_coords = np.argwhere(valid_mask)
+                    valid_scores = score_map[valid_mask]
+                    order_global = np.argsort(valid_scores)[::-1]
+                    for idx in order_global:
+                        if len(chosen) >= num_zero + num_active:
+                            break
+                        y, x = valid_coords[int(idx)]
+                        add_unique((int(y), int(x)))
+
+                attempts = 0
+                while len(chosen) < num_zero + num_active and attempts < 128:
+                    attempts += 1
+                    cand = sample_from_coords(np.argwhere(valid_mask))
+                    add_unique(cand)
+
+                if chosen:
+                    return chosen[: num_zero + num_active]
 
         def pick_from_mask(mask, prefer_high: bool):
             if mask is None:
@@ -1560,12 +1750,36 @@ def save_depth_profile(step, generator, z_latent, ct_vol, act_vol, outdir: Path,
         cached_indices = cache.get("indices")
         cached_shape = cache.get("shape")
         cached_total = cache.get("total")
-        if cached_indices and cached_shape == (generator.H, generator.W) and cached_total == target_total:
+        cached_sig_q = cache.get("signal_quantile")
+        cached_bg_q = cache.get("bg_quantile")
+        cached_seed = cache.get("seed")
+        cached_target_kind = cache.get("target_kind")
+        if (
+            cached_indices
+            and cached_shape == (generator.H, generator.W)
+            and cached_total == target_total
+            and cached_sig_q == signal_quantile
+            and cached_bg_q == bg_quantile
+            and cached_seed == int(seed)
+            and cached_target_kind == target_kind
+        ):
             ray_indices_cache = cached_indices
 
     if ray_indices_cache is None:
         ray_indices = pick_ray_indices(num_zero=num_zero, num_active=num_active)
-        setattr(generator, cache_attr, {"indices": list(ray_indices), "shape": (generator.H, generator.W), "total": target_total})
+        setattr(
+            generator,
+            cache_attr,
+            {
+                "indices": list(ray_indices),
+                "shape": (generator.H, generator.W),
+                "total": target_total,
+                "signal_quantile": signal_quantile,
+                "bg_quantile": bg_quantile,
+                "seed": int(seed),
+                "target_kind": target_kind,
+            },
+        )
     else:
         ray_indices = ray_indices_cache
 
@@ -1602,12 +1816,12 @@ def save_depth_profile(step, generator, z_latent, ct_vol, act_vol, outdir: Path,
             ax.plot(depth_axis, curve, label=label)
 
         title_extra = []
-        if ap_img is not None:
-            title_extra.append(f"I_AP={ap_img[y_idx, x_idx]:.2e}")
-        if pa_img is not None:
-            title_extra.append(f"I_PA={pa_img[y_idx, x_idx]:.2e}")
+        if ap_title_img is not None:
+            title_extra.append(f"I_AP={ap_title_img[y_idx, x_idx]:.2e}")
+        if pa_title_img is not None:
+            title_extra.append(f"I_PA={pa_title_img[y_idx, x_idx]:.2e}")
         aux = " | ".join(title_extra)
-        ax.set_title(f"Strahl y={y_idx}, x={x_idx}" + (f"\n{aux}" if aux else ""))
+        ax.set_title(f"({y_idx},{x_idx})" + (f"\n{aux}" if aux else ""))
         ax.set_ylim(0, 1.05)
         ax.grid(True, alpha=0.2)
         ax.legend(loc="upper right", fontsize=8)
@@ -1658,24 +1872,42 @@ def evaluate_pixel_subsets(
             ray_batch_ap = slice_rays(rays_cache["ap"], idx_ap)
             ray_batch_pa = slice_rays(rays_cache["pa"], idx_pa)
 
-            pred_ap, _ = render_minibatch(generator, z_latent, ray_batch_ap, ct_context=ct_context)
-            pred_pa, _ = render_minibatch(generator, z_latent, ray_batch_pa, ct_context=ct_context)
+            pred_ap_raw, _ = render_minibatch(generator, z_latent, ray_batch_ap, ct_context=ct_context)
+            pred_pa_raw, _ = render_minibatch(generator, z_latent, ray_batch_pa, ct_context=ct_context)
+
+            if loss_fn == poisson_nll:
+                lambda_ap_used = F.softplus(pred_ap_raw) - math.log(2.0)
+                lambda_pa_used = F.softplus(pred_pa_raw) - math.log(2.0)
+                lambda_ap_used = lambda_ap_used.clamp_min(1e-6)
+                lambda_pa_used = lambda_pa_used.clamp_min(1e-6)
+            else:
+                lambda_ap_used = pred_ap_raw
+                lambda_pa_used = pred_pa_raw
 
             if pred_scale != 1.0:
-                pred_ap = pred_ap * float(pred_scale)
-                pred_pa = pred_pa * float(pred_scale)
+                lambda_ap_used = lambda_ap_used * float(pred_scale)
+                lambda_pa_used = lambda_pa_used * float(pred_scale)
             if gain is not None:
-                pred_ap = pred_ap * gain
-                pred_pa = pred_pa * gain
+                lambda_ap_used = lambda_ap_used * gain
+                lambda_pa_used = lambda_pa_used * gain
+            pred_ap = lambda_ap_used
+            pred_pa = lambda_pa_used
 
             target_ap = ap_flat_proc[0, idx_ap].unsqueeze(0)
             target_pa = pa_flat_proc[0, idx_pa].unsqueeze(0)
 
-            pred_ap = pred_ap.clamp_min(1e-8)
-            pred_pa = pred_pa.clamp_min(1e-8)
+            if (target_ap < 0).any() or (target_pa < 0).any():
+                print("[WARN] Negative projection targets detected in eval.", flush=True)
+            if loss_fn == poisson_nll:
+                if not torch.isfinite(pred_ap).all() or not torch.isfinite(pred_pa).all():
+                    raise RuntimeError("Non-finite lambda in Poisson projection loss (eval).")
+                if (pred_ap <= 0).any() or (pred_pa <= 0).any():
+                    raise RuntimeError("Non-positive lambda in Poisson projection loss (eval).")
 
             weight_ap = build_loss_weights(target_ap, bg_weight, weight_threshold)
             weight_pa = build_loss_weights(target_pa, bg_weight, weight_threshold)
+
+            # ---------------------------------------------------------------------------
             loss_ap = loss_fn(pred_ap, target_ap, weight=weight_ap)
             loss_pa = loss_fn(pred_pa, target_pa, weight=weight_pa)
             loss_total = 0.5 * (loss_ap + loss_pa)
@@ -2002,11 +2234,46 @@ def train():
     ray_tv_edge_aware = bool(training_cfg.get("ray_tv_edge_aware", False))
     ray_tv_alpha = float(training_cfg.get("ray_tv_alpha", 0.0))
     ray_tv_w_clamp_min = float(training_cfg.get("ray_tv_w_clamp_min", 0.0))
+    depth_sanity_every = int(max(0, args.depth_sanity_every))
+    depth_checks_active = depth_sanity_every > 0
+    depth_grad_zero_streak = 0
 
     generator = build_models(config)
     generator.to(device)
     generator.train()
     generator.use_test_kwargs = False  # enforce training kwargs
+
+    def _depth_grad_norm(loss_term: torch.Tensor, module_candidate) -> float:
+        def _local_grad_norm(loss_term_local: torch.Tensor, module_local: torch.nn.Module) -> float:
+            if loss_term_local is None or not loss_term_local.requires_grad:
+                return 0.0
+            params = [p for p in module_local.parameters() if p.requires_grad]
+            if not params:
+                return 0.0
+            grads = torch.autograd.grad(loss_term_local, params, retain_graph=True, allow_unused=True)
+            grads = [g for g in grads if g is not None]
+            if not grads:
+                return 0.0
+            flat = torch.cat([g.reshape(-1) for g in grads])
+            return float(flat.norm().detach().cpu().item())
+
+        target = (
+            module_candidate
+            if isinstance(module_candidate, torch.nn.Module)
+            else (generator if isinstance(generator, torch.nn.Module) else None)
+        )
+        if target is None:
+            print("[WARN][depth] Grad-Target ist kein nn.Module; skippe Depth-Grad-Norm.", flush=True)
+            return 0.0
+        if "grad_norm_of_module" in globals():
+            try:
+                return grad_norm_of_module(loss_term, target)
+            except Exception as exc:
+                print(
+                    f"[WARN][depth] grad_norm_of_module failed ({exc.__class__.__name__}); nutze Fallback.",
+                    flush=True,
+                )
+        return _local_grad_norm(loss_term, target)
 
     # always provide AP/PA fallback poses if not already configured
     generator.set_fixed_ap_pa(radius=hwfr[3])
@@ -2302,6 +2569,14 @@ def train():
         else:
             z_latent = z_base
 
+        scale_joint_used = 1.0
+        if isinstance(meta, dict):
+            meta_scale = meta.get("proj_scale_joint_p99")
+            if torch.is_tensor(meta_scale):
+                meta_scale = meta_scale.item() if meta_scale.numel() > 0 else None
+            if isinstance(meta_scale, (int, float)) and math.isfinite(meta_scale) and meta_scale > 0:
+                scale_joint_used = float(meta_scale)
+
         idx_ap = torch.randperm(num_pixels, device=device)[:rays_per_proj]
         idx_pa = map_pa_indices_torch(idx_ap, W, pa_xflip)
         ray_batch_ap = slice_rays(rays_cache["ap"], idx_ap)
@@ -2312,23 +2587,29 @@ def train():
             proj_weight = float(args.proj_loss_weight)
 
         with torch.cuda.amp.autocast(enabled=amp_enabled):
-            pred_ap, _ = render_minibatch(generator, z_latent, ray_batch_ap, ct_context=ct_context)
-            pred_pa, _ = render_minibatch(generator, z_latent, ray_batch_pa, ct_context=ct_context)
-            if hybrid_enabled and args.proj_target_source == "counts" and batch.get("ap_counts") is not None:
-                ap_counts = batch.get("ap_counts").to(device, non_blocking=True).float()
-                pa_counts = batch.get("pa_counts").to(device, non_blocking=True).float()
+            pred_ap_raw, _ = render_minibatch(generator, z_latent, ray_batch_ap, ct_context=ct_context)
+            pred_pa_raw, _ = render_minibatch(generator, z_latent, ray_batch_pa, ct_context=ct_context)
+            ap_counts = batch.get("ap_counts")
+            pa_counts = batch.get("pa_counts")
+            use_counts = ap_counts is not None and ap_counts.numel() > 0 and pa_counts is not None and pa_counts.numel() > 0
+            if use_counts:
+                ap_counts = ap_counts.to(device, non_blocking=True).float()
+                pa_counts = pa_counts.to(device, non_blocking=True).float()
                 target_ap = ap_counts.reshape(ap_counts.shape[0], -1)[0, idx_ap].unsqueeze(0)
                 target_pa = pa_counts.reshape(pa_counts.shape[0], -1)[0, idx_pa].unsqueeze(0)
             else:
                 target_ap = ap.reshape(ap.shape[0], -1)[0, idx_ap].unsqueeze(0)
                 target_pa = pa.reshape(pa.shape[0], -1)[0, idx_pa].unsqueeze(0)
-            pred_ap_raw = pred_ap.clamp_min(1e-8)
-            pred_pa_raw = pred_pa.clamp_min(1e-8)
-            pred_ap = pred_ap_raw
-            pred_pa = pred_pa_raw
-            if hybrid_enabled and args.proj_target_source == "counts":
+
+            if proj_loss_type == "poisson":
+                pred_ap = F.softplus(pred_ap_raw) + 1e-6
+                pred_pa = F.softplus(pred_pa_raw) + 1e-6
+            else:
                 pred_ap = pred_ap_raw
                 pred_pa = pred_pa_raw
+            if use_counts:
+                pred_ap = pred_ap * float(scale_joint_used)
+                pred_pa = pred_pa * float(scale_joint_used)
                 if gain_head is not None and z_enc is not None:
                     gain_val = F.softplus(gain_head(z_enc))
                     pred_ap = pred_ap * gain_val
@@ -2386,936 +2667,1301 @@ def train():
 
     data_iter = iter(dataloader)
     ct_context = None
+    max_steps_cfg = None
+    if isinstance(training_cfg, dict):
+        max_steps_cfg = training_cfg.get("max_steps")
+    if max_steps_cfg is None:
+        max_steps_cfg = config.get("max_steps")
+    if max_steps_cfg is not None and args.max_steps is not None and args.max_steps > 0:
+        if int(max_steps_cfg) != int(args.max_steps):
+            print(
+                f"[cfg] max_steps in config={int(max_steps_cfg)} -> CLI override (using {int(args.max_steps)})",
+                flush=True,
+            )
+    max_steps = int(args.max_steps)
+    last_step = 0
+    exit_reason = "normal"
+
+    def _signal_handler(signum, frame):
+        nonlocal exit_reason, last_step
+        exit_reason = "signal"
+        try:
+            signame = signal.Signals(signum).name
+        except Exception:
+            signame = str(signum)
+        print(
+            f"[signal] received {signame} last_step={last_step} max_steps={max_steps}",
+            flush=True,
+        )
+        raise SystemExit(128 + int(signum))
+
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
     print(
-        f"🚀 Starting emission-NeRF training | steps={args.max_steps} | rays/proj={rays_per_proj} "
+        f"🚀 Starting emission-NeRF training | steps={max_steps} | rays/proj={rays_per_proj} "
         f"| image={generator.H}x{generator.W} | chunk={generator.chunk}"
     )
     scale_ap_used = 1.0
     scale_pa_used = 1.0
     scale_joint_used = 1.0
     scale_missing_warned = False
+    counts_missing_warned = False
     act_norm_global = None
     last_z_latent = z_train
+    last_gain_val = None
     gain_prior_ema = None
     gain_prior_final = None
     gain_prior_decay = 0.9
     gain_prior_steps = 50
+    proj_collapse_count = 0
 
-    for step in range(1, args.max_steps + 1):
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(dataloader)
-            batch = next(data_iter)
-
-        ap = batch["ap"].to(device, non_blocking=True).float()
-        pa = batch["pa"].to(device, non_blocking=True).float()
-        meta = batch.get("meta")
-        meta_scale = None
-        meta_missing = False
-        if isinstance(meta, dict):
-            meta_scale = meta.get("proj_scale_joint_p99")
-            meta_missing = meta.get("proj_scale_joint_p99_missing", False)
-            if isinstance(meta_scale, (list, tuple)):
-                meta_scale = meta_scale[0] if meta_scale else None
-            if torch.is_tensor(meta_scale):
-                meta_scale = meta_scale.item() if meta_scale.numel() > 0 else None
-            if torch.is_tensor(meta_missing):
-                meta_missing = bool(meta_missing.item()) if meta_missing.numel() > 0 else False
-        if meta_scale is None or (isinstance(meta_scale, float) and math.isnan(meta_scale)) or meta_missing:
-            scale_joint_used = 1.0
-            if not scale_missing_warned:
-                print(
-                    "[WARN] proj_scale_joint_p99 fehlt im manifest; physikalische Metriken sind bedeutungslos.",
-                    flush=True,
-                )
-                scale_missing_warned = True
-        else:
-            scale_joint_used = float(meta_scale)
-        pred_to_counts_scale = scale_joint_used if (hybrid_enabled and args.proj_target_source == "counts") else 1.0
-        if hybrid_enabled and args.proj_target_source == "counts":
-            scale_ap_used = 1.0
-            scale_pa_used = 1.0
-        else:
-            scale_ap_used = scale_joint_used
-            scale_pa_used = scale_joint_used
-        if step == 1:
-            print(
-                f"[scale] projections_on_disk_normalized_with_joint_p99: proj_scale_joint_p99={scale_joint_used:.3e}",
-                flush=True,
-            )
-        act_vol = batch.get("act")
-        if act_vol is not None:
-            if act_vol.numel() == 0:
-                act_vol = None
-            else:
-                act_vol = act_vol.to(device, non_blocking=True)
-        ct_vol = batch.get("ct")
-        if ct_vol is not None:
-            ct_vol = ct_vol.to(device, non_blocking=True).float()
-        ct_context = generator.build_ct_context(ct_vol, padding_mode=args.ct_padding_mode) if ct_vol is not None else None
-
-        # Wichtig: Flatten-Order ist (y * W + x), identisch zu den Ray-Indizes aus make_stratified_tile_split.
-        # Keine permute/transpose zwischen (H, W) und reshape(-1), damit Target/Predict exakt die gleiche Reihenfolge teilen.
-        ap_flat = ap.reshape(batch_size, -1)
-        pa_flat = pa.reshape(batch_size, -1)
-        ap_counts = batch.get("ap_counts")
-        pa_counts = batch.get("pa_counts")
-        if ap_counts is not None and ap_counts.numel() > 0:
-            ap_counts = ap_counts.to(device, non_blocking=True).float()
-        else:
-            ap_counts = None
-        if pa_counts is not None and pa_counts.numel() > 0:
-            pa_counts = pa_counts.to(device, non_blocking=True).float()
-        else:
-            pa_counts = None
-
-        if hybrid_enabled and args.proj_target_source == "counts":
-            if ap_counts is None or pa_counts is None:
-                raise ValueError("proj_target_source=counts but ap_counts/pa_counts missing.")
-            ap_flat_proc = ap_counts.reshape(batch_size, -1)
-            pa_flat_proc = pa_counts.reshape(batch_size, -1)
-        else:
-            ap_flat_proc = ap_flat
-            pa_flat_proc = pa_flat
-
-        z_base = z_train
-        if z_base.shape[0] != ap.shape[0]:
-            z_base = z_base.expand(ap.shape[0], -1)
-        z_enc = None
-        z_enc_proj = None
-        proj_scale_enc = None
-        if hybrid_enabled and encoder is not None:
-            proj_scale_enc = compute_proj_scale(ap, pa, args.proj_scale_source, meta)
-            proj_scale_enc = torch.clamp(proj_scale_enc, min=1e-6)
-            enc_input = build_encoder_input(
-                ap,
-                pa,
-                ct_vol,
-                proj_scale_enc,
-                args.encoder_proj_transform,
-                args.encoder_use_ct,
-            )
-            z_enc = encoder(enc_input)
-            if z_enc.shape[0] != z_base.shape[0]:
-                z_base = z_base.expand(z_enc.shape[0], -1)
-            if z_fuser is not None:
-                z_enc_proj = z_fuser(z_enc)
-            else:
-                z_enc_proj = z_enc
-            z_latent = z_base + (z_enc_alpha * z_enc_proj)
-        else:
-            z_latent = z_base
-        last_z_latent = z_latent
-
-        skip_proj = bool(args.act_only)
-        debug_act_step = bool(args.debug_act and step == 1)
-        proj_metrics_enabled = (not skip_proj) and not (hybrid_enabled and args.proj_loss_weight <= 0.0)
-
-        optimizer.zero_grad(set_to_none=True)
-        t0 = time.perf_counter()
-
-        need_ray_tv = (not skip_proj) and ray_tv_weight != 0.0
-        need_bg_depth = (not skip_proj) and args.bg_depth_mass_weight > 0.0
-        need_raw_stats = proj_metrics_enabled and hybrid_enabled and args.log_every > 0 and (step % args.log_every == 0 or step == 1)
-        need_raw = need_ray_tv or need_bg_depth or need_raw_stats
-
-        idx_ap = None
-        idx_pa = None
-        ray_batch_ap = None
-        ray_batch_pa = None
-        proj_weight = 0.0
-        if not skip_proj:
-            if ray_split_enabled and pixel_split_np is not None and rng_train is not None:
-                idx_np = sample_train_indices(pixel_split_np, rays_per_proj, ray_train_fg_frac, rng_train)
-                idx_ap = torch.from_numpy(idx_np).long().to(device, non_blocking=True)
-                idx_pa = map_pa_indices_torch(idx_ap, W, pa_xflip)
-            else:
-                idx_ap = sample_split_indices(ray_indices["pixel"]["train_idx_all"], rays_per_proj)
-                idx_pa = map_pa_indices_torch(idx_ap, W, pa_xflip)
-
-            ray_batch_ap = slice_rays(rays_cache["ap"], idx_ap)
-            ray_batch_pa = slice_rays(rays_cache["pa"], idx_pa)
-
-            proj_weight = 1.0
-            if hybrid_enabled:
-                proj_weight_min = float(args.proj_weight_min)
-                proj_weight_max = float(args.proj_loss_weight)
-                if args.proj_warmup_steps > 0 and step <= args.proj_warmup_steps:
-                    proj_weight = proj_weight_min
-                else:
-                    ramp_steps = max(1, int(args.proj_ramp_steps))
-                    ramp_t = min(1.0, max(0.0, (step - max(args.proj_warmup_steps, 0)) / float(ramp_steps)))
-                    proj_weight = proj_weight_min + ramp_t * (proj_weight_max - proj_weight_min)
-
-        loss = torch.tensor(0.0, device=device)
-        loss_ap = torch.tensor(0.0, device=device)
-        loss_pa = torch.tensor(0.0, device=device)
-        loss_proj = torch.tensor(0.0, device=device)
-        pred_ap = None
-        pred_pa = None
-        pred_ap_raw = None
-        pred_pa_raw = None
-        target_ap = None
-        target_pa = None
-        extras_ap = None
-        extras_pa = None
-        gain_val = None
-
-        with torch.cuda.amp.autocast(enabled=amp_enabled):
-            if not skip_proj:
-                pred_ap, extras_ap = render_minibatch(
-                    generator, z_latent, ray_batch_ap, ct_context=ct_context, return_raw=need_raw
-                )
-                pred_pa, extras_pa = render_minibatch(
-                    generator, z_latent, ray_batch_pa, ct_context=ct_context, return_raw=need_raw
-                )
-
-                target_ap = ap_flat_proc[0, idx_ap].unsqueeze(0)
-                target_pa = pa_flat_proc[0, idx_pa].unsqueeze(0)
-
-                # Poisson-NLL erwartet pred >= 0
-                pred_ap_raw = pred_ap.clamp_min(1e-8)
-                pred_pa_raw = pred_pa.clamp_min(1e-8)
-
-                pred_ap = pred_ap_raw
-                pred_pa = pred_pa_raw
-                if hybrid_enabled and args.proj_target_source == "counts":
-                    pred_ap = pred_ap_raw * float(pred_to_counts_scale)
-                    pred_pa = pred_pa_raw * float(pred_to_counts_scale)
-                    if gain_head is not None and z_enc is not None:
-                        gain_raw = gain_head(z_enc)
-                        gain_val = F.softplus(gain_raw)
-                        pred_ap = pred_ap * gain_val
-                        pred_pa = pred_pa * gain_val
-                    elif gain_param is not None:
-                        gain_val = F.softplus(gain_param)
-                        pred_ap = pred_ap * gain_val
-                        pred_pa = pred_pa * gain_val
-                    if gain_val is not None:
-                        g_min = float(args.gain_clamp_min) if args.gain_clamp_min is not None else None
-                        g_max = args.gain_clamp_max
-                        if g_min is not None or g_max is not None:
-                            gmin = g_min if g_min is not None else -float("inf")
-                            gmax = g_max if g_max is not None else float("inf")
-                            gain_val = torch.clamp(gain_val, min=gmin, max=gmax)
-                            pred_ap = pred_ap_raw * float(pred_to_counts_scale) * gain_val
-                            pred_pa = pred_pa_raw * float(pred_to_counts_scale) * gain_val
-
-                weight_ap = build_loss_weights(target_ap, args.bg_weight, args.weight_threshold)
-                weight_pa = build_loss_weights(target_pa, args.bg_weight, args.weight_threshold)
-
-                loss_ap = loss_fn(pred_ap, target_ap, weight=weight_ap)
-                loss_pa = loss_fn(pred_pa, target_pa, weight=weight_pa)
-                loss_proj = 0.5 * (loss_ap + loss_pa)
-                if hybrid_enabled:
-                    if proj_weight > 0.0:
-                        loss = loss + proj_weight * loss_proj
-                else:
-                    loss = loss_proj
-                if DEBUG_PRINTS and (step % 50 == 0):
+    print(
+        f"[sanity] max_steps={max_steps} proj_warmup_steps={args.proj_warmup_steps} "
+        f"depth_sanity_every={args.depth_sanity_every}",
+        flush=True,
+    )
+    try:
+        for step in range(1, max_steps + 1):
+            last_step = step
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(dataloader)
+                batch = next(data_iter)
+    
+            ap = batch["ap"].to(device, non_blocking=True).float()
+            pa = batch["pa"].to(device, non_blocking=True).float()
+            meta = batch.get("meta")
+            meta_scale = None
+            meta_missing = False
+            if isinstance(meta, dict):
+                meta_scale = meta.get("proj_scale_joint_p99")
+                meta_missing = meta.get("proj_scale_joint_p99_missing", False)
+                if isinstance(meta_scale, (list, tuple)):
+                    meta_scale = meta_scale[0] if meta_scale else None
+                if torch.is_tensor(meta_scale):
+                    meta_scale = meta_scale.item() if meta_scale.numel() > 0 else None
+                if torch.is_tensor(meta_missing):
+                    meta_missing = bool(meta_missing.item()) if meta_missing.numel() > 0 else False
+            if meta_scale is None or (isinstance(meta_scale, float) and math.isnan(meta_scale)) or meta_missing:
+                scale_joint_used = 1.0
+                if not scale_missing_warned:
                     print(
-                        f"[DEBUG][step {step}] TARGET AP min/max: {target_ap.min().item():.3e}/{target_ap.max().item():.3e} | "
-                        f"PRED AP min/max: {pred_ap.min().item():.3e}/{pred_ap.max().item():.3e} | "
-                        f"TARGET PA min/max: {target_pa.min().item():.3e}/{target_pa.max().item():.3e} | "
-                        f"PRED PA min/max: {pred_pa.min().item():.3e}/{pred_pa.max().item():.3e}",
+                        "[WARN] proj_scale_joint_p99 fehlt im manifest; physikalische Metriken sind bedeutungslos.",
                         flush=True,
                     )
-
-            bg_depth_mass = torch.tensor(0.0, device=device)
-            bg_depth_mass_w = torch.tensor(0.0, device=device)
-            bg_depth_frac_t = torch.tensor(0.0, device=device)
-            if (not skip_proj) and args.bg_depth_mass_weight > 0.0:
-                bg_mask = None
-                if target_ap is not None and target_pa is not None:
-                    bg_mask = (target_ap < args.bg_depth_eps) & (target_pa < args.bg_depth_eps)
-                elif target_ap is not None:
-                    bg_mask = target_ap < args.bg_depth_eps
-                elif target_pa is not None:
-                    bg_mask = target_pa < args.bg_depth_eps
-                if bg_mask is not None:
-                    bg_mask_flat = bg_mask.reshape(-1)
-                    bg_depth_frac_t = bg_mask_flat.float().mean()
-                    bg_terms = []
+                    scale_missing_warned = True
+            else:
+                scale_joint_used = float(meta_scale)
+            if step == 1:
+                print(
+                    f"[scale] projections_on_disk_normalized_with_joint_p99: proj_scale_joint_p99={scale_joint_used:.3e}",
+                    flush=True,
+                )
+            act_vol = batch.get("act")
+            if act_vol is not None:
+                if act_vol.numel() == 0:
+                    act_vol = None
+                else:
+                    act_vol = act_vol.to(device, non_blocking=True)
+            ct_vol = batch.get("ct")
+            if ct_vol is not None:
+                ct_vol = ct_vol.to(device, non_blocking=True).float()
+            ct_context = generator.build_ct_context(ct_vol, padding_mode=args.ct_padding_mode) if ct_vol is not None else None
+    
+            # Wichtig: Flatten-Order ist (y * W + x), identisch zu den Ray-Indizes aus make_stratified_tile_split.
+            # Keine permute/transpose zwischen (H, W) und reshape(-1), damit Target/Predict exakt die gleiche Reihenfolge teilen.
+            ap_flat = ap.reshape(batch_size, -1)
+            pa_flat = pa.reshape(batch_size, -1)
+            ap_counts = batch.get("ap_counts")
+            pa_counts = batch.get("pa_counts")
+            if ap_counts is not None and ap_counts.numel() > 0:
+                ap_counts = ap_counts.to(device, non_blocking=True).float()
+            else:
+                ap_counts = None
+            if pa_counts is not None and pa_counts.numel() > 0:
+                pa_counts = pa_counts.to(device, non_blocking=True).float()
+            else:
+                pa_counts = None
+    
+            use_counts = (
+                (ap_counts is not None)
+                and (pa_counts is not None)
+                and (ap_counts.numel() > 0)
+                and (pa_counts.numel() > 0)
+            )
+            if not use_counts and not counts_missing_warned:
+                print("[WARN] Projection-Loss wuerde normierte AP/PA nutzen (Counts fehlen).", flush=True)
+                counts_missing_warned = True
+            if proj_loss_type == "poisson" and not use_counts:
+                raise RuntimeError("Poisson projection loss requires count targets (ap_counts/pa_counts).")
+            if use_counts and proj_loss_type != "poisson":
+                raise RuntimeError("Counts targets require Poisson projection loss.")
+    
+            target_ap_full = ap_counts if use_counts else ap
+            target_pa_full = pa_counts if use_counts else pa
+            ap_flat_proc = target_ap_full.reshape(batch_size, -1)
+            pa_flat_proc = target_pa_full.reshape(batch_size, -1)
+    
+            pred_to_counts_scale = scale_joint_used if use_counts else 1.0
+            if use_counts:
+                scale_ap_used = 1.0
+                scale_pa_used = 1.0
+            else:
+                scale_ap_used = scale_joint_used
+                scale_pa_used = scale_joint_used
+    
+            z_base = z_train
+            if z_base.shape[0] != ap.shape[0]:
+                z_base = z_base.expand(ap.shape[0], -1)
+            z_enc = None
+            z_enc_proj = None
+            proj_scale_enc = None
+            if hybrid_enabled and encoder is not None:
+                proj_scale_enc = compute_proj_scale(ap, pa, args.proj_scale_source, meta)
+                proj_scale_enc = torch.clamp(proj_scale_enc, min=1e-6)
+                enc_input = build_encoder_input(
+                    ap,
+                    pa,
+                    ct_vol,
+                    proj_scale_enc,
+                    args.encoder_proj_transform,
+                    args.encoder_use_ct,
+                )
+                z_enc = encoder(enc_input)
+                if z_enc.shape[0] != z_base.shape[0]:
+                    z_base = z_base.expand(z_enc.shape[0], -1)
+                if z_fuser is not None:
+                    z_enc_proj = z_fuser(z_enc)
+                else:
+                    z_enc_proj = z_enc
+                z_latent = z_base + (z_enc_alpha * z_enc_proj)
+            else:
+                z_latent = z_base
+            last_z_latent = z_latent
+    
+            skip_proj = bool(args.act_only)
+            debug_act_step = bool(args.debug_act and step == 1)
+            proj_metrics_enabled = (not skip_proj) and not (hybrid_enabled and args.proj_loss_weight <= 0.0)
+    
+            optimizer.zero_grad(set_to_none=True)
+            t0 = time.perf_counter()
+    
+            need_ray_tv = (not skip_proj) and ray_tv_weight != 0.0
+            need_bg_depth = (not skip_proj) and args.bg_depth_mass_weight > 0.0
+            need_raw_stats = proj_metrics_enabled and hybrid_enabled and args.log_every > 0 and (step % args.log_every == 0 or step == 1)
+            need_raw = need_ray_tv or need_bg_depth or need_raw_stats or depth_checks_active
+    
+            idx_ap = None
+            idx_pa = None
+            ray_batch_ap = None
+            ray_batch_pa = None
+            proj_weight = 0.0
+            if not skip_proj:
+                if ray_split_enabled and pixel_split_np is not None and rng_train is not None:
+                    idx_np = sample_train_indices(pixel_split_np, rays_per_proj, ray_train_fg_frac, rng_train)
+                    idx_ap = torch.from_numpy(idx_np).long().to(device, non_blocking=True)
+                    idx_pa = map_pa_indices_torch(idx_ap, W, pa_xflip)
+                else:
+                    idx_ap = sample_split_indices(ray_indices["pixel"]["train_idx_all"], rays_per_proj)
+                    idx_pa = map_pa_indices_torch(idx_ap, W, pa_xflip)
+    
+                ray_batch_ap = slice_rays(rays_cache["ap"], idx_ap)
+                ray_batch_pa = slice_rays(rays_cache["pa"], idx_pa)
+    
+                proj_weight = 1.0
+                if hybrid_enabled:
+                    proj_weight_min = float(args.proj_weight_min)
+                    proj_weight_max = float(args.proj_loss_weight)
+                    if args.proj_warmup_steps > 0 and step <= args.proj_warmup_steps:
+                        proj_weight = proj_weight_min
+                    else:
+                        ramp_steps = max(1, int(args.proj_ramp_steps))
+                        ramp_t = min(1.0, max(0.0, (step - max(args.proj_warmup_steps, 0)) / float(ramp_steps)))
+                        proj_weight = proj_weight_min + ramp_t * (proj_weight_max - proj_weight_min)
+    
+            loss = torch.tensor(0.0, device=device)
+            loss_ap = torch.tensor(0.0, device=device)
+            loss_pa = torch.tensor(0.0, device=device)
+            loss_proj = torch.tensor(0.0, device=device)
+            pred_ap = None
+            pred_pa = None
+            pred_ap_raw = None
+            pred_pa_raw = None
+            target_ap = None
+            target_pa = None
+            extras_ap = None
+            extras_pa = None
+            gain_val = None
+    
+            with torch.cuda.amp.autocast(enabled=amp_enabled):
+                if not skip_proj:
+                    pred_ap, extras_ap = render_minibatch(
+                        generator, z_latent, ray_batch_ap, ct_context=ct_context, return_raw=need_raw
+                    )
+                    pred_pa, extras_pa = render_minibatch(
+                        generator, z_latent, ray_batch_pa, ct_context=ct_context, return_raw=need_raw
+                    )
+    
+                    target_ap = ap_flat_proc[0, idx_ap].unsqueeze(0)
+                    target_pa = pa_flat_proc[0, idx_pa].unsqueeze(0)
+    
+                    pred_ap_raw = pred_ap
+                    pred_pa_raw = pred_pa
+    
+                    if proj_loss_type == "poisson":
+                        lambda_ap_used = F.softplus(pred_ap_raw) - math.log(2.0)
+                        lambda_pa_used = F.softplus(pred_pa_raw) - math.log(2.0)
+                        lambda_ap_used = lambda_ap_used.clamp_min(1e-6)
+                        lambda_pa_used = lambda_pa_used.clamp_min(1e-6)
+                    else:
+                        lambda_ap_used = pred_ap_raw
+                        lambda_pa_used = pred_pa_raw
+    
+                    gain_val_raw = None
+                    gain_val = None
+                    if use_counts:
+                        lambda_ap_used = lambda_ap_used * float(pred_to_counts_scale)
+                        lambda_pa_used = lambda_pa_used * float(pred_to_counts_scale)
+                        if gain_head is not None and z_enc is not None:
+                            gain_raw = gain_head(z_enc)
+                            gain_val_raw = F.softplus(gain_raw)
+                        elif gain_param is not None:
+                            gain_val_raw = F.softplus(gain_param)
+                        if gain_val_raw is not None:
+                            g_min = float(args.gain_clamp_min) if args.gain_clamp_min is not None else None
+                            g_max = args.gain_clamp_max
+                            if g_min is not None or g_max is not None:
+                                gmin = g_min if g_min is not None else -float("inf")
+                                gmax = g_max if g_max is not None else float("inf")
+                                gain_val = torch.clamp(gain_val_raw, min=gmin, max=gmax)
+                            else:
+                                gain_val = gain_val_raw
+                            lambda_ap_used = lambda_ap_used * gain_val
+                            lambda_pa_used = lambda_pa_used * gain_val
+                    pred_ap = lambda_ap_used
+                    pred_pa = lambda_pa_used
+                    last_gain_val = gain_val
+    
+                    if (target_ap < 0).any() or (target_pa < 0).any():
+                        print("[WARN] Negative projection targets detected.", flush=True)
+                    if proj_loss_type == "poisson":
+                        if not torch.isfinite(pred_ap).all() or not torch.isfinite(pred_pa).all():
+                            raise RuntimeError("Non-finite lambda in Poisson projection loss.")
+                        if (pred_ap <= 0).any() or (pred_pa <= 0).any():
+                            raise RuntimeError("Non-positive lambda in Poisson projection loss.")
+                        if use_counts:
+                            if (target_ap <= 1.0).all() and (target_pa <= 1.0).all():
+                                print("[WARN] Count targets appear in [0,1] range; check scaling.", flush=True)
+                            if step == 1:
+                                p95_ap = float(torch.quantile(pred_ap, 0.95).item()) if pred_ap.numel() > 0 else float("nan")
+                                p95_pa = float(torch.quantile(pred_pa, 0.95).item()) if pred_pa.numel() > 0 else float("nan")
+                                if p95_ap < 5 or p95_ap > 1e6 or p95_pa < 5 or p95_pa > 1e6:
+                                    print("[WARN] Lambda p95 outside expected count scale (5..1e6).", flush=True)
+                        if step % 50 == 0:
+                            pred_std = float(pred_ap.std().item())
+                            target_std = float(target_ap.std().item())
+                            if pred_std < 1e-6 and target_std > 1e-3:
+                                proj_collapse_count += 1
+                                pred_mean = float(pred_ap.mean().item())
+                                pred_min = float(pred_ap.min().item())
+                                pred_max = float(pred_ap.max().item())
+                                target_mean = float(target_ap.mean().item())
+                                gain_pre = float(gain_val_raw.mean().item()) if gain_val_raw is not None else float("nan")
+                                gain_post = float(gain_val.mean().item()) if gain_val is not None else float("nan")
+                                print(
+                                    "[WARN][proj] Projection lambda collapsed: pred std ~0 while target std is large.",
+                                    flush=True,
+                                )
+                                print(
+                                    f"[WARN][proj] pred_std={pred_std:.3e} target_std={target_std:.3e} "
+                                    f"| pred_mean={pred_mean:.3e} pred_min/max=({pred_min:.3e},{pred_max:.3e}) "
+                                    f"| target_mean={target_mean:.3e} "
+                                    f"| pred_to_counts_scale={pred_to_counts_scale:.3e} "
+                                    f"| gain_pre={gain_pre:.3e} gain_post={gain_post:.3e} "
+                                    f"| collapse_streak={proj_collapse_count} patience={args.proj_collapse_patience}",
+                                    flush=True,
+                                )
+                                if args.proj_collapse_patience > 0 and proj_collapse_count >= args.proj_collapse_patience:
+                                    raise RuntimeError(
+                                        "Projection lambda collapsed: pred std ~0 while target std is large "
+                                        "(patience exceeded)."
+                                    )
+                            else:
+                                proj_collapse_count = 0
+    
+                    weight_ap = build_loss_weights(target_ap, args.bg_weight, args.weight_threshold)
+                    weight_pa = build_loss_weights(target_pa, args.bg_weight, args.weight_threshold)
+    
+                    if step in (1, 50):
+                        pred_raw_mean = float(pred_ap_raw.mean().item())
+                        pred_raw_std = float(pred_ap_raw.std().item())
+                        pred_mean = float(pred_ap.mean().item())
+                        pred_std = float(pred_ap.std().item())
+                        target_mean = float(target_ap.mean().item())
+                        target_std = float(target_ap.std().item())
+                        gain_pre = float(gain_val_raw.mean().item()) if gain_val_raw is not None else float("nan")
+                        gain_post = float(gain_val.mean().item()) if gain_val is not None else float("nan")
+                        print(
+                            f"[DEBUG][proj][step {step}] pred_raw_mean={pred_raw_mean:.3e} pred_raw_std={pred_raw_std:.3e} "
+                            f"| pred_mean={pred_mean:.3e} pred_std={pred_std:.3e} "
+                            f"| target_mean={target_mean:.3e} target_std={target_std:.3e} "
+                            f"| sum_pred={pred_ap.sum().item():.3e} sum_target={target_ap.sum().item():.3e} "
+                            f"| pred_to_counts_scale={pred_to_counts_scale:.3e} "
+                            f"| gain_pre={gain_pre:.3e} gain_post={gain_post:.3e}",
+                            flush=True,
+                        )
+    
+                    loss_ap = loss_fn(pred_ap, target_ap, weight=weight_ap)
+                    loss_pa = loss_fn(pred_pa, target_pa, weight=weight_pa)
+                    loss_proj = 0.5 * (loss_ap + loss_pa)
+                    if step == 1:
+                        tmin = float(target_ap.min().item()) if target_ap.numel() > 0 else float("nan")
+                        tmax = float(target_ap.max().item()) if target_ap.numel() > 0 else float("nan")
+                        lmin = float(pred_ap.min().item()) if pred_ap.numel() > 0 else float("nan")
+                        lmax = float(pred_ap.max().item()) if pred_ap.numel() > 0 else float("nan")
+                        print(
+                            f"[DEBUG][proj][step 1] use_counts={use_counts} "
+                            f"| target_min/max=({tmin:.3e},{tmax:.3e}) "
+                            f"| lambda_min/max=({lmin:.3e},{lmax:.3e})",
+                            flush=True,
+                        )
+                    if hybrid_enabled:
+                        if proj_weight > 0.0:
+                            loss = loss + proj_weight * loss_proj
+                    else:
+                        loss = loss_proj
+                    if DEBUG_PRINTS and (step % 50 == 0):
+                        print(
+                            f"[DEBUG][step {step}] TARGET AP min/max: {target_ap.min().item():.3e}/{target_ap.max().item():.3e} | "
+                            f"PRED AP min/max: {pred_ap.min().item():.3e}/{pred_ap.max().item():.3e} | "
+                            f"TARGET PA min/max: {target_pa.min().item():.3e}/{target_pa.max().item():.3e} | "
+                            f"PRED PA min/max: {pred_pa.min().item():.3e}/{pred_pa.max().item():.3e}",
+                            flush=True,
+                        )
+    
+                bg_depth_mass = torch.tensor(0.0, device=device)
+                bg_depth_mass_w = torch.tensor(0.0, device=device)
+                bg_depth_frac_t = torch.tensor(0.0, device=device)
+                if (not skip_proj) and args.bg_depth_mass_weight > 0.0:
+                    bg_mask = None
+                    if target_ap is not None and target_pa is not None:
+                        bg_mask = (target_ap < args.bg_depth_eps) & (target_pa < args.bg_depth_eps)
+                    elif target_ap is not None:
+                        bg_mask = target_ap < args.bg_depth_eps
+                    elif target_pa is not None:
+                        bg_mask = target_pa < args.bg_depth_eps
+                    if bg_mask is not None:
+                        bg_mask_flat = bg_mask.reshape(-1)
+                        bg_depth_frac_t = bg_mask_flat.float().mean()
+                        bg_terms = []
+                        for extras in (extras_ap, extras_pa):
+                            if not isinstance(extras, dict):
+                                continue
+                            raw_out = extras.get("raw")
+                            if raw_out is None:
+                                continue
+                            lambda_vals = F.softplus(raw_out[..., 0])
+                            if args.bg_depth_mode == "integral":
+                                dists = extras.get("dists")
+                                if dists is None:
+                                    z_vals = extras.get("z_vals")
+                                    if z_vals is not None:
+                                        dists = z_vals[..., 1:] - z_vals[..., :-1]
+                                        dists = torch.cat([dists, dists[..., -1:].clone()], dim=-1)
+                                if dists is None:
+                                    continue
+                                m_ray = torch.sum(lambda_vals * dists, dim=-1)
+                            else:
+                                m_ray = torch.mean(lambda_vals, dim=-1)
+                            if m_ray.shape[0] != bg_mask_flat.shape[0]:
+                                continue
+                            if bg_mask_flat.any():
+                                bg_terms.append(m_ray[bg_mask_flat].mean())
+                        if bg_terms:
+                            bg_depth_mass = torch.stack(bg_terms).mean()
+                            bg_depth_mass_w = bg_depth_mass * args.bg_depth_mass_weight
+                            loss = loss + bg_depth_mass_w
+    
+                loss_act = torch.tensor(0.0, device=device)
+                act_norm_factor = 1.0
+                if args.act_loss_weight > 0.0 and act_vol is not None:
+                    radius = generator.radius
+                    if isinstance(radius, tuple):
+                        radius = radius[1]
+                    # Stichprobe aus act.npy und direkte Dichteabfrage im NeRF
+                    coords, act_samples, pos_flags = sample_act_points(
+                        act_vol,
+                        args.act_samples,
+                        radius=radius,
+                        pos_fraction=args.act_pos_fraction,
+                        pos_threshold=args.act_pos_threshold,
+                    )
+                    pred_act_raw = None
+                    pred_act = None
+                    pred_act_log = None
+                    if debug_act_step:
+                        pred_act, pred_act_raw = query_emission_at_points(
+                            generator, z_latent, coords, return_raw=True
+                        )
+                    else:
+                        pred_act, pred_act_raw = query_emission_at_points(
+                            generator, z_latent, coords, return_raw=True
+                        )
+                    if pred_act.numel() > 0:
+                        act_norm_factor, act_norm_global = compute_act_norm_factor(
+                            act_vol, args.act_norm_source, args.act_norm_value, act_norm_global
+                        )
+                        act_norm_factor = float(act_norm_factor)
+                        pred_pos = pred_act_raw.clamp_min(0.0) / max(act_norm_factor, 1e-8)
+                        act_pos = act_samples.clamp_min(0.0) / max(act_norm_factor, 1e-8)
+                        pred_act_log = torch.log1p(pred_pos)
+                        act_log = torch.log1p(act_pos)
+                        weights_act = torch.where(
+                            pos_flags,
+                            torch.full_like(pred_act_log, args.act_pos_weight),
+                            torch.ones_like(pred_act_log),
+                        )
+                        diff = F.smooth_l1_loss(pred_act_log, act_log, reduction="none")
+                        loss_act = torch.mean(weights_act * diff)
+                        loss = loss + args.act_loss_weight * loss_act
+                        if debug_act_step:
+                            act_vol_stats = tensor_stats(act_vol)
+                            pos_vol_frac = float((act_vol > 1e-8).float().mean().item()) if act_vol is not None else float("nan")
+                            act_stats_pre = tensor_stats(act_samples)
+                            act_stats_norm = tensor_stats(act_pos)
+                            pred_stats = tensor_stats(pred_act)
+                            pred_raw_stats = tensor_stats(pred_act_raw)
+                            zero_frac = float((act_samples == 0).float().mean().item())
+                            tiny_frac = float((act_samples < 1e-6).float().mean().item())
+                            pos_frac = float(pos_flags.float().mean().item()) if pos_flags.numel() > 0 else float("nan")
+                            print(
+                                f"[DEBUG][ACT][step {step}] act_vol={fmt_stats(act_vol_stats)} | pos_vol_frac={pos_vol_frac:.3f} "
+                                f"| act_gt={fmt_stats(act_stats_pre)} "
+                                f"| act_gt_norm={fmt_stats(act_stats_norm)} "
+                                f"| zero_frac={zero_frac:.3f} | lt1e-6_frac={tiny_frac:.3f} | pos_frac={pos_frac:.3f}",
+                                flush=True,
+                            )
+                            print(
+                                f"[DEBUG][ACT][step {step}] pred_raw={fmt_stats(pred_raw_stats)} "
+                                f"| pred_act={fmt_stats(pred_stats)} "
+                                f"| act_norm_source={args.act_norm_source} act_norm_factor={act_norm_factor:.3e} "
+                                f"act_norm_global={'set' if act_norm_global is not None else 'none'}",
+                                flush=True,
+                            )
+                            print(
+                                f"[DEBUG][ACT][step {step}] requires_grad: pred_act={pred_act_raw.requires_grad} "
+                                f"z_latent={z_latent.requires_grad} act_samples={act_samples.requires_grad}",
+                                flush=True,
+                            )
+    
+                loss_gain = torch.tensor(0.0, device=device)
+                gain_prior = None
+                if hybrid_enabled and gain_val is not None and args.gain_reg_weight > 0.0:
+                    gain_mean = float(gain_val.detach().mean().item())
+                    if args.gain_prior_mode == "fixed":
+                        gain_prior = float(args.gain_prior_value)
+                    else:
+                        # EMA over first N steps
+                        if gain_prior_ema is None:
+                            gain_prior_ema = gain_mean
+                        else:
+                            gain_prior_ema = gain_prior_decay * gain_prior_ema + (1.0 - gain_prior_decay) * gain_mean
+                        if step <= gain_prior_steps:
+                            gain_prior = gain_prior_ema
+                        else:
+                            if gain_prior_final is None:
+                                gain_prior_final = gain_prior_ema
+                            gain_prior = gain_prior_final
+                    if gain_prior is not None and gain_prior > 0:
+                        log_gain = torch.log(gain_val.clamp_min(1e-12))
+                        log_prior = math.log(max(gain_prior, 1e-12))
+                        loss_gain = ((log_gain - log_prior) ** 2).mean()
+                        loss_gain = loss_gain * float(args.gain_reg_scale)
+                        loss = loss + float(args.gain_reg_weight) * loss_gain
+    
+                loss_ct = torch.tensor(0.0, device=device)
+                ct_pairs_valid = False
+                if args.ct_loss_weight > 0.0 and ct_vol is not None:
+                    radius = generator.radius
+                    if isinstance(radius, tuple):
+                        radius = radius[1]
+                    ct_pairs = sample_ct_pairs(ct_vol, args.ct_samples, args.ct_threshold, radius=radius)
+                    if ct_pairs is not None:
+                        ct_pairs_valid = True
+                        coords1, coords2, weights = ct_pairs
+                        pred1 = query_emission_at_points(generator, z_latent, coords1)
+                        pred2 = query_emission_at_points(generator, z_latent, coords2)
+                        # Loss zwingt Emission auf flachen CT-Strecken zur Konstanz
+                        loss_ct = torch.mean(torch.abs(pred1 - pred2) * weights)
+                        loss = loss + args.ct_loss_weight * loss_ct
+    
+                loss_reg = torch.tensor(0.0, device=device)
+                if args.z_reg_weight > 0.0:
+                    loss_reg = z_train.pow(2).mean()
+                    loss = loss + args.z_reg_weight * loss_reg
+    
+                tv_base_loss = torch.tensor(0.0, device=device)
+                loss_tv = torch.tensor(0.0, device=device)
+                loss_ray_tv = torch.tensor(0.0, device=device)
+                loss_ray_tv_w = torch.tensor(0.0, device=device)
+                ray_tv_mode = "plain"
+                ray_tv_w_mean = None
+                ray_tv_w_min = None
+                ray_tv_w_max = None
+                ct_boundary_depth_mean = None
+                ct_boundary_depth_median = None
+    
+                tv_base_terms = []
+                if isinstance(extras_ap, dict):
+                    base_val = extras_ap.get("tv_base_loss") or extras_ap.get("tv_loss")
+                    if base_val is not None:
+                        tv_base_terms.append(base_val)
+                if isinstance(extras_pa, dict):
+                    base_val = extras_pa.get("tv_base_loss") or extras_pa.get("tv_loss")
+                    if base_val is not None:
+                        tv_base_terms.append(base_val)
+    
+                if tv_base_terms:
+                    tv_base_loss = torch.stack(tv_base_terms).mean()
+    
+                if tv_weight != 0.0:
+                    loss_tv = tv_weight * tv_base_loss
+                    loss = loss + loss_tv
+    
+                if ray_tv_weight != 0.0:
+                    edge_aware_active = ray_tv_edge_aware and ray_tv_alpha > 0.0
+                    ray_tv_terms = []
+                    ray_tv_w_terms = []
                     for extras in (extras_ap, extras_pa):
                         if not isinstance(extras, dict):
                             continue
                         raw_out = extras.get("raw")
                         if raw_out is None:
                             continue
-                        lambda_vals = F.softplus(raw_out[..., 0])
-                        if args.bg_depth_mode == "integral":
-                            dists = extras.get("dists")
-                            if dists is None:
-                                z_vals = extras.get("z_vals")
-                                if z_vals is not None:
-                                    dists = z_vals[..., 1:] - z_vals[..., :-1]
-                                    dists = torch.cat([dists, dists[..., -1:].clone()], dim=-1)
-                            if dists is None:
-                                continue
-                            m_ray = torch.sum(lambda_vals * dists, dim=-1)
+                        if edge_aware_active:
+                            mu_out = extras.get("mu")
+                            tv_val, w_stats = compute_ray_tv(
+                                raw_out,
+                                mu_vals=mu_out,
+                                edge_aware=True,
+                                alpha=ray_tv_alpha,
+                                w_clamp_min=ray_tv_w_clamp_min,
+                                return_stats=True,
+                            )
+                            if isinstance(w_stats, dict):
+                                w_mean = w_stats.get("w_mean")
+                                if w_mean is not None:
+                                    ray_tv_w_terms.append(w_mean)
+                                ray_tv_w_min = w_stats.get("w_min")
+                                ray_tv_w_max = w_stats.get("w_max")
+                                ct_boundary_depth_mean = w_stats.get("ct_boundary_depth_mean")
+                                ct_boundary_depth_median = w_stats.get("ct_boundary_depth_median")
+                            ray_tv_terms.append(tv_val)
                         else:
-                            m_ray = torch.mean(lambda_vals, dim=-1)
-                        if m_ray.shape[0] != bg_mask_flat.shape[0]:
+                            tv_val, _ = compute_ray_tv(raw_out)
+                            ray_tv_terms.append(tv_val)
+                    if ray_tv_terms:
+                        loss_ray_tv = torch.stack(ray_tv_terms).mean()
+                        loss_ray_tv_w = loss_ray_tv * ray_tv_weight
+                        loss = loss + loss_ray_tv_w
+                    if edge_aware_active and ray_tv_w_terms:
+                        ray_tv_w_mean = torch.stack(ray_tv_w_terms).mean().item()
+                        ray_tv_mode = "edgeaware"
+    
+                if depth_checks_active and (step % depth_sanity_every == 0 or step == 1):
+                    # Single-Phantom ist inhaltlich stabil, wenn:
+                    # - Projektionen plateauieren,
+                    # - Depth-Regularizer nicht trivial sind,
+                    # - lambda-Std entlang Rays stabil > 1e-4,
+                    # - Gain im physikalischen Bereich bleibt.
+                    proj_loss_active = (not skip_proj) and (not hybrid_enabled or proj_weight > 0.0)
+                    atten_flag = bool(generator.render_kwargs_train.get("use_attenuation", False))
+                    atten_active = atten_flag and (ct_context is not None)
+                    if proj_loss_active and not atten_active:
+                        reason = "use_attenuation=False" if not atten_flag else "ct_context=None"
+                        print(
+                            f"[WARN][depth] Attenuation inaktiv bei aktivem Projection-Loss -> Depth unterbestimmt. "
+                            f"Ursache: {reason}.",
+                            flush=True,
+                        )
+                    if proj_loss_active and atten_active:
+                        mu_terms = []
+                        atten_terms = []
+                        atten_default = globals().get("ATTEN_SCALE_DEFAULT", 1.0)
+                        atten_scale = float(generator.render_kwargs_train.get("atten_scale", atten_default))
+                        for extras in (extras_ap, extras_pa):
+                            if not isinstance(extras, dict):
+                                continue
+                            mu_out = extras.get("mu")
+                            if mu_out is not None and mu_out.dim() > 0 and mu_out.shape[-1] == 1:
+                                mu_out = mu_out.squeeze(-1)
+                            dists = extras.get("dists")
+                            if mu_out is not None:
+                                mu_terms.append(mu_out.reshape(-1))
+                            if mu_out is not None and dists is not None and mu_out.shape == dists.shape:
+                                mu_clamped = torch.clamp(mu_out, min=0.0)
+                                mu_dists = mu_clamped * dists
+                                attenuation = torch.cumsum(mu_dists, dim=-1) * atten_scale
+                                attenuation = F.pad(attenuation[..., :-1], (1, 0), mode="constant", value=0.0)
+                                attenuation = torch.clamp(attenuation, min=0.0, max=60.0)
+                                atten_terms.append(attenuation.reshape(-1))
+                        if not mu_terms:
+                            print(
+                                "[WARN][depth] Attenuation aktiv, aber mu fehlt in Extras (retraw/ct_context prüfen).",
+                                flush=True,
+                            )
+                        else:
+                            mu_all = torch.cat(mu_terms)
+                            mu_mean = float(mu_all.mean().item())
+                            if mu_mean <= 0.0:
+                                print(
+                                    "[WARN][depth] mu_mean <= 0 -> Attenuation hat praktisch keinen Einfluss.",
+                                    flush=True,
+                                )
+                        if atten_terms:
+                            atten_all = torch.cat(atten_terms)
+                            atten_mean = float(atten_all.mean().item())
+                            if atten_mean < 1e-3:
+                                print(
+                                    f"[WARN][depth] Attenuation-Mittelwert sehr klein ({atten_mean:.3e}) -> geringer Einfluss.",
+                                    flush=True,
+                                )
+    
+                    depth_zero = []
+                    if ray_tv_weight != 0.0 and float(loss_ray_tv.item()) <= 0.0:
+                        depth_zero.append("ray_tv")
+                    if args.ct_loss_weight > 0.0:
+                        if ct_vol is None:
+                            depth_zero.append("ct_missing")
+                        elif not ct_pairs_valid:
+                            depth_zero.append("ct_pairs")
+                    if depth_zero:
+                        print(
+                            f"[WARN][depth] Depth-Terms ohne Signal: {', '.join(depth_zero)}. "
+                            "Bitte CT/Ray-TV/BG-Depth pruefen.",
+                            flush=True,
+                        )
+    
+                    lam_std_terms = []
+                    for extras in (extras_ap, extras_pa):
+                        if not isinstance(extras, dict):
                             continue
-                        if bg_mask_flat.any():
-                            bg_terms.append(m_ray[bg_mask_flat].mean())
-                    if bg_terms:
-                        bg_depth_mass = torch.stack(bg_terms).mean()
-                        bg_depth_mass_w = bg_depth_mass * args.bg_depth_mass_weight
-                        loss = loss + bg_depth_mass_w
-
-            loss_act = torch.tensor(0.0, device=device)
-            act_norm_factor = 1.0
-            if args.act_loss_weight > 0.0 and act_vol is not None:
-                radius = generator.radius
-                if isinstance(radius, tuple):
-                    radius = radius[1]
-                # Stichprobe aus act.npy und direkte Dichteabfrage im NeRF
-                coords, act_samples, pos_flags = sample_act_points(
-                    act_vol,
-                    args.act_samples,
-                    radius=radius,
-                    pos_fraction=args.act_pos_fraction,
-                    pos_threshold=args.act_pos_threshold,
-                )
-                pred_act_raw = None
-                pred_act = None
-                pred_act_log = None
-                if debug_act_step:
-                    pred_act, pred_act_raw = query_emission_at_points(
-                        generator, z_latent, coords, return_raw=True
+                        raw_out = extras.get("raw")
+                        if raw_out is None:
+                            continue
+                        lam = F.softplus(raw_out[..., 0]) - math.log(2.0)
+                        lam = lam.clamp_min(1e-6)
+                        lam_std_terms.append(lam.std(dim=-1).mean())
+                    if lam_std_terms:
+                        lam_std_mean = float(torch.stack(lam_std_terms).mean().item())
+                        if lam_std_mean < 1e-6:
+                            print(
+                                f"[WARN][depth] Depth-Profil kollabiert (lambda std entlang Ray ~ {lam_std_mean:.3e}).",
+                                flush=True,
+                            )
+                        if lam_std_mean < 1e-4:
+                            print(
+                                f"[WARN][depth] lambda std entlang Ray sehr klein: {lam_std_mean:.3e}",
+                                flush=True,
+                            )
+    
+                    depth_reg_loss = loss_ray_tv_w + (args.ct_loss_weight * loss_ct) + bg_depth_mass_w
+                    depth_reg_total = float(depth_reg_loss.detach().item())
+                    net_module = generator.render_kwargs_train.get("network_fn")
+                    depth_grad_net = _depth_grad_norm(depth_reg_loss, net_module)
+                    print(
+                        f"[depth][grad] ||g_depth||_net={depth_grad_net:.3e} | depth_reg_total={depth_reg_total:.3e}",
+                        flush=True,
                     )
-                else:
-                    pred_act, pred_act_raw = query_emission_at_points(
-                        generator, z_latent, coords, return_raw=True
-                    )
-                if pred_act.numel() > 0:
-                    act_norm_factor, act_norm_global = compute_act_norm_factor(
-                        act_vol, args.act_norm_source, args.act_norm_value, act_norm_global
-                    )
-                    act_norm_factor = float(act_norm_factor)
-                    pred_pos = pred_act_raw.clamp_min(0.0) / max(act_norm_factor, 1e-8)
-                    act_pos = act_samples.clamp_min(0.0) / max(act_norm_factor, 1e-8)
-                    pred_act_log = torch.log1p(pred_pos)
-                    act_log = torch.log1p(act_pos)
-                    weights_act = torch.where(
-                        pos_flags,
-                        torch.full_like(pred_act_log, args.act_pos_weight),
-                        torch.ones_like(pred_act_log),
-                    )
-                    diff = F.smooth_l1_loss(pred_act_log, act_log, reduction="none")
-                    loss_act = torch.mean(weights_act * diff)
-                    loss = loss + args.act_loss_weight * loss_act
-                    if debug_act_step:
-                        act_vol_stats = tensor_stats(act_vol)
-                        pos_vol_frac = float((act_vol > 1e-8).float().mean().item()) if act_vol is not None else float("nan")
-                        act_stats_pre = tensor_stats(act_samples)
-                        act_stats_norm = tensor_stats(act_pos)
-                        pred_stats = tensor_stats(pred_act)
-                        pred_raw_stats = tensor_stats(pred_act_raw)
-                        zero_frac = float((act_samples == 0).float().mean().item())
-                        tiny_frac = float((act_samples < 1e-6).float().mean().item())
-                        pos_frac = float(pos_flags.float().mean().item()) if pos_flags.numel() > 0 else float("nan")
+                    if depth_grad_net < 1e-8:
+                        depth_grad_zero_streak += 1
+                    else:
+                        depth_grad_zero_streak = 0
+                    if depth_grad_zero_streak >= 3:
                         print(
-                            f"[DEBUG][ACT][step {step}] act_vol={fmt_stats(act_vol_stats)} | pos_vol_frac={pos_vol_frac:.3f} "
-                            f"| act_gt={fmt_stats(act_stats_pre)} "
-                            f"| act_gt_norm={fmt_stats(act_stats_norm)} "
-                            f"| zero_frac={zero_frac:.3f} | lt1e-6_frac={tiny_frac:.3f} | pos_frac={pos_frac:.3f}",
+                            "[WARN][depth] Depth-Gradient ~0 ueber mehrere Checks -> Depth lernt nicht.",
                             flush=True,
                         )
+    
+                    if gain_val is not None:
+                        gain_mean = float(gain_val.detach().mean().item())
+                        gain_std = float(gain_val.detach().std().item())
                         print(
-                            f"[DEBUG][ACT][step {step}] pred_raw={fmt_stats(pred_raw_stats)} "
-                            f"| pred_act={fmt_stats(pred_stats)} "
-                            f"| act_norm_source={args.act_norm_source} act_norm_factor={act_norm_factor:.3e} "
-                            f"act_norm_global={'set' if act_norm_global is not None else 'none'}",
+                            f"[gain][depth] gain_mean={gain_mean:.3f} gain_std={gain_std:.3f} "
+                            f"| depth_reg_total={depth_reg_total:.3e}",
                             flush=True,
                         )
-                        print(
-                            f"[DEBUG][ACT][step {step}] requires_grad: pred_act={pred_act_raw.requires_grad} "
-                            f"z_latent={z_latent.requires_grad} act_samples={act_samples.requires_grad}",
-                            flush=True,
-                        )
-
-            loss_gain = torch.tensor(0.0, device=device)
-            gain_prior = None
-            if hybrid_enabled and gain_val is not None and args.gain_reg_weight > 0.0:
-                gain_mean = float(gain_val.detach().mean().item())
-                if args.gain_prior_mode == "fixed":
-                    gain_prior = float(args.gain_prior_value)
-                else:
-                    # EMA over first N steps
-                    if gain_prior_ema is None:
-                        gain_prior_ema = gain_mean
-                    else:
-                        gain_prior_ema = gain_prior_decay * gain_prior_ema + (1.0 - gain_prior_decay) * gain_mean
-                    if step <= gain_prior_steps:
-                        gain_prior = gain_prior_ema
-                    else:
-                        if gain_prior_final is None:
-                            gain_prior_final = gain_prior_ema
-                        gain_prior = gain_prior_final
-                if gain_prior is not None and gain_prior > 0:
-                    log_gain = torch.log(gain_val.clamp_min(1e-12))
-                    log_prior = math.log(max(gain_prior, 1e-12))
-                    loss_gain = ((log_gain - log_prior) ** 2).mean()
-                    loss = loss + float(args.gain_reg_weight) * loss_gain
-
-            loss_ct = torch.tensor(0.0, device=device)
-            if args.ct_loss_weight > 0.0 and ct_vol is not None:
-                radius = generator.radius
-                if isinstance(radius, tuple):
-                    radius = radius[1]
-                ct_pairs = sample_ct_pairs(ct_vol, args.ct_samples, args.ct_threshold, radius=radius)
-                if ct_pairs is not None:
-                    coords1, coords2, weights = ct_pairs
-                    pred1 = query_emission_at_points(generator, z_latent, coords1)
-                    pred2 = query_emission_at_points(generator, z_latent, coords2)
-                    # Loss zwingt Emission auf flachen CT-Strecken zur Konstanz
-                    loss_ct = torch.mean(torch.abs(pred1 - pred2) * weights)
-                    loss = loss + args.ct_loss_weight * loss_ct
-
-            loss_reg = torch.tensor(0.0, device=device)
-            if args.z_reg_weight > 0.0:
-                loss_reg = z_train.pow(2).mean()
-                loss = loss + args.z_reg_weight * loss_reg
-
-            tv_base_loss = torch.tensor(0.0, device=device)
-            loss_tv = torch.tensor(0.0, device=device)
-            loss_ray_tv = torch.tensor(0.0, device=device)
-            loss_ray_tv_w = torch.tensor(0.0, device=device)
-            ray_tv_mode = "plain"
-            ray_tv_w_mean = None
-            ray_tv_w_min = None
-            ray_tv_w_max = None
-            ct_boundary_depth_mean = None
-            ct_boundary_depth_median = None
-
-            tv_base_terms = []
-            if isinstance(extras_ap, dict):
-                base_val = extras_ap.get("tv_base_loss") or extras_ap.get("tv_loss")
-                if base_val is not None:
-                    tv_base_terms.append(base_val)
-            if isinstance(extras_pa, dict):
-                base_val = extras_pa.get("tv_base_loss") or extras_pa.get("tv_loss")
-                if base_val is not None:
-                    tv_base_terms.append(base_val)
-
-            if tv_base_terms:
-                tv_base_loss = torch.stack(tv_base_terms).mean()
-
-            if tv_weight != 0.0:
-                loss_tv = tv_weight * tv_base_loss
-                loss = loss + loss_tv
-
-            if ray_tv_weight != 0.0:
-                edge_aware_active = ray_tv_edge_aware and ray_tv_alpha > 0.0
-                ray_tv_terms = []
-                ray_tv_w_terms = []
-                for extras in (extras_ap, extras_pa):
-                    if not isinstance(extras, dict):
-                        continue
-                    raw_out = extras.get("raw")
-                    if raw_out is None:
-                        continue
-                    if edge_aware_active:
-                        mu_out = extras.get("mu")
-                        tv_val, w_stats = compute_ray_tv(
-                            raw_out,
-                            mu_vals=mu_out,
-                            edge_aware=True,
-                            alpha=ray_tv_alpha,
-                            w_clamp_min=ray_tv_w_clamp_min,
-                            return_stats=True,
-                        )
-                        if isinstance(w_stats, dict):
-                            w_mean = w_stats.get("w_mean")
-                            if w_mean is not None:
-                                ray_tv_w_terms.append(w_mean)
-                            ray_tv_w_min = w_stats.get("w_min")
-                            ray_tv_w_max = w_stats.get("w_max")
-                            ct_boundary_depth_mean = w_stats.get("ct_boundary_depth_mean")
-                            ct_boundary_depth_median = w_stats.get("ct_boundary_depth_median")
-                        ray_tv_terms.append(tv_val)
-                    else:
-                        tv_val, _ = compute_ray_tv(raw_out)
-                        ray_tv_terms.append(tv_val)
-                if ray_tv_terms:
-                    loss_ray_tv = torch.stack(ray_tv_terms).mean()
-                    loss_ray_tv_w = loss_ray_tv * ray_tv_weight
-                    loss = loss + loss_ray_tv_w
-                if edge_aware_active and ray_tv_w_terms:
-                    ray_tv_w_mean = torch.stack(ray_tv_w_terms).mean().item()
-                    ray_tv_mode = "edgeaware"
-
-        proj_loss_for_grad = proj_weight * 0.5 * (loss_ap + loss_pa) if not skip_proj else torch.tensor(0.0, device=device)
-
-        if debug_act_step:
-            net_module = generator.render_kwargs_train.get("network_fn")
-            grad_act_net = grad_norm_of_module(args.act_loss_weight * loss_act, net_module)
-            grad_proj_net = grad_norm_of_module(proj_loss_for_grad, net_module)
-            grad_act_enc = grad_norm_of_module(args.act_loss_weight * loss_act, encoder)
-            grad_proj_enc = grad_norm_of_module(proj_loss_for_grad, encoder)
-            print(
-                f"[DEBUG][ACT][gradcomp][step {step}] ||g_act||_net={grad_act_net:.3e} "
-                f"||g_proj||_net={grad_proj_net:.3e} ||g_act||_enc={grad_act_enc:.3e} "
-                f"||g_proj||_enc={grad_proj_enc:.3e}",
-                flush=True,
-            )
-
-        if args.grad_stats_every > 0 and (step % args.grad_stats_every) == 0:
-            grad_stats = {
-                "proj": grad_norm_of(proj_loss_for_grad, [z_latent]),
-                "act": grad_norm_of(args.act_loss_weight * loss_act, [z_latent]) if args.act_loss_weight > 0 else 0.0,
-                "ct": grad_norm_of(args.ct_loss_weight * loss_ct, [z_latent]) if args.ct_loss_weight > 0 else 0.0,
-                "zreg": grad_norm_of(args.z_reg_weight * loss_reg, [z_latent]) if args.z_reg_weight > 0 else 0.0,
-            }
-            print(
-                f"[grad][step {step:05d}] ||g_proj||={grad_stats['proj']:.3e} "
-                f"| ||g_act||={grad_stats['act']:.3e} | ||g_ct||={grad_stats['ct']:.3e} "
-                f"| ||g_zreg||={grad_stats['zreg']:.3e}",
-                flush=True,
-            )
-
-        scaler.scale(loss).backward()
-        if debug_act_step:
-            net_module = generator.render_kwargs_train.get("network_fn")
-            gain_param_grad = 0.0
-            if gain_param is not None and gain_param.grad is not None:
-                gain_param_grad = float(gain_param.grad.detach().abs().mean().item())
-            print(
-                f"[DEBUG][ACT][grads][step {step}] net={module_grad_mean_abs(net_module):.3e} "
-                f"encoder={module_grad_mean_abs(encoder):.3e} z_fuser={module_grad_mean_abs(z_fuser):.3e} "
-                f"gain_head={module_grad_mean_abs(gain_head):.3e} gain_param={gain_param_grad:.3e}",
-                flush=True,
-            )
-        grad_norm_global = global_grad_norm(opt_params) if hybrid_enabled else 0.0
-        grad_norm_gen = torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
-        clip_event = float(grad_norm_gen) > 1.0
-        scaler.step(optimizer)
-        scaler.update()
-
-        torch.cuda.synchronize()
-        iter_ms = (time.perf_counter() - t0) * 1000.0
-
-        with torch.no_grad():
-            if not proj_metrics_enabled:
-                mae_ap = float("nan")
-                mae_pa = float("nan")
-                pred_mean = (float("nan"), float("nan"))
-                pred_std = (float("nan"), float("nan"))
-                pred_mean_raw = (float("nan"), float("nan"))
-                pred_std_raw = (float("nan"), float("nan"))
-                psnr_ap = float("nan")
-                psnr_pa = float("nan")
-                psnr_ap_phys = None
-                psnr_pa_phys = None
-                mae_ap_phys = None
-                mae_pa_phys = None
-            else:
-                mae_ap = torch.mean(torch.abs(pred_ap - target_ap)).item()
-                mae_pa = torch.mean(torch.abs(pred_pa - target_pa)).item()
-                pred_mean = (pred_ap.mean().item(), pred_pa.mean().item())              # skaliert gemäß Projektnorm
-                pred_std = (pred_ap.std().item(), pred_pa.std().item())
-                pred_mean_raw = (pred_ap_raw.mean().item(), pred_pa_raw.mean().item())  # physikalischer Maßstab
-                pred_std_raw = (pred_ap_raw.std().item(), pred_pa_raw.std().item())
-                psnr_ap = compute_psnr(pred_ap, target_ap)
-                psnr_pa = compute_psnr(pred_pa, target_pa)
-                psnr_ap_phys = None
-                psnr_pa_phys = None
-                mae_ap_phys = None
-                mae_pa_phys = None
-                if log_proj_metrics_physical:
-                    pred_ap_phys = pred_ap * float(scale_ap_used)
-                    pred_pa_phys = pred_pa * float(scale_pa_used)
-                    target_ap_phys = target_ap * float(scale_ap_used)
-                    target_pa_phys = target_pa * float(scale_pa_used)
-                    psnr_ap_phys = compute_psnr(pred_ap_phys, target_ap_phys)
-                    psnr_pa_phys = compute_psnr(pred_pa_phys, target_pa_phys)
-                    mae_ap_phys = torch.mean(torch.abs(pred_ap_phys - target_ap_phys)).item()
-                    mae_pa_phys = torch.mean(torch.abs(pred_pa_phys - target_pa_phys)).item()
-            bg_depth_frac = float(bg_depth_frac_t.detach().cpu().item())
-            if hybrid_enabled and hybrid_log_path is not None and need_raw_stats:
-                target_ap_stats = tensor_stats(target_ap)
-                target_pa_stats = tensor_stats(target_pa)
-                pred_ap_stats = tensor_stats(pred_ap)
-                pred_pa_stats = tensor_stats(pred_pa)
-                atten_scale = float(generator.render_kwargs_train.get("atten_scale", ATTEN_SCALE_DEFAULT))
-                (
-                    lambda_stats,
-                    mu_stats,
-                    atten_stats,
-                    atten_frac_gt20,
-                    atten_frac_clamp,
-                    nonfinite_lambda,
-                    nonfinite_atten,
-                ) = compute_lambda_and_attenuation_stats([extras_ap, extras_pa], atten_scale=atten_scale)
-                nonfinite_pred = nonfinite_fraction(torch.cat([pred_ap, pred_pa], dim=1))
-                proj_scale_enc_val = (
-                    float(proj_scale_enc.mean().item()) if torch.is_tensor(proj_scale_enc) else float("nan")
-                )
-                gain_log = float(gain_val.mean().item()) if gain_val is not None else float("nan")
-                z_train_l2 = float(z_train.detach().norm().item())
-                z_enc_l2 = (
-                    float(z_enc_proj.detach().norm(dim=1).mean().item()) if z_enc_proj is not None else float("nan")
-                )
-                z_latent_l2 = float(z_latent.detach().norm(dim=1).mean().item())
-
-                def _stat(stats, key):
-                    return float(stats[key]) if stats is not None and key in stats else float("nan")
-
+                        if depth_reg_total < 1e-6 and abs(gain_mean - 1.0) > 0.1:
+                            print(
+                                f"[WARN][gain] gain_mean={gain_mean:.3f} bei depth_reg_total={depth_reg_total:.3e} "
+                                "-> Gain kann Strukturfreiheit kompensieren.",
+                                flush=True,
+                            )
+            proj_loss_for_grad = proj_weight * 0.5 * (loss_ap + loss_pa) if not skip_proj else torch.tensor(0.0, device=device)
+    
+            if debug_act_step:
+                net_module = generator.render_kwargs_train.get("network_fn")
+                grad_act_net = grad_norm_of_module(args.act_loss_weight * loss_act, net_module)
+                grad_proj_net = grad_norm_of_module(proj_loss_for_grad, net_module)
+                grad_act_enc = grad_norm_of_module(args.act_loss_weight * loss_act, encoder)
+                grad_proj_enc = grad_norm_of_module(proj_loss_for_grad, encoder)
                 print(
-                    f"[hybrid][step {step:05d}] "
-                    f"t_ap(min/mean/p95/max)=({_stat(target_ap_stats,'min'):.3e},"
-                    f"{_stat(target_ap_stats,'mean'):.3e},{_stat(target_ap_stats,'p95'):.3e},"
-                    f"{_stat(target_ap_stats,'max'):.3e}) "
-                    f"t_pa(min/mean/p95/max)=({_stat(target_pa_stats,'min'):.3e},"
-                    f"{_stat(target_pa_stats,'mean'):.3e},{_stat(target_pa_stats,'p95'):.3e},"
-                    f"{_stat(target_pa_stats,'max'):.3e}) "
-                    f"p_ap(min/mean/p95/max)=({_stat(pred_ap_stats,'min'):.3e},"
-                    f"{_stat(pred_ap_stats,'mean'):.3e},{_stat(pred_ap_stats,'p95'):.3e},"
-                    f"{_stat(pred_ap_stats,'max'):.3e}) "
-                    f"p_pa(min/mean/p95/max)=({_stat(pred_pa_stats,'min'):.3e},"
-                    f"{_stat(pred_pa_stats,'mean'):.3e},{_stat(pred_pa_stats,'p95'):.3e},"
-                    f"{_stat(pred_pa_stats,'max'):.3e}) "
-                    f"lambda(min/mean/p95/max)=({_stat(lambda_stats,'min'):.3e},"
-                    f"{_stat(lambda_stats,'mean'):.3e},{_stat(lambda_stats,'p95'):.3e},"
-                    f"{_stat(lambda_stats,'max'):.3e}) "
-                    f"mu(min/mean/p95/max)=({_stat(mu_stats,'min'):.3e},"
-                    f"{_stat(mu_stats,'mean'):.3e},{_stat(mu_stats,'p95'):.3e},"
-                    f"{_stat(mu_stats,'max'):.3e}) "
-                    f"atten(min/mean/p95/max)=({_stat(atten_stats,'min'):.3e},"
-                    f"{_stat(atten_stats,'mean'):.3e},{_stat(atten_stats,'p95'):.3e},"
-                    f"{_stat(atten_stats,'max'):.3e}) "
-                    f"gain={gain_log:.3e} "
-                    f"atten>20={atten_frac_gt20 if atten_frac_gt20 is not None else float('nan'):.3f} "
-                    f"atten=60={atten_frac_clamp if atten_frac_clamp is not None else float('nan'):.3f} "
-                    f"nonfinite(pred/lambda/atten)=({nonfinite_pred:.3e},{nonfinite_lambda:.3e},{nonfinite_atten:.3e}) "
-                    f"grad_norm={grad_norm_global:.3e} clip={int(clip_event)}",
+                    f"[DEBUG][ACT][gradcomp][step {step}] ||g_act||_net={grad_act_net:.3e} "
+                    f"||g_proj||_net={grad_proj_net:.3e} ||g_act||_enc={grad_act_enc:.3e} "
+                    f"||g_proj||_enc={grad_proj_enc:.3e}",
                     flush=True,
                 )
-
-                append_hybrid_log(
-                    hybrid_log_path,
-                    [
-                        step,
-                        proj_weight,
-                        float(loss_proj.item()),
-                        float(loss_ap.item()),
-                        float(loss_pa.item()),
-                        float(loss_act.item()),
-                        float(loss_gain.item()),
-                        float(gain_prior) if gain_prior is not None else float("nan"),
-                        float(act_norm_factor),
-                        float(loss.item()),
-                        proj_scale_enc_val,
-                        _stat(target_ap_stats, "min"),
-                        _stat(target_ap_stats, "mean"),
-                        _stat(target_ap_stats, "p95"),
-                        _stat(target_ap_stats, "max"),
-                        _stat(target_pa_stats, "min"),
-                        _stat(target_pa_stats, "mean"),
-                        _stat(target_pa_stats, "p95"),
-                        _stat(target_pa_stats, "max"),
-                        _stat(pred_ap_stats, "min"),
-                        _stat(pred_ap_stats, "mean"),
-                        _stat(pred_ap_stats, "p95"),
-                        _stat(pred_ap_stats, "max"),
-                        _stat(pred_pa_stats, "min"),
-                        _stat(pred_pa_stats, "mean"),
-                        _stat(pred_pa_stats, "p95"),
-                        _stat(pred_pa_stats, "max"),
-                        _stat(lambda_stats, "min"),
-                        _stat(lambda_stats, "mean"),
-                        _stat(lambda_stats, "p95"),
-                        _stat(lambda_stats, "max"),
-                        _stat(mu_stats, "min"),
-                        _stat(mu_stats, "mean"),
-                        _stat(mu_stats, "p95"),
-                        _stat(mu_stats, "max"),
-                        _stat(atten_stats, "min"),
-                        _stat(atten_stats, "mean"),
-                        _stat(atten_stats, "p95"),
-                        _stat(atten_stats, "max"),
-                        float(atten_frac_gt20) if atten_frac_gt20 is not None else float("nan"),
-                        float(atten_frac_clamp) if atten_frac_clamp is not None else float("nan"),
-                        gain_log,
-                        nonfinite_pred,
+    
+            if args.grad_stats_every > 0 and (step % args.grad_stats_every) == 0:
+                grad_stats = {
+                    "proj": grad_norm_of(proj_loss_for_grad, [z_latent]),
+                    "act": grad_norm_of(args.act_loss_weight * loss_act, [z_latent]) if args.act_loss_weight > 0 else 0.0,
+                    "ct": grad_norm_of(args.ct_loss_weight * loss_ct, [z_latent]) if args.ct_loss_weight > 0 else 0.0,
+                    "zreg": grad_norm_of(args.z_reg_weight * loss_reg, [z_latent]) if args.z_reg_weight > 0 else 0.0,
+                }
+                print(
+                    f"[grad][step {step:05d}] ||g_proj||={grad_stats['proj']:.3e} "
+                    f"| ||g_act||={grad_stats['act']:.3e} | ||g_ct||={grad_stats['ct']:.3e} "
+                    f"| ||g_zreg||={grad_stats['zreg']:.3e}",
+                    flush=True,
+                )
+    
+            scaler.scale(loss).backward()
+            if debug_act_step:
+                net_module = generator.render_kwargs_train.get("network_fn")
+                gain_param_grad = 0.0
+                if gain_param is not None and gain_param.grad is not None:
+                    gain_param_grad = float(gain_param.grad.detach().abs().mean().item())
+                print(
+                    f"[DEBUG][ACT][grads][step {step}] net={module_grad_mean_abs(net_module):.3e} "
+                    f"encoder={module_grad_mean_abs(encoder):.3e} z_fuser={module_grad_mean_abs(z_fuser):.3e} "
+                    f"gain_head={module_grad_mean_abs(gain_head):.3e} gain_param={gain_param_grad:.3e}",
+                    flush=True,
+                )
+            grad_norm_global = global_grad_norm(opt_params) if hybrid_enabled else 0.0
+            grad_norm_gen = torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
+            clip_event = float(grad_norm_gen) > 1.0
+            scaler.step(optimizer)
+            scaler.update()
+    
+            torch.cuda.synchronize()
+            iter_ms = (time.perf_counter() - t0) * 1000.0
+    
+            with torch.no_grad():
+                if not proj_metrics_enabled:
+                    mae_ap = float("nan")
+                    mae_pa = float("nan")
+                    pred_mean = (float("nan"), float("nan"))
+                    pred_std = (float("nan"), float("nan"))
+                    pred_mean_raw = (float("nan"), float("nan"))
+                    pred_std_raw = (float("nan"), float("nan"))
+                    psnr_ap = float("nan")
+                    psnr_pa = float("nan")
+                    psnr_ap_phys = None
+                    psnr_pa_phys = None
+                    mae_ap_phys = None
+                    mae_pa_phys = None
+                else:
+                    mae_ap = torch.mean(torch.abs(pred_ap - target_ap)).item()
+                    mae_pa = torch.mean(torch.abs(pred_pa - target_pa)).item()
+                    pred_mean = (pred_ap.mean().item(), pred_pa.mean().item())              # skaliert gemäß Projektnorm
+                    pred_std = (pred_ap.std().item(), pred_pa.std().item())
+                    pred_mean_raw = (pred_ap_raw.mean().item(), pred_pa_raw.mean().item())  # physikalischer Maßstab
+                    pred_std_raw = (pred_ap_raw.std().item(), pred_pa_raw.std().item())
+                    psnr_ap = compute_psnr(pred_ap, target_ap)
+                    psnr_pa = compute_psnr(pred_pa, target_pa)
+                    psnr_ap_phys = None
+                    psnr_pa_phys = None
+                    mae_ap_phys = None
+                    mae_pa_phys = None
+                    if log_proj_metrics_physical:
+                        pred_ap_phys = pred_ap * float(scale_ap_used)
+                        pred_pa_phys = pred_pa * float(scale_pa_used)
+                        target_ap_phys = target_ap * float(scale_ap_used)
+                        target_pa_phys = target_pa * float(scale_pa_used)
+                        psnr_ap_phys = compute_psnr(pred_ap_phys, target_ap_phys)
+                        psnr_pa_phys = compute_psnr(pred_pa_phys, target_pa_phys)
+                        mae_ap_phys = torch.mean(torch.abs(pred_ap_phys - target_ap_phys)).item()
+                        mae_pa_phys = torch.mean(torch.abs(pred_pa_phys - target_pa_phys)).item()
+                bg_depth_frac = float(bg_depth_frac_t.detach().cpu().item())
+                if hybrid_enabled and hybrid_log_path is not None and need_raw_stats:
+                    target_ap_stats = tensor_stats(target_ap)
+                    target_pa_stats = tensor_stats(target_pa)
+                    pred_ap_stats = tensor_stats(pred_ap)
+                    pred_pa_stats = tensor_stats(pred_pa)
+                    atten_scale = float(generator.render_kwargs_train.get("atten_scale", ATTEN_SCALE_DEFAULT))
+                    (
+                        lambda_stats,
+                        mu_stats,
+                        atten_stats,
+                        atten_frac_gt20,
+                        atten_frac_clamp,
                         nonfinite_lambda,
                         nonfinite_atten,
-                        grad_norm_global,
-                        float(grad_norm_gen),
-                        int(clip_event),
-                        z_train_l2,
-                        z_enc_l2,
-                        z_latent_l2,
-                    ],
-                )
-            val_stats = None
-            if val_interval > 0 and (step % val_interval) == 0 and (not args.no_val):
-                rays_eval = None if ray_split_enabled else rays_per_proj
-                # Testmetriken:
-                # test_all  → gesamter Test-Split (dominiert von BG, kann “zu gut” aussehen)
-                # test_fg   → nur Vordergrund-Rays, misst eigentliche Rekonstruktionsqualität
-                # test_top10→ oberste 10% Test-Intensitäten, fokussiert auf stärkste Aktivität
-                subsets = {
-                    "test_all": ray_indices["pixel"]["test_idx_all"],
-                }
-                if ray_split_enabled:
-                    subsets["test_fg"] = ray_indices["pixel"]["test_idx_fg"]
-                    subsets["test_top10"] = ray_indices["pixel"]["test_idx_top10"]
-                    subsets["test_bg"] = ray_indices["pixel"]["test_idx_bg"]
-                val_stats = evaluate_pixel_subsets(
-                    generator,
-                    z_latent.detach(),
-                    rays_cache,
-                    subsets=subsets,
-                    ap_flat_proc=ap_flat_proc,
-                    pa_flat_proc=pa_flat_proc,
-                    rays_per_eval=rays_eval,
-                    bg_weight=args.bg_weight,
-                    weight_threshold=args.weight_threshold,
-                    pa_xflip=pa_xflip,
-                    ct_context=ct_context,
-                    W=W,
-                    scale_ap=scale_ap_used if log_proj_metrics_physical else None,
-                    scale_pa=scale_pa_used if log_proj_metrics_physical else None,
-                    loss_fn=loss_fn,
-                    pred_scale=pred_to_counts_scale if (hybrid_enabled and args.proj_target_source == "counts") else 1.0,
-                    gain=gain_val if (hybrid_enabled and args.proj_target_source == "counts") else None,
-                )
-        val_all = val_stats.get("test_all") if isinstance(val_stats, dict) else None
-        val_fg = val_stats.get("test_fg") if isinstance(val_stats, dict) else None
-        val_top10 = val_stats.get("test_top10") if isinstance(val_stats, dict) else None
-        val_bg = val_stats.get("test_bg") if isinstance(val_stats, dict) else None
-
-        val_loss = val_all["loss"] if val_all is not None else None
-        val_psnr = val_all["psnr"] if val_all is not None else None
-        val_mae = val_all["mae"] if val_all is not None else None
-
-        val_loss_fg = val_fg["loss"] if val_fg is not None else None
-        val_psnr_fg = val_fg["psnr"] if val_fg is not None else None
-        val_mae_fg = val_fg["mae"] if val_fg is not None else None
-        val_loss_bg = val_bg["loss"] if val_bg is not None else None
-        val_psnr_bg = val_bg["psnr"] if val_bg is not None else None
-        val_mae_bg = val_bg["mae"] if val_bg is not None else None
-        val_pred_mean_bg = val_bg.get("pred_mean") if val_bg is not None else None
-        val_target_mean_bg = val_bg.get("target_mean") if val_bg is not None else None
-        val_view_all = val_all.get("view") if val_all is not None else None
-        val_phys_all = val_all.get("phys") if val_all is not None else None
-        val_phys_fg = val_fg.get("phys") if val_fg is not None else None
-        val_phys_bg = val_bg.get("phys") if val_bg is not None else None
-        val_phys_top10 = val_top10.get("phys") if val_top10 is not None else None
-        val_loss_ap = val_view_all["ap"]["loss"] if val_view_all is not None else None
-        val_loss_pa = val_view_all["pa"]["loss"] if val_view_all is not None else None
-        val_psnr_ap_val = val_view_all["ap"]["psnr"] if val_view_all is not None else None
-        val_psnr_pa_val = val_view_all["pa"]["psnr"] if val_view_all is not None else None
-        val_mae_ap_val = val_view_all["ap"]["mae"] if val_view_all is not None else None
-        val_mae_pa_val = val_view_all["pa"]["mae"] if val_view_all is not None else None
-
-        val_loss_top10 = val_top10["loss"] if val_top10 is not None else None
-        val_psnr_top10 = val_top10["psnr"] if val_top10 is not None else None
-        val_mae_top10 = val_top10["mae"] if val_top10 is not None else None
-
-        msg = (
-            f"[step {step:05d}] loss={loss.item():.6f} | act={loss_act.item():.6f} "
-            f"| gain_reg={loss_gain.item():.6f} | ct={loss_ct.item():.6f} "
-            f"| ray_tv={loss_ray_tv.item():.6f} | ray_tv_w={loss_ray_tv_w.item():.6f} "
-            f"| bg_depth_mass={bg_depth_mass.item():.6f} | bg_depth_mass_w={bg_depth_mass_w.item():.6f} | bg_depth_frac={bg_depth_frac:.4f} "
-            f"| tv={loss_tv.item():.6f} | zreg={loss_reg.item():.6f} "
-        )
-        if proj_metrics_enabled:
-            msg += (
-                f"| ap={loss_ap.item():.6f} | pa={loss_pa.item():.6f} "
-                f"| mae_ap={mae_ap:.6f} | mae_pa={mae_pa:.6f} "
-                f"| psnr_ap={psnr_ap:.2f} | psnr_pa={psnr_pa:.2f} "
-                f"| predμ_raw=({pred_mean_raw[0]:.3e},{pred_mean_raw[1]:.3e}) predσ_raw=({pred_std_raw[0]:.3e},{pred_std_raw[1]:.3e}) "
-                f"| predμ=({pred_mean[0]:.3e},{pred_mean[1]:.3e}) predσ=({pred_std[0]:.3e},{pred_std[1]:.3e})"
+                    ) = compute_lambda_and_attenuation_stats([extras_ap, extras_pa], atten_scale=atten_scale)
+                    nonfinite_pred = nonfinite_fraction(torch.cat([pred_ap, pred_pa], dim=1))
+                    proj_scale_enc_val = (
+                        float(proj_scale_enc.mean().item()) if torch.is_tensor(proj_scale_enc) else float("nan")
+                    )
+                    gain_log = float(gain_val.mean().item()) if gain_val is not None else float("nan")
+                    z_train_l2 = float(z_train.detach().norm().item())
+                    z_enc_l2 = (
+                        float(z_enc_proj.detach().norm(dim=1).mean().item()) if z_enc_proj is not None else float("nan")
+                    )
+                    z_latent_l2 = float(z_latent.detach().norm(dim=1).mean().item())
+    
+                    def _stat(stats, key):
+                        return float(stats[key]) if stats is not None and key in stats else float("nan")
+    
+                    print(
+                        f"[hybrid][step {step:05d}] "
+                        f"t_ap(min/mean/p95/max)=({_stat(target_ap_stats,'min'):.3e},"
+                        f"{_stat(target_ap_stats,'mean'):.3e},{_stat(target_ap_stats,'p95'):.3e},"
+                        f"{_stat(target_ap_stats,'max'):.3e}) "
+                        f"t_pa(min/mean/p95/max)=({_stat(target_pa_stats,'min'):.3e},"
+                        f"{_stat(target_pa_stats,'mean'):.3e},{_stat(target_pa_stats,'p95'):.3e},"
+                        f"{_stat(target_pa_stats,'max'):.3e}) "
+                        f"p_ap(min/mean/p95/max)=({_stat(pred_ap_stats,'min'):.3e},"
+                        f"{_stat(pred_ap_stats,'mean'):.3e},{_stat(pred_ap_stats,'p95'):.3e},"
+                        f"{_stat(pred_ap_stats,'max'):.3e}) "
+                        f"p_pa(min/mean/p95/max)=({_stat(pred_pa_stats,'min'):.3e},"
+                        f"{_stat(pred_pa_stats,'mean'):.3e},{_stat(pred_pa_stats,'p95'):.3e},"
+                        f"{_stat(pred_pa_stats,'max'):.3e}) "
+                        f"lambda_ray(min/mean/p95/max)=({_stat(lambda_stats,'min'):.3e},"
+                        f"{_stat(lambda_stats,'mean'):.3e},{_stat(lambda_stats,'p95'):.3e},"
+                        f"{_stat(lambda_stats,'max'):.3e}) "
+                        f"mu(min/mean/p95/max)=({_stat(mu_stats,'min'):.3e},"
+                        f"{_stat(mu_stats,'mean'):.3e},{_stat(mu_stats,'p95'):.3e},"
+                        f"{_stat(mu_stats,'max'):.3e}) "
+                        f"atten(min/mean/p95/max)=({_stat(atten_stats,'min'):.3e},"
+                        f"{_stat(atten_stats,'mean'):.3e},{_stat(atten_stats,'p95'):.3e},"
+                        f"{_stat(atten_stats,'max'):.3e}) "
+                        f"gain={gain_log:.3e} "
+                        f"atten>20={atten_frac_gt20 if atten_frac_gt20 is not None else float('nan'):.3f} "
+                        f"atten=60={atten_frac_clamp if atten_frac_clamp is not None else float('nan'):.3f} "
+                        f"nonfinite(pred/lambda/atten)=({nonfinite_pred:.3e},{nonfinite_lambda:.3e},{nonfinite_atten:.3e}) "
+                        f"grad_norm={grad_norm_global:.3e} clip={int(clip_event)}",
+                        flush=True,
+                    )
+    
+                    append_hybrid_log(
+                        hybrid_log_path,
+                        [
+                            step,
+                            proj_weight,
+                            float(loss_proj.item()),
+                            float(loss_ap.item()),
+                            float(loss_pa.item()),
+                            float(loss_act.item()),
+                            float(loss_gain.item()),
+                            float(gain_prior) if gain_prior is not None else float("nan"),
+                            float(act_norm_factor),
+                            float(loss.item()),
+                            proj_scale_enc_val,
+                            _stat(target_ap_stats, "min"),
+                            _stat(target_ap_stats, "mean"),
+                            _stat(target_ap_stats, "p95"),
+                            _stat(target_ap_stats, "max"),
+                            _stat(target_pa_stats, "min"),
+                            _stat(target_pa_stats, "mean"),
+                            _stat(target_pa_stats, "p95"),
+                            _stat(target_pa_stats, "max"),
+                            _stat(pred_ap_stats, "min"),
+                            _stat(pred_ap_stats, "mean"),
+                            _stat(pred_ap_stats, "p95"),
+                            _stat(pred_ap_stats, "max"),
+                            _stat(pred_pa_stats, "min"),
+                            _stat(pred_pa_stats, "mean"),
+                            _stat(pred_pa_stats, "p95"),
+                            _stat(pred_pa_stats, "max"),
+                            _stat(lambda_stats, "min"),
+                            _stat(lambda_stats, "mean"),
+                            _stat(lambda_stats, "p95"),
+                            _stat(lambda_stats, "max"),
+                            _stat(mu_stats, "min"),
+                            _stat(mu_stats, "mean"),
+                            _stat(mu_stats, "p95"),
+                            _stat(mu_stats, "max"),
+                            _stat(atten_stats, "min"),
+                            _stat(atten_stats, "mean"),
+                            _stat(atten_stats, "p95"),
+                            _stat(atten_stats, "max"),
+                            float(atten_frac_gt20) if atten_frac_gt20 is not None else float("nan"),
+                            float(atten_frac_clamp) if atten_frac_clamp is not None else float("nan"),
+                            gain_log,
+                            nonfinite_pred,
+                            nonfinite_lambda,
+                            nonfinite_atten,
+                            grad_norm_global,
+                            float(grad_norm_gen),
+                            int(clip_event),
+                            z_train_l2,
+                            z_enc_l2,
+                            z_latent_l2,
+                        ],
+                    )
+                val_stats = None
+                if val_interval > 0 and (step % val_interval) == 0 and (not args.no_val):
+                    rays_eval = None if ray_split_enabled else rays_per_proj
+                    # Testmetriken:
+                    # test_all  → gesamter Test-Split (dominiert von BG, kann “zu gut” aussehen)
+                    # test_fg   → nur Vordergrund-Rays, misst eigentliche Rekonstruktionsqualität
+                    # test_top10→ oberste 10% Test-Intensitäten, fokussiert auf stärkste Aktivität
+                    subsets = {
+                        "test_all": ray_indices["pixel"]["test_idx_all"],
+                    }
+                    if ray_split_enabled:
+                        subsets["test_fg"] = ray_indices["pixel"]["test_idx_fg"]
+                        subsets["test_top10"] = ray_indices["pixel"]["test_idx_top10"]
+                        subsets["test_bg"] = ray_indices["pixel"]["test_idx_bg"]
+                    val_stats = evaluate_pixel_subsets(
+                        generator,
+                        z_latent.detach(),
+                        rays_cache,
+                        subsets=subsets,
+                        ap_flat_proc=ap_flat_proc,
+                        pa_flat_proc=pa_flat_proc,
+                        rays_per_eval=rays_eval,
+                        bg_weight=args.bg_weight,
+                        weight_threshold=args.weight_threshold,
+                        pa_xflip=pa_xflip,
+                        ct_context=ct_context,
+                        W=W,
+                        scale_ap=scale_ap_used if log_proj_metrics_physical else None,
+                        scale_pa=scale_pa_used if log_proj_metrics_physical else None,
+                        loss_fn=loss_fn,
+                        pred_scale=pred_to_counts_scale if (hybrid_enabled and args.proj_target_source == "counts") else 1.0,
+                        gain=gain_val if (hybrid_enabled and args.proj_target_source == "counts") else None,
+                    )
+            val_all = val_stats.get("test_all") if isinstance(val_stats, dict) else None
+            val_fg = val_stats.get("test_fg") if isinstance(val_stats, dict) else None
+            val_top10 = val_stats.get("test_top10") if isinstance(val_stats, dict) else None
+            val_bg = val_stats.get("test_bg") if isinstance(val_stats, dict) else None
+    
+            val_loss = val_all["loss"] if val_all is not None else None
+            val_psnr = val_all["psnr"] if val_all is not None else None
+            val_mae = val_all["mae"] if val_all is not None else None
+    
+            val_loss_fg = val_fg["loss"] if val_fg is not None else None
+            val_psnr_fg = val_fg["psnr"] if val_fg is not None else None
+            val_mae_fg = val_fg["mae"] if val_fg is not None else None
+            val_loss_bg = val_bg["loss"] if val_bg is not None else None
+            val_psnr_bg = val_bg["psnr"] if val_bg is not None else None
+            val_mae_bg = val_bg["mae"] if val_bg is not None else None
+            val_pred_mean_bg = val_bg.get("pred_mean") if val_bg is not None else None
+            val_target_mean_bg = val_bg.get("target_mean") if val_bg is not None else None
+            val_view_all = val_all.get("view") if val_all is not None else None
+            val_phys_all = val_all.get("phys") if val_all is not None else None
+            val_phys_fg = val_fg.get("phys") if val_fg is not None else None
+            val_phys_bg = val_bg.get("phys") if val_bg is not None else None
+            val_phys_top10 = val_top10.get("phys") if val_top10 is not None else None
+            val_loss_ap = val_view_all["ap"]["loss"] if val_view_all is not None else None
+            val_loss_pa = val_view_all["pa"]["loss"] if val_view_all is not None else None
+            val_psnr_ap_val = val_view_all["ap"]["psnr"] if val_view_all is not None else None
+            val_psnr_pa_val = val_view_all["pa"]["psnr"] if val_view_all is not None else None
+            val_mae_ap_val = val_view_all["ap"]["mae"] if val_view_all is not None else None
+            val_mae_pa_val = val_view_all["pa"]["mae"] if val_view_all is not None else None
+    
+            val_loss_top10 = val_top10["loss"] if val_top10 is not None else None
+            val_psnr_top10 = val_top10["psnr"] if val_top10 is not None else None
+            val_mae_top10 = val_top10["mae"] if val_top10 is not None else None
+    
+            msg = (
+                f"[step {step:05d}] loss={loss.item():.6f} | act={loss_act.item():.6f} "
+                f"| gain_reg={loss_gain.item():.6f} | ct={loss_ct.item():.6f} "
+                f"| ray_tv={loss_ray_tv.item():.6f} | ray_tv_w={loss_ray_tv_w.item():.6f} "
+                f"| bg_depth_mass={bg_depth_mass.item():.6f} | bg_depth_mass_w={bg_depth_mass_w.item():.6f} | bg_depth_frac={bg_depth_frac:.4f} "
+                f"| tv={loss_tv.item():.6f} | zreg={loss_reg.item():.6f} "
             )
-        if proj_metrics_enabled and log_proj_metrics_physical and psnr_ap_phys is not None:
-            msg += (
-                f" | mae_ap_phys={mae_ap_phys:.6f} | mae_pa_phys={mae_pa_phys:.6f} "
-                f"| psnr_ap_phys={psnr_ap_phys:.2f} | psnr_pa_phys={psnr_pa_phys:.2f}"
-            )
-        if ray_tv_weight != 0.0:
-            msg += f" | ray_tv_mode={ray_tv_mode}"
-            if ray_tv_w_mean is not None:
-                msg += f" | ray_tv_w_mean={ray_tv_w_mean:.6f}"
-            if ray_tv_w_min is not None and ray_tv_w_max is not None:
-                msg += f" | ray_tv_w_min={float(ray_tv_w_min):.6f} | ray_tv_w_max={float(ray_tv_w_max):.6f}"
-            if ct_boundary_depth_mean is not None and ct_boundary_depth_median is not None:
+            if proj_metrics_enabled:
                 msg += (
-                    f" | ct_bnd_mean={float(ct_boundary_depth_mean):.3f}"
-                    f" | ct_bnd_med={float(ct_boundary_depth_median):.3f}"
+                    f"| ap={loss_ap.item():.6f} | pa={loss_pa.item():.6f} "
+                    f"| mae_ap={mae_ap:.6f} | mae_pa={mae_pa:.6f} "
+                    f"| psnr_ap={psnr_ap:.2f} | psnr_pa={psnr_pa:.2f} "
+                    f"| predμ_raw=({pred_mean_raw[0]:.3e},{pred_mean_raw[1]:.3e}) predσ_raw=({pred_std_raw[0]:.3e},{pred_std_raw[1]:.3e}) "
+                    f"| predμ=({pred_mean[0]:.3e},{pred_mean[1]:.3e}) predσ=({pred_std[0]:.3e},{pred_std[1]:.3e})"
                 )
-        if val_all is not None:
-            msg += (
-                f" | test_all_loss={val_loss:.6f} | test_all_psnr={val_psnr:.2f} | test_all_mae={val_mae:.6f}"
+            if proj_metrics_enabled and log_proj_metrics_physical and psnr_ap_phys is not None:
+                msg += (
+                    f" | mae_ap_phys={mae_ap_phys:.6f} | mae_pa_phys={mae_pa_phys:.6f} "
+                    f"| psnr_ap_phys={psnr_ap_phys:.2f} | psnr_pa_phys={psnr_pa_phys:.2f}"
+                )
+            if ray_tv_weight != 0.0:
+                msg += f" | ray_tv_mode={ray_tv_mode}"
+                if ray_tv_w_mean is not None:
+                    msg += f" | ray_tv_w_mean={ray_tv_w_mean:.6f}"
+                if ray_tv_w_min is not None and ray_tv_w_max is not None:
+                    msg += f" | ray_tv_w_min={float(ray_tv_w_min):.6f} | ray_tv_w_max={float(ray_tv_w_max):.6f}"
+                if ct_boundary_depth_mean is not None and ct_boundary_depth_median is not None:
+                    msg += (
+                        f" | ct_bnd_mean={float(ct_boundary_depth_mean):.3f}"
+                        f" | ct_bnd_med={float(ct_boundary_depth_median):.3f}"
+                    )
+            if val_all is not None:
+                msg += (
+                    f" | test_all_loss={val_loss:.6f} | test_all_psnr={val_psnr:.2f} | test_all_mae={val_mae:.6f}"
+                )
+            if val_fg is not None:
+                msg += (
+                    f" | test_fg_loss={val_loss_fg:.6f} | test_fg_psnr={val_psnr_fg:.2f} | test_fg_mae={val_mae_fg:.6f}"
+                )
+            if val_top10 is not None:
+                msg += (
+                    f" | test_top10_loss={val_loss_top10:.6f} | test_top10_psnr={val_psnr_top10:.2f} "
+                    f"| test_top10_mae={val_mae_top10:.6f}"
+                )
+            if val_bg is not None:
+                msg += (
+                    f" | test_bg_loss={val_loss_bg:.6f} | test_bg_psnr={val_psnr_bg:.2f} | test_bg_mae={val_mae_bg:.6f}"
+                )
+            if log_proj_metrics_physical and val_phys_all is not None:
+                msg += (
+                    f" | test_all_psnr_phys={val_phys_all['psnr']:.2f} | test_all_mae_phys={val_phys_all['mae']:.6f}"
+                )
+            if log_proj_metrics_physical and val_phys_fg is not None:
+                msg += (
+                    f" | test_fg_psnr_phys={val_phys_fg['psnr']:.2f} | test_fg_mae_phys={val_phys_fg['mae']:.6f}"
+                )
+            if log_proj_metrics_physical and val_phys_top10 is not None:
+                msg += (
+                    f" | test_top10_psnr_phys={val_phys_top10['psnr']:.2f} | test_top10_mae_phys={val_phys_top10['mae']:.6f}"
+                )
+            if log_proj_metrics_physical and val_phys_bg is not None:
+                msg += (
+                    f" | test_bg_psnr_phys={val_phys_bg['psnr']:.2f} | test_bg_mae_phys={val_phys_bg['mae']:.6f}"
+                )
+            if val_pred_mean_bg is not None and val_target_mean_bg is not None:
+                print(
+                    f"[ray-split-bg-check] mean target={val_target_mean_bg[0]:.3e}/{val_target_mean_bg[1]:.3e} "
+                    f"mean pred={val_pred_mean_bg[0]:.3e}/{val_pred_mean_bg[1]:.3e}",
+                    flush=True,
+                )
+            if val_view_all is not None:
+                msg += (
+                    f" | test_ap_loss={val_loss_ap:.6f} | test_ap_psnr={val_psnr_ap_val:.2f} | test_ap_mae={val_mae_ap_val:.6f}"
+                    f" | test_pa_loss={val_loss_pa:.6f} | test_pa_psnr={val_psnr_pa_val:.2f} | test_pa_mae={val_mae_pa_val:.6f}"
+                )
+            print(msg, flush=True)
+            append_log(
+                log_path,
+                [
+                    step,
+                    loss.item(),
+                    loss_ap.item(),
+                    loss_pa.item(),
+                    loss_act.item(),
+                    loss_ct.item(),
+                    loss_ray_tv.item(),
+                    loss_ray_tv_w.item(),
+                    bg_depth_mass.item(),
+                    bg_depth_mass_w.item(),
+                    bg_depth_frac,
+                    loss_tv.item(),
+                    loss_reg.item(),
+                    mae_ap,
+                    mae_pa,
+                    psnr_ap,
+                    psnr_pa,
+                    pred_mean[0],
+                    pred_mean[1],
+                    pred_std[0],
+                    pred_std[1],
+                    val_loss,
+                    val_loss_ap,
+                    val_loss_pa,
+                    val_psnr,
+                    val_psnr_ap_val,
+                    val_psnr_pa_val,
+                    val_mae,
+                    val_mae_ap_val,
+                    val_mae_pa_val,
+                    val_loss_fg,
+                    val_psnr_fg,
+                    val_mae_fg,
+                    val_loss_top10,
+                    val_psnr_top10,
+                    val_mae_top10,
+                    iter_ms,
+                    optimizer.param_groups[0]["lr"],
+                    ray_tv_mode,
+                    ray_tv_w_mean,
+                ],
             )
-        if val_fg is not None:
-            msg += (
-                f" | test_fg_loss={val_loss_fg:.6f} | test_fg_psnr={val_psnr_fg:.2f} | test_fg_mae={val_mae_fg:.6f}"
-            )
-        if val_top10 is not None:
-            msg += (
-                f" | test_top10_loss={val_loss_top10:.6f} | test_top10_psnr={val_psnr_top10:.2f} "
-                f"| test_top10_mae={val_mae_top10:.6f}"
-            )
-        if val_bg is not None:
-            msg += (
-                f" | test_bg_loss={val_loss_bg:.6f} | test_bg_psnr={val_psnr_bg:.2f} | test_bg_mae={val_mae_bg:.6f}"
-            )
-        if log_proj_metrics_physical and val_phys_all is not None:
-            msg += (
-                f" | test_all_psnr_phys={val_phys_all['psnr']:.2f} | test_all_mae_phys={val_phys_all['mae']:.6f}"
-            )
-        if log_proj_metrics_physical and val_phys_fg is not None:
-            msg += (
-                f" | test_fg_psnr_phys={val_phys_fg['psnr']:.2f} | test_fg_mae_phys={val_phys_fg['mae']:.6f}"
-            )
-        if log_proj_metrics_physical and val_phys_top10 is not None:
-            msg += (
-                f" | test_top10_psnr_phys={val_phys_top10['psnr']:.2f} | test_top10_mae_phys={val_phys_top10['mae']:.6f}"
-            )
-        if log_proj_metrics_physical and val_phys_bg is not None:
-            msg += (
-                f" | test_bg_psnr_phys={val_phys_bg['psnr']:.2f} | test_bg_mae_phys={val_phys_bg['mae']:.6f}"
-            )
-        if val_pred_mean_bg is not None and val_target_mean_bg is not None:
-            print(
-                f"[ray-split-bg-check] mean target={val_target_mean_bg[0]:.3e}/{val_target_mean_bg[1]:.3e} "
-                f"mean pred={val_pred_mean_bg[0]:.3e}/{val_pred_mean_bg[1]:.3e}",
-                flush=True,
-            )
-        if val_view_all is not None:
-            msg += (
-                f" | test_ap_loss={val_loss_ap:.6f} | test_ap_psnr={val_psnr_ap_val:.2f} | test_ap_mae={val_mae_ap_val:.6f}"
-                f" | test_pa_loss={val_loss_pa:.6f} | test_pa_psnr={val_psnr_pa_val:.2f} | test_pa_mae={val_mae_pa_val:.6f}"
-            )
-        print(msg, flush=True)
-        append_log(
-            log_path,
-            [
+            if args.save_every > 0 and (step % args.save_every == 0):
+                save_checkpoint(
+                    step,
+                    generator,
+                    z_train,
+                    optimizer,
+                    scaler,
+                    ckpt_dir,
+                    encoder=encoder,
+                    z_fuser=z_fuser,
+                    gain_head=gain_head,
+                    gain_param=gain_param,
+                )
+            maybe_render_preview(
                 step,
-                loss.item(),
-                loss_ap.item(),
-                loss_pa.item(),
-                loss_act.item(),
-                loss_ct.item(),
-                loss_ray_tv.item(),
-                loss_ray_tv_w.item(),
-                bg_depth_mass.item(),
-                bg_depth_mass_w.item(),
-                bg_depth_frac,
-                loss_tv.item(),
-                loss_reg.item(),
-                mae_ap,
-                mae_pa,
-                psnr_ap,
-                psnr_pa,
-                pred_mean[0],
-                pred_mean[1],
-                pred_std[0],
-                pred_std[1],
-                val_loss,
-                val_loss_ap,
-                val_loss_pa,
-                val_psnr,
-                val_psnr_ap_val,
-                val_psnr_pa_val,
-                val_mae,
-                val_mae_ap_val,
-                val_mae_pa_val,
-                val_loss_fg,
-                val_psnr_fg,
-                val_mae_fg,
-                val_loss_top10,
-                val_psnr_top10,
-                val_mae_top10,
-                iter_ms,
-                optimizer.param_groups[0]["lr"],
-                ray_tv_mode,
-                ray_tv_w_mean,
-            ],
-        )
-        if args.save_every > 0 and (step % args.save_every == 0):
-            save_checkpoint(
-                step,
+                args,
                 generator,
-                z_train,
-                optimizer,
-                scaler,
-                ckpt_dir,
-                encoder=encoder,
-                z_fuser=z_fuser,
-                gain_head=gain_head,
-                gain_param=gain_param,
+                z_latent.detach(),
+                outdir,
+                ct_vol,
+                act_vol,
+                ct_context,
+                target_ap=ap,
+                target_pa=pa,
+                target_ap_counts=ap_counts,
+                target_pa_counts=pa_counts,
             )
-        maybe_render_preview(
-            step,
-            args,
+            if args.export_vol_every > 0 and (step % args.export_vol_every == 0):
+                export_path = outdir / f"activity_pred_step_{step:05d}.npy"
+                export_activity_volume(generator, z_latent.detach(), export_path, args.export_vol_res, device)
+    
+        proj_metrics_enabled_final = not (args.act_only or (args.hybrid and args.proj_loss_weight <= 0.0))
+        if proj_metrics_enabled_final:
+            prev_flag = generator.use_test_kwargs
+            generator.eval()
+            generator.use_test_kwargs = True
+            with torch.no_grad():
+                proj_ap, _, _, _ = generator.render_from_pose(last_z_latent.detach(), generator.pose_ap, ct_context=ct_context)
+                proj_pa, _, _, _ = generator.render_from_pose(last_z_latent.detach(), generator.pose_pa, ct_context=ct_context)
+            generator.train()
+            generator.use_test_kwargs = prev_flag or False
+    
+            use_counts_final = (
+                (ap_counts is not None)
+                and (pa_counts is not None)
+                and (ap_counts.numel() > 0)
+                and (pa_counts.numel() > 0)
+            )
+            if proj_loss_type == "poisson":
+                lambda_ap_used = F.softplus(proj_ap) - math.log(2.0)
+                lambda_pa_used = F.softplus(proj_pa) - math.log(2.0)
+                lambda_ap_used = lambda_ap_used.clamp_min(1e-6)
+                lambda_pa_used = lambda_pa_used.clamp_min(1e-6)
+            else:
+                lambda_ap_used = proj_ap
+                lambda_pa_used = proj_pa
+            if use_counts_final:
+                lambda_ap_used = lambda_ap_used * float(pred_to_counts_scale)
+                lambda_pa_used = lambda_pa_used * float(pred_to_counts_scale)
+                gain_val_final = None
+                if gain_param is not None:
+                    gain_val_final = F.softplus(gain_param)
+                elif gain_head is not None:
+                    # compute z_enc for final batch (encoder sees normalized AP/PA)
+                    proj_scale_enc = compute_proj_scale(ap, pa, args.proj_scale_source, meta)
+                    proj_scale_enc = torch.clamp(proj_scale_enc, min=1e-6)
+                    enc_input = build_encoder_input(
+                        ap,
+                        pa,
+                        ct_vol,
+                        proj_scale_enc,
+                        args.encoder_proj_transform,
+                        args.encoder_use_ct,
+                    )
+                    z_enc_final = encoder(enc_input)
+                    gain_val_final = F.softplus(gain_head(z_enc_final))
+                if gain_val_final is not None:
+                    g_min = float(args.gain_clamp_min) if args.gain_clamp_min is not None else None
+                    g_max = args.gain_clamp_max
+                    if g_min is not None or g_max is not None:
+                        gmin = g_min if g_min is not None else -float("inf")
+                        gmax = g_max if g_max is not None else float("inf")
+                        gain_val_final = torch.clamp(gain_val_final, min=gmin, max=gmax)
+                    lambda_ap_used = lambda_ap_used * gain_val_final
+                    lambda_pa_used = lambda_pa_used * gain_val_final
+    
+            H, W = generator.H, generator.W
+            ap_np = lambda_ap_used[0].reshape(H, W).detach().cpu().numpy()
+            pa_np = lambda_pa_used[0].reshape(H, W).detach().cpu().numpy()
+            fp = outdir / "preview"
+            fp.mkdir(parents=True, exist_ok=True)
+            if args.log_quantiles_final_only:
+                if use_counts_final:
+                    ap_t_np = ap_counts.detach().cpu().numpy()[0]
+                    pa_t_np = pa_counts.detach().cpu().numpy()[0]
+                else:
+                    ap_t_np = ap.detach().cpu().numpy()[0] if ap is not None else None
+                    pa_t_np = pa.detach().cpu().numpy()[0] if pa is not None else None
+                log_projection_quantiles(lambda_ap_used, lambda_pa_used, ap_target=ap_t_np, pa_target=pa_t_np, tag="final")
+                if log_proj_metrics_physical:
+                    log_projection_quantiles_scaled(
+                        lambda_ap_used,
+                        lambda_pa_used,
+                        ap_target=ap_t_np,
+                        pa_target=pa_t_np,
+                        tag="final_phys",
+                        ap_scale=scale_ap_used,
+                        pa_scale=scale_pa_used,
+                    )
+                if use_counts_final:
+                    raw_ap_q = np.quantile(proj_ap.detach().cpu().numpy().ravel(), [0.5, 0.8, 0.95, 0.99])
+                    raw_pa_q = np.quantile(proj_pa.detach().cpu().numpy().ravel(), [0.5, 0.8, 0.95, 0.99])
+                    soft_ap_q = np.quantile(F.softplus(proj_ap).detach().cpu().numpy().ravel(), [0.5, 0.8, 0.95, 0.99])
+                    soft_pa_q = np.quantile(F.softplus(proj_pa).detach().cpu().numpy().ravel(), [0.5, 0.8, 0.95, 0.99])
+                    lam_ap_q = np.quantile(lambda_ap_used.detach().cpu().numpy().ravel(), [0.5, 0.8, 0.95, 0.99])
+                    lam_pa_q = np.quantile(lambda_pa_used.detach().cpu().numpy().ravel(), [0.5, 0.8, 0.95, 0.99])
+                    tgt_ap_q = np.quantile(ap_t_np.ravel(), [0.5, 0.8, 0.95, 0.99]) if ap_t_np is not None else None
+                    tgt_pa_q = np.quantile(pa_t_np.ravel(), [0.5, 0.8, 0.95, 0.99]) if pa_t_np is not None else None
+                    print(
+                        "[quantiles][final][diag] "
+                        f"pred_raw_ap p50={raw_ap_q[0]:.3e} p80={raw_ap_q[1]:.3e} p95={raw_ap_q[2]:.3e} p99={raw_ap_q[3]:.3e} | "
+                        f"pred_raw_pa p50={raw_pa_q[0]:.3e} p80={raw_pa_q[1]:.3e} p95={raw_pa_q[2]:.3e} p99={raw_pa_q[3]:.3e}",
+                        flush=True,
+                    )
+                    print(
+                        "[quantiles][final][diag] "
+                        f"softplus_ap p50={soft_ap_q[0]:.3e} p80={soft_ap_q[1]:.3e} p95={soft_ap_q[2]:.3e} p99={soft_ap_q[3]:.3e} | "
+                        f"softplus_pa p50={soft_pa_q[0]:.3e} p80={soft_pa_q[1]:.3e} p95={soft_pa_q[2]:.3e} p99={soft_pa_q[3]:.3e}",
+                        flush=True,
+                    )
+                    print(
+                        "[quantiles][final][diag] "
+                        f"lambda_ap p50={lam_ap_q[0]:.3e} p80={lam_ap_q[1]:.3e} p95={lam_ap_q[2]:.3e} p99={lam_ap_q[3]:.3e} | "
+                        f"lambda_pa p50={lam_pa_q[0]:.3e} p80={lam_pa_q[1]:.3e} p95={lam_pa_q[2]:.3e} p99={lam_pa_q[3]:.3e}",
+                        flush=True,
+                    )
+                    if tgt_ap_q is not None and tgt_pa_q is not None:
+                        print(
+                            "[quantiles][final][diag] "
+                            f"target_ap p50={tgt_ap_q[0]:.3e} p80={tgt_ap_q[1]:.3e} p95={tgt_ap_q[2]:.3e} p99={tgt_ap_q[3]:.3e} | "
+                            f"target_pa p50={tgt_pa_q[0]:.3e} p80={tgt_pa_q[1]:.3e} p95={tgt_pa_q[2]:.3e} p99={tgt_pa_q[3]:.3e}",
+                            flush=True,
+                        )
+                    if lam_ap_q[2] < 5 or lam_pa_q[2] < 5:
+                        print("[WARN] Final pred quantiles appear non-count-scaled; logging wrong tensor.", flush=True)
+            save_img(ap_np, fp / "final_AP.png", "AP final")
+            save_img(pa_np, fp / "final_PA.png", "PA final")
+            print("🖼️ Finale Previews gespeichert.", flush=True)
+            print("   ", (fp / "final_AP.png").resolve(), flush=True)
+            print("   ", (fp / "final_PA.png").resolve(), flush=True)
+    
+        export_activity_volume(generator, last_z_latent.detach(), outdir / "activity_pred_final.npy", args.export_vol_res, device)
+        save_checkpoint(
+            max_steps,
             generator,
-            z_latent.detach(),
-            outdir,
-            ct_vol,
-            act_vol,
-            ct_context,
+            z_train,
+            optimizer,
+            scaler,
+            ckpt_dir,
+            encoder=encoder,
+            z_fuser=z_fuser,
+            gain_head=gain_head,
+            gain_param=gain_param,
         )
-        if args.export_vol_every > 0 and (step % args.export_vol_every == 0):
-            export_path = outdir / f"activity_pred_step_{step:05d}.npy"
-            export_activity_volume(generator, z_latent.detach(), export_path, args.export_vol_res, device)
-
-    proj_metrics_enabled_final = not (args.act_only or (args.hybrid and args.proj_loss_weight <= 0.0))
-    if proj_metrics_enabled_final:
-        prev_flag = generator.use_test_kwargs
-        generator.eval()
-        generator.use_test_kwargs = True
-        with torch.no_grad():
-            proj_ap, _, _, _ = generator.render_from_pose(last_z_latent.detach(), generator.pose_ap, ct_context=ct_context)
-            proj_pa, _, _, _ = generator.render_from_pose(last_z_latent.detach(), generator.pose_pa, ct_context=ct_context)
-        generator.train()
-        generator.use_test_kwargs = prev_flag or False
-
-        H, W = generator.H, generator.W
-        ap_np = proj_ap[0].reshape(H, W).detach().cpu().numpy()
-        pa_np = proj_pa[0].reshape(H, W).detach().cpu().numpy()
-        fp = outdir / "preview"
-        fp.mkdir(parents=True, exist_ok=True)
-        if args.log_quantiles_final_only:
-            ap_t_np = ap.detach().cpu().numpy()[0] if ap is not None else None
-            pa_t_np = pa.detach().cpu().numpy()[0] if pa is not None else None
-            log_projection_quantiles(proj_ap, proj_pa, ap_target=ap_t_np, pa_target=pa_t_np, tag="final")
-            if log_proj_metrics_physical:
-                log_projection_quantiles_scaled(
-                    proj_ap,
-                    proj_pa,
-                    ap_target=ap_t_np,
-                    pa_target=pa_t_np,
-                    tag="final_phys",
-                    ap_scale=scale_ap_used,
-                    pa_scale=scale_pa_used,
-                )
-        save_img(ap_np, fp / "final_AP.png", "AP final")
-        save_img(pa_np, fp / "final_PA.png", "PA final")
-        print("🖼️ Finale Previews gespeichert.", flush=True)
-        print("   ", (fp / "final_AP.png").resolve(), flush=True)
-        print("   ", (fp / "final_PA.png").resolve(), flush=True)
-
-    export_activity_volume(generator, last_z_latent.detach(), outdir / "activity_pred_final.npy", args.export_vol_res, device)
-    save_checkpoint(
-        args.max_steps,
-        generator,
-        z_train,
-        optimizer,
-        scaler,
-        ckpt_dir,
-        encoder=encoder,
-        z_fuser=z_fuser,
-        gain_head=gain_head,
-        gain_param=gain_param,
-    )
-    print("✅ Training run finished.", flush=True)
-
-
+        print("✅ Training run finished.", flush=True)
+    
+    
+        print(f"[end] reached step={last_step} max_steps={max_steps} exit_reason={exit_reason}", flush=True)
+    except Exception as exc:
+        exit_reason = "exception"
+        print(f"[exception] {exc.__class__.__name__}: {exc}", flush=True)
+        traceback.print_exc()
+        raise
+    finally:
+        print(f"[end] reached step={last_step} max_steps={max_steps} exit_reason={exit_reason}", flush=True)
 if __name__ == "__main__":
     train()
