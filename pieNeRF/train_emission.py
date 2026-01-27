@@ -30,6 +30,7 @@ from utils.ray_split import (
 __VERSION__ = "emission-train v0.3"
 DEBUG_PRINTS = False  # Nur Debug-Ausgaben, keine Änderung am Verhalten
 ATTEN_SCALE_DEFAULT = 25.0
+_POISSON_RATE_LEGACY_WARNED = False
 
 
 def str2bool(v):
@@ -142,7 +143,7 @@ def parse_args():
     parser.add_argument(
         "--final-act-compare-scale",
         type=str,
-        default="shared",
+        default="separate",
         choices=["shared", "separate"],
         help="Color scaling fuer finale Activity-Compare: shared (vergleichbar) oder separate (strukturbetont).",
     )
@@ -172,6 +173,17 @@ def parse_args():
         "--debug-prints",
         action="store_true",
         help="Aktiviert verbosere Debug-Ausgaben (keine Verhaltensänderung).",
+    )
+    parser.add_argument(
+        "--debug-sanity-checks",
+        action="store_true",
+        help="Aktiviert Sanity-Checks (Attenuation/Scaling/Geometry); kann Training verlangsamen.",
+    )
+    parser.add_argument(
+        "--debug-sanity-every",
+        type=int,
+        default=100,
+        help="Intervall in Steps fuer Sanity-Checks (nur bei --debug-sanity-checks).",
     )
     parser.add_argument(
         "--weight-threshold",
@@ -215,6 +227,13 @@ def parse_args():
         default="poisson",
         choices=["poisson", "sqrt_mse", "huber"],
         help="Projection-Loss-Typ (poisson oder sqrt_mse).",
+    )
+    parser.add_argument(
+        "--poisson-rate-mode",
+        type=str,
+        default="softplus_shift",
+        choices=["softplus_shift", "identity"],
+        help="Poisson-Rate-Definition: softplus_shift (legacy) oder identity (rate=pred).",
     )
     parser.add_argument(
         "--proj-loss-weight",
@@ -265,6 +284,18 @@ def parse_args():
         type=float,
         default=1.0,
         help="Skalierung fuer Gain-Regularisierung (1.0 = unveraendert).",
+    )
+    parser.add_argument(
+        "--gain-warn-min",
+        type=float,
+        default=1e-3,
+        help="Warnschwelle fuer Gain (min) im Sanity-Check.",
+    )
+    parser.add_argument(
+        "--gain-warn-max",
+        type=float,
+        default=1e3,
+        help="Warnschwelle fuer Gain (max) im Sanity-Check.",
     )
     parser.add_argument(
         "--gain-prior-mode",
@@ -688,6 +719,29 @@ def poisson_nll(
     return nll.mean()
 
 
+def compute_poisson_rate(pred_raw: torch.Tensor, mode: str, eps: float = 1e-6) -> torch.Tensor:
+    """Map raw projection output to a Poisson rate (lambda).
+
+    Note: renderer already outputs a non-negative projection (proj_map). "identity" is
+    the physically consistent mapping. "softplus_shift" preserves legacy behavior.
+    """
+    mode = str(mode or "softplus_shift")
+    if mode == "softplus_shift":
+        global _POISSON_RATE_LEGACY_WARNED
+        if not _POISSON_RATE_LEGACY_WARNED:
+            print(
+                "[WARN] Poisson rate uses legacy softplus_shift on already-positive proj_map. "
+                "Consider --poisson-rate-mode identity for physically consistent rates.",
+                flush=True,
+            )
+            _POISSON_RATE_LEGACY_WARNED = True
+        rate = F.softplus(pred_raw) - math.log(2.0)
+        return rate.clamp_min(eps)
+    if mode == "identity":
+        return pred_raw.clamp_min(eps)
+    raise ValueError(f"Unknown poisson_rate_mode: {mode}")
+
+
 def sqrt_mse_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -1004,6 +1058,128 @@ def compute_lambda_and_attenuation_stats(
     return lambda_stats, mu_stats, atten_stats, frac_gt20, frac_clamp, nonfinite_lambda, nonfinite_atten
 
 
+def log_attenuation_sanity(
+    step: int,
+    extras_list,
+    atten_scale: float,
+    label: str = "train",
+    trans_near0: float = 1e-4,
+    trans_near1: float = 0.999,
+):
+    """Print attenuation/unit sanity stats based on render extras."""
+    dists_vals = []
+    sum_dists_vals = []
+    ray_norm_vals = []
+    near_vals = []
+    far_vals = []
+    mu_vals = []
+    atten_vals = []
+    trans_vals = []
+    n_samples = None
+    for extras in extras_list:
+        if not isinstance(extras, dict):
+            continue
+        dists = extras.get("dists")
+        if dists is None:
+            continue
+        if dists.dim() == 3 and dists.shape[-1] == 1:
+            dists = dists.squeeze(-1)
+        if n_samples is None:
+            n_samples = int(dists.shape[-1])
+        dists_vals.append(dists.reshape(-1))
+        sum_dists_vals.append(dists.sum(dim=-1).reshape(-1))
+        ray_norm = extras.get("ray_norm")
+        near = extras.get("near")
+        far = extras.get("far")
+        if ray_norm is not None:
+            ray_norm_vals.append(ray_norm.reshape(-1))
+        if near is not None:
+            near_vals.append(near.reshape(-1))
+        if far is not None:
+            far_vals.append(far.reshape(-1))
+        mu = extras.get("mu")
+        if mu is not None:
+            if mu.dim() == 3 and mu.shape[-1] == 1:
+                mu = mu.squeeze(-1)
+            if mu.shape == dists.shape:
+                mu_vals.append(mu.reshape(-1))
+                attenuation = extras.get("attenuation")
+                transmission = extras.get("transmission")
+                if attenuation is None:
+                    mu_clamped = torch.clamp(mu, min=0.0)
+                    mu_dists = mu_clamped * dists
+                    attenuation = torch.cumsum(mu_dists, dim=-1) * float(atten_scale)
+                    attenuation = F.pad(attenuation[..., :-1], (1, 0), mode="constant", value=0.0)
+                    attenuation = torch.clamp(attenuation, min=0.0, max=60.0)
+                if transmission is None:
+                    transmission = torch.exp(-attenuation)
+                atten_vals.append(attenuation.reshape(-1))
+                trans_vals.append(transmission.reshape(-1))
+    if not dists_vals:
+        print(f"[sanity][{label}][step {step}] no dists available for attenuation stats.", flush=True)
+        return
+
+    dists_all = torch.cat(dists_vals, dim=0)
+    sum_dists_all = torch.cat(sum_dists_vals, dim=0)
+    dists_stats = tensor_stats(dists_all)
+    sum_stats = tensor_stats(sum_dists_all)
+    ray_norm_stats = tensor_stats(torch.cat(ray_norm_vals, dim=0)) if ray_norm_vals else None
+    near_stats = tensor_stats(torch.cat(near_vals, dim=0)) if near_vals else None
+    far_stats = tensor_stats(torch.cat(far_vals, dim=0)) if far_vals else None
+    mu_stats = tensor_stats(torch.cat(mu_vals, dim=0)) if mu_vals else None
+    atten_stats = tensor_stats(torch.cat(atten_vals, dim=0)) if atten_vals else None
+    trans_stats = tensor_stats(torch.cat(trans_vals, dim=0)) if trans_vals else None
+    trans_near0_frac = (
+        float((torch.cat(trans_vals, dim=0) < trans_near0).float().mean().item()) if trans_vals else float("nan")
+    )
+    trans_near1_frac = (
+        float((torch.cat(trans_vals, dim=0) > trans_near1).float().mean().item()) if trans_vals else float("nan")
+    )
+    sum_mean = float(sum_stats["mean"]) if sum_stats is not None else float("nan")
+    sum_cm_est = sum_mean * float(atten_scale) if math.isfinite(sum_mean) else float("nan")
+    print(
+        f"[sanity][{label}][step {step}] dists(min/mean/p95/max)={fmt_stats(dists_stats)} "
+        f"| sum_dists(min/mean/p95/max)={fmt_stats(sum_stats)} | sum_dists_cm_est={sum_cm_est:.3e} "
+        f"| ||d||(min/mean/p95/max)={fmt_stats(ray_norm_stats)} "
+        f"| near(min/mean/p95/max)={fmt_stats(near_stats)} | far(min/mean/p95/max)={fmt_stats(far_stats)} "
+        f"| mu(min/mean/p95/max)={fmt_stats(mu_stats)} | atten(min/mean/p95/max)={fmt_stats(atten_stats)} "
+        f"| T(min/mean/p95/max)={fmt_stats(trans_stats)} | T<={trans_near0:.1e}={trans_near0_frac:.3f} "
+        f"| T>={trans_near1:.3f}={trans_near1_frac:.3f}",
+        flush=True,
+    )
+    if ray_norm_stats is not None:
+        ray_norm_mean = float(ray_norm_stats["mean"])
+        if abs(ray_norm_mean - 1.0) > 0.1:
+            print(
+                f"[sanity][{label}] WARN: ||rays_d|| mean deviates from 1.0 (mean={ray_norm_mean:.3f}).",
+                flush=True,
+            )
+    if ray_norm_vals and near_vals and far_vals:
+        ray_norm_all = torch.cat(ray_norm_vals, dim=0)
+        near_all = torch.cat(near_vals, dim=0)
+        far_all = torch.cat(far_vals, dim=0)
+        if dists_all.numel() > 0 and ray_norm_all.numel() == near_all.numel() == far_all.numel():
+            expected = (far_all - near_all) * ray_norm_all
+            if n_samples is not None and n_samples > 1:
+                # dists includes a duplicated last segment -> expected sum is scaled by N/(N-1)
+                expected = expected * (float(n_samples) / float(n_samples - 1))
+            expected_mean = float(expected.mean().item())
+            if math.isfinite(expected_mean) and expected_mean > 0:
+                ratio = sum_mean / expected_mean
+                if abs(ratio - 1.0) > 0.1:
+                    print(
+                        f"[sanity][{label}] WARN: sum_dists mean != (far-near)*||d|| "
+                        f"(ratio={ratio:.3f}, expected_mean={expected_mean:.3e}).",
+                        flush=True,
+                    )
+    if sum_mean <= 0 or (math.isfinite(sum_mean) and sum_mean < 1e-6):
+        print(f"[sanity][{label}] WARN: sum_dists mean is very small ({sum_mean:.3e}).", flush=True)
+    if trans_vals and (trans_near1_frac > 0.99):
+        print(f"[sanity][{label}] WARN: transmission ~1 for most samples (frac {trans_near1_frac:.3f}).", flush=True)
+    if trans_vals and (trans_near0_frac > 0.5):
+        print(f"[sanity][{label}] WARN: transmission ~0 for many samples (frac {trans_near0_frac:.3f}).", flush=True)
+
+
 def build_ray_split(num_pixels: int, split_ratio: float, device: torch.device) -> Dict[str, torch.Tensor]:
     """
     Erzeuge einen festen Train/Test-Split über alle Rays einer Ansicht.
@@ -1112,7 +1288,8 @@ def log_effective_config(outdir: Path, config: dict, args):
         f"| ct_loss_weight={args.ct_loss_weight} | ct_threshold={args.ct_threshold} | z_reg_weight={args.z_reg_weight} "
         f"| ray_tv_weight={args.ray_tv_weight} | ray_tv_edge_aware={args.ray_tv_edge_aware} | ray_tv_alpha={args.ray_tv_alpha} "
         f"| ray_tv_w_clamp_min={args.ray_tv_w_clamp_min} | ct_padding_mode={args.ct_padding_mode} "
-        f"| bg_depth_mass_weight={args.bg_depth_mass_weight} | bg_depth_eps={args.bg_depth_eps} | bg_depth_mode={args.bg_depth_mode}",
+        f"| bg_depth_mass_weight={args.bg_depth_mass_weight} | bg_depth_eps={args.bg_depth_eps} | bg_depth_mode={args.bg_depth_mode} "
+        f"| poisson_rate_mode={args.poisson_rate_mode} | debug_sanity_checks={bool(getattr(args, 'debug_sanity_checks', False))}",
         flush=True,
     )
     if getattr(args, "hybrid", False):
@@ -1161,7 +1338,14 @@ def slice_rays(rays_full: torch.Tensor, ray_idx: torch.Tensor) -> torch.Tensor:
     )
 
 
-def render_minibatch(generator, z_latent, rays_subset, ct_context=None, return_raw: bool = False):
+def render_minibatch(
+    generator,
+    z_latent,
+    rays_subset,
+    ct_context=None,
+    return_raw: bool = False,
+    debug_sanity_checks: bool = False,
+):
     """Render a mini-batch of rays from a fixed pose while keeping training kwargs."""
     # train/test kwargs werden durch use_test_kwargs umgeschaltet
     render_kwargs = generator.render_kwargs_train if not generator.use_test_kwargs else generator.render_kwargs_test
@@ -1175,6 +1359,8 @@ def render_minibatch(generator, z_latent, rays_subset, ct_context=None, return_r
         render_kwargs["retraw"] = True
     if DEBUG_PRINTS:
         render_kwargs["debug_prints"] = True
+    if debug_sanity_checks:
+        render_kwargs["debug_sanity_checks"] = True
     proj_map, _, _, extras = generator.render(rays=rays_subset, **render_kwargs)
     return proj_map.view(z_latent.shape[0], -1), extras
 
@@ -2005,14 +2191,17 @@ def save_depth_profile(
     warn_render_fail = False
     warn_sampling_fail = False
 
+    # Avoid constrained_layout here: long diagnostic strings can force extreme
+    # whitespace and visually "squash" the axes width.
+    width_per_panel = 5.0
     fig, axes = plt.subplots(
         1,
         len(ray_indices),
-        figsize=(4 * len(ray_indices), 4),
+        figsize=(width_per_panel * len(ray_indices), 4.2),
         sharex=True,
         sharey=True,
-        constrained_layout=True,
     )
+    fig.subplots_adjust(wspace=0.35)
     axes = np.atleast_1d(axes)
 
     try:
@@ -2132,10 +2321,17 @@ def save_depth_profile(
 
                 ax.set_title(f"({y_idx},{x_idx})", fontsize=9)
                 if diag_parts:
+                    # Break the diagnostic text into multiple short lines so it
+                    # does not influence layout as aggressively.
+                    max_parts_per_line = 3
+                    diag_lines = [
+                        " | ".join(diag_parts[i : i + max_parts_per_line])
+                        for i in range(0, len(diag_parts), max_parts_per_line)
+                    ]
                     ax.text(
                         0.02,
                         0.98,
-                        " | ".join(diag_parts),
+                        "\n".join(diag_lines),
                         transform=ax.transAxes,
                         ha="left",
                         va="top",
@@ -2145,6 +2341,10 @@ def save_depth_profile(
                 ax.set_xlim(0.0, 1.0)
                 ax.grid(True, alpha=0.2)
                 ax.legend(loc="upper right", fontsize=8)
+                # Ensure square axes boxes for depth_profile_step_*.png (equal side lengths).
+                # This is about visual aspect, not equal data step sizes.
+                if hasattr(ax, "set_box_aspect"):
+                    ax.set_box_aspect(1)
     finally:
         generator.use_test_kwargs = prev_flag
         if hasattr(generator, "train"):
@@ -2876,6 +3076,7 @@ def evaluate_pixel_subsets(
     scale_ap: Optional[float] = None,
     scale_pa: Optional[float] = None,
     loss_fn=poisson_nll,
+    poisson_rate_mode: str = "softplus_shift",
     pred_scale: float = 1.0,
     gain: Optional[torch.Tensor] = None,
 ):
@@ -2900,10 +3101,8 @@ def evaluate_pixel_subsets(
             pred_pa_raw, _ = render_minibatch(generator, z_latent, ray_batch_pa, ct_context=ct_context)
 
             if loss_fn == poisson_nll:
-                lambda_ap_used = F.softplus(pred_ap_raw) - math.log(2.0)
-                lambda_pa_used = F.softplus(pred_pa_raw) - math.log(2.0)
-                lambda_ap_used = lambda_ap_used.clamp_min(1e-6)
-                lambda_pa_used = lambda_pa_used.clamp_min(1e-6)
+                lambda_ap_used = compute_poisson_rate(pred_ap_raw, poisson_rate_mode, eps=1e-6)
+                lambda_pa_used = compute_poisson_rate(pred_pa_raw, poisson_rate_mode, eps=1e-6)
             else:
                 lambda_ap_used = pred_ap_raw
                 lambda_pa_used = pred_pa_raw
@@ -3261,6 +3460,9 @@ def train():
     depth_sanity_every = int(max(0, args.depth_sanity_every))
     depth_checks_active = depth_sanity_every > 0
     depth_grad_zero_streak = 0
+    debug_sanity_checks = bool(getattr(args, "debug_sanity_checks", False))
+    debug_sanity_every = int(max(1, getattr(args, "debug_sanity_every", 100)))
+    geometry_checked = False
 
     generator = build_models(config)
     generator.to(device)
@@ -3626,8 +3828,8 @@ def train():
                 target_pa = pa.reshape(pa.shape[0], -1)[0, idx_pa].unsqueeze(0)
 
             if proj_loss_type == "poisson":
-                pred_ap = F.softplus(pred_ap_raw) + 1e-6
-                pred_pa = F.softplus(pred_pa_raw) + 1e-6
+                pred_ap = compute_poisson_rate(pred_ap_raw, args.poisson_rate_mode, eps=1e-6)
+                pred_pa = compute_poisson_rate(pred_pa_raw, args.poisson_rate_mode, eps=1e-6)
             else:
                 pred_ap = pred_ap_raw
                 pred_pa = pred_pa_raw
@@ -3863,6 +4065,77 @@ def train():
             else:
                 z_latent = z_base
             last_z_latent = z_latent
+
+            if debug_sanity_checks and (not geometry_checked) and step == 1:
+                geometry_checked = True
+                try:
+                    prev_flag = generator.use_test_kwargs
+                    generator.eval()
+                    generator.use_test_kwargs = True
+                    with torch.no_grad():
+                        proj_ap_full, _, _, _ = generator.render_from_pose(z_latent.detach(), generator.pose_ap, ct_context=ct_context)
+                        proj_pa_full, _, _, _ = generator.render_from_pose(z_latent.detach(), generator.pose_pa, ct_context=ct_context)
+                    generator.train()
+                    generator.use_test_kwargs = prev_flag or False
+
+                    H, W = generator.H, generator.W
+                    pred_ap_full = proj_ap_full.view(1, -1)
+                    pred_pa_full = proj_pa_full.view(1, -1)
+                    if proj_loss_type == "poisson":
+                        pred_ap_full = compute_poisson_rate(pred_ap_full, args.poisson_rate_mode, eps=1e-6)
+                        pred_pa_full = compute_poisson_rate(pred_pa_full, args.poisson_rate_mode, eps=1e-6)
+                    if use_counts:
+                        pred_ap_full = pred_ap_full * float(pred_to_counts_scale)
+                        pred_pa_full = pred_pa_full * float(pred_to_counts_scale)
+                        gain_val_dbg = None
+                        if gain_head is not None and z_enc is not None:
+                            gain_val_dbg = F.softplus(gain_head(z_enc))
+                        elif gain_param is not None:
+                            gain_val_dbg = F.softplus(gain_param)
+                        if gain_val_dbg is not None:
+                            g_min = float(args.gain_clamp_min) if args.gain_clamp_min is not None else None
+                            g_max = args.gain_clamp_max
+                            if g_min is not None or g_max is not None:
+                                gmin = g_min if g_min is not None else -float("inf")
+                                gmax = g_max if g_max is not None else float("inf")
+                                gain_val_dbg = torch.clamp(gain_val_dbg, min=gmin, max=gmax)
+                            pred_ap_full = pred_ap_full * gain_val_dbg
+                            pred_pa_full = pred_pa_full * gain_val_dbg
+
+                    tgt_ap_full = target_ap_full.reshape(1, -1)
+                    tgt_pa_full = target_pa_full.reshape(1, -1)
+
+                    def _corr(a, b):
+                        a = a.reshape(-1).float()
+                        b = b.reshape(-1).float()
+                        a = a - a.mean()
+                        b = b - b.mean()
+                        denom = a.std() * b.std() + 1e-8
+                        return float((a * b).mean().item() / denom.item())
+
+                    def _nmse(a, b):
+                        a = a.reshape(-1).float()
+                        b = b.reshape(-1).float()
+                        num = torch.mean((a - b) ** 2)
+                        den = torch.mean(b ** 2) + 1e-12
+                        return float((num / den).item())
+
+                    pa_img = tgt_pa_full.view(H, W)
+                    pa_img_flip = torch.flip(pa_img, dims=[1])
+                    pa_flip_flat = pa_img_flip.reshape(1, -1)
+                    corr_ap = _corr(pred_ap_full, tgt_ap_full)
+                    corr_pa = _corr(pred_pa_full, tgt_pa_full)
+                    corr_pa_flip = _corr(pred_pa_full, pa_flip_flat)
+                    nmse_ap = _nmse(pred_ap_full, tgt_ap_full)
+                    nmse_pa = _nmse(pred_pa_full, tgt_pa_full)
+                    nmse_pa_flip = _nmse(pred_pa_full, pa_flip_flat)
+                    print(
+                        f"[sanity][geometry] corr_ap={corr_ap:.3f} | corr_pa={corr_pa:.3f} | corr_pa_flip={corr_pa_flip:.3f} "
+                        f"| nmse_ap={nmse_ap:.3e} | nmse_pa={nmse_pa:.3e} | nmse_pa_flip={nmse_pa_flip:.3e}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(f"[sanity][geometry][WARN] check failed: {exc.__class__.__name__}: {exc}", flush=True)
     
             skip_proj = bool(args.act_only)
             debug_act_step = bool(args.debug_act and step == 1)
@@ -3874,7 +4147,7 @@ def train():
             need_ray_tv = (not skip_proj) and ray_tv_weight != 0.0
             need_bg_depth = (not skip_proj) and args.bg_depth_mass_weight > 0.0
             need_raw_stats = proj_metrics_enabled and hybrid_enabled and args.log_every > 0 and (step % args.log_every == 0 or step == 1)
-            need_raw = need_ray_tv or need_bg_depth or need_raw_stats or depth_checks_active
+            need_raw = need_ray_tv or need_bg_depth or need_raw_stats or depth_checks_active or debug_sanity_checks
     
             idx_ap = None
             idx_pa = None
@@ -3917,14 +4190,25 @@ def train():
             extras_ap = None
             extras_pa = None
             gain_val = None
+            lambda_floor_frac = None
     
             with torch.cuda.amp.autocast(enabled=amp_enabled):
                 if not skip_proj:
                     pred_ap, extras_ap = render_minibatch(
-                        generator, z_latent, ray_batch_ap, ct_context=ct_context, return_raw=need_raw
+                        generator,
+                        z_latent,
+                        ray_batch_ap,
+                        ct_context=ct_context,
+                        return_raw=need_raw,
+                        debug_sanity_checks=bool(args.debug_sanity_checks),
                     )
                     pred_pa, extras_pa = render_minibatch(
-                        generator, z_latent, ray_batch_pa, ct_context=ct_context, return_raw=need_raw
+                        generator,
+                        z_latent,
+                        ray_batch_pa,
+                        ct_context=ct_context,
+                        return_raw=need_raw,
+                        debug_sanity_checks=bool(args.debug_sanity_checks),
                     )
     
                     target_ap = ap_flat_proc[0, idx_ap].unsqueeze(0)
@@ -3934,10 +4218,12 @@ def train():
                     pred_pa_raw = pred_pa
     
                     if proj_loss_type == "poisson":
-                        lambda_ap_used = F.softplus(pred_ap_raw) - math.log(2.0)
-                        lambda_pa_used = F.softplus(pred_pa_raw) - math.log(2.0)
-                        lambda_ap_used = lambda_ap_used.clamp_min(1e-6)
-                        lambda_pa_used = lambda_pa_used.clamp_min(1e-6)
+                        lambda_ap_used = compute_poisson_rate(pred_ap_raw, args.poisson_rate_mode, eps=1e-6)
+                        lambda_pa_used = compute_poisson_rate(pred_pa_raw, args.poisson_rate_mode, eps=1e-6)
+                        floor_eps = 1e-6
+                        floor_ap = float((lambda_ap_used <= (floor_eps * 1.001)).float().mean().item())
+                        floor_pa = float((lambda_pa_used <= (floor_eps * 1.001)).float().mean().item())
+                        lambda_floor_frac = 0.5 * (floor_ap + floor_pa)
                     else:
                         lambda_ap_used = pred_ap_raw
                         lambda_pa_used = pred_pa_raw
@@ -4013,6 +4299,51 @@ def train():
                                     )
                             else:
                                 proj_collapse_count = 0
+
+                    if debug_sanity_checks and (step == 1 or (step % debug_sanity_every) == 0):
+                        atten_scale = float(generator.render_kwargs_train.get("atten_scale", ATTEN_SCALE_DEFAULT))
+                        print(
+                            f"[sanity][step {step}] near={generator.render_kwargs_train.get('near')} "
+                            f"| far={generator.render_kwargs_train.get('far')} | radius={generator.radius} "
+                            f"| atten_scale={atten_scale}",
+                            flush=True,
+                        )
+                        log_attenuation_sanity(
+                            step,
+                            [extras_ap, extras_pa],
+                            atten_scale=atten_scale,
+                            label="train",
+                        )
+                        if lambda_floor_frac is not None:
+                            print(
+                                f"[sanity][step {step}] lambda_floor_frac={lambda_floor_frac:.3f} "
+                                f"(mode={args.poisson_rate_mode})",
+                                flush=True,
+                            )
+                        if use_counts:
+                            gain_min = float(args.gain_warn_min)
+                            gain_max = float(args.gain_warn_max)
+                            gain_stats = None
+                            if gain_val is not None:
+                                gain_stats = tensor_stats(gain_val)
+                            scale_gain_stats = None
+                            if gain_val is not None:
+                                scale_gain_stats = tensor_stats(gain_val * float(pred_to_counts_scale))
+                            print(
+                                f"[sanity][step {step}] pred_to_counts_scale={pred_to_counts_scale:.3e} "
+                                f"| gain(min/mean/p95/max)={fmt_stats(gain_stats)} "
+                                f"| scale*gain(min/mean/p95/max)={fmt_stats(scale_gain_stats)}",
+                                flush=True,
+                            )
+                            if gain_stats is not None:
+                                gmin = gain_stats["min"]
+                                gmax = gain_stats["max"]
+                                if (gmin < gain_min) or (gmax > gain_max):
+                                    print(
+                                        f"[sanity][step {step}] WARN: gain outside [{gain_min:.3e},{gain_max:.3e}] "
+                                        f"(min={gmin:.3e}, max={gmax:.3e}).",
+                                        flush=True,
+                                    )
     
                     weight_ap = build_loss_weights(target_ap, args.bg_weight, args.weight_threshold)
                     weight_pa = build_loss_weights(target_pa, args.bg_weight, args.weight_threshold)
@@ -4655,6 +4986,7 @@ def train():
                         scale_ap=scale_ap_used if log_proj_metrics_physical else None,
                         scale_pa=scale_pa_used if log_proj_metrics_physical else None,
                         loss_fn=loss_fn,
+                        poisson_rate_mode=args.poisson_rate_mode,
                         pred_scale=pred_to_counts_scale if (hybrid_enabled and args.proj_target_source == "counts") else 1.0,
                         gain=gain_val if (hybrid_enabled and args.proj_target_source == "counts") else None,
                     )
@@ -4861,10 +5193,8 @@ def train():
                 and (pa_counts.numel() > 0)
             )
             if proj_loss_type == "poisson":
-                lambda_ap_used = F.softplus(proj_ap) - math.log(2.0)
-                lambda_pa_used = F.softplus(proj_pa) - math.log(2.0)
-                lambda_ap_used = lambda_ap_used.clamp_min(1e-6)
-                lambda_pa_used = lambda_pa_used.clamp_min(1e-6)
+                lambda_ap_used = compute_poisson_rate(proj_ap, args.poisson_rate_mode, eps=1e-6)
+                lambda_pa_used = compute_poisson_rate(proj_pa, args.poisson_rate_mode, eps=1e-6)
             else:
                 lambda_ap_used = proj_ap
                 lambda_pa_used = proj_pa

@@ -484,6 +484,20 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
             ret['z_vals'] = z_vals
             if mu_vals is not None:
                 ret['mu'] = mu_vals
+            debug_sanity_checks = bool(kwargs.get("debug_sanity_checks", False))
+            if debug_sanity_checks and use_attenuation and mu_vals is not None:
+                mu_clamped = torch.clamp(mu_vals, min=0.0)
+                mu_dists = mu_clamped * dists_out
+                attenuation = torch.cumsum(mu_dists, dim=-1) * float(atten_scale)
+                attenuation = F.pad(attenuation[..., :-1], (1, 0), mode="constant", value=0.0)
+                attenuation = torch.clamp(attenuation, min=0.0, max=60.0)
+                transmission = torch.exp(-attenuation)
+                ret['attenuation'] = attenuation
+                ret['transmission'] = transmission
+            if debug_sanity_checks:
+                ret['ray_norm'] = torch.norm(rays_d, dim=-1)
+                ret['near'] = near
+                ret['far'] = far
         return ret
 
     # Fallback: klassischer RGB-NeRF-Pfad (sollte in meinem Setup NIE aufgerufen werden)
