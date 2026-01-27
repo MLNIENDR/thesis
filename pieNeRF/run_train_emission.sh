@@ -36,23 +36,14 @@ exit_code=0
 srun ${PYTHON_BIN} -u train_emission.py \
   --config configs/spect.yaml \
   --hybrid \
-  --max-steps 2000 \
-  --depth-sanity-every 50 \
+  --max-steps 5 \
+  --save-every 5 \
   --proj-target-source counts \
   --proj-loss-type poisson \
-  --proj-loss-weight 0.1 \
-  --proj-weight-min 0.005 \
-  --proj-warmup-steps 50 \
-  --proj-ramp-steps 300 \
-  --proj-gain-source z_enc \
-  --gain-reg-weight 5e-3 \
-  --gain-reg-scale 0.1 \
-  --gain-clamp-min 0.7 \
-  --gain-clamp-max 1.3 \
-  --act-loss-weight 1e-2 \
-  --ct-loss-weight 1e-4 \
-  --ct-samples 2048 \
-  --ray-tv-weight 3e-4 || exit_code=$?
+  --final-act-compare \
+  --final-act-compare-axial \
+  --final-act-compare-axis2-idx 65 260 325 \
+  --final-act-compare-scale shared || exit_code=$?
 echo "python_exit=$exit_code"
 if [ $exit_code -ne 0 ]; then
   echo "[ERROR] Training failed with exit_code=$exit_code"

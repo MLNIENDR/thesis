@@ -103,6 +103,63 @@ def parse_args():
         help="Seed fuer deterministische Auswahl der Depth-Profile-Strahlen.",
     )
     parser.add_argument(
+        "--final-sagittal-viz",
+        action="store_true",
+        help="Speichere am Trainingsende eine sagittale GT-vs-Depth-Curtain Visualisierung.",
+    )
+    parser.add_argument(
+        "--final-sagittal-axis0-idx",
+        type=int,
+        nargs=3,
+        default=[80, 128, 200],
+        metavar=("IDX0", "IDX1", "IDX2"),
+        help="Drei feste axis0-Indizes fuer die finale sagittale Visualisierung (wie in test.py).",
+    )
+    parser.add_argument(
+        "--final-sagittal-debug",
+        action="store_true",
+        help="Speichere zusaetzlich eine Debug-PNG mit E[depth]/argmax pro Pixel.",
+    )
+    parser.add_argument(
+        "--final-act-compare",
+        action="store_true",
+        help="Speichere am Trainingsende eine GT-vs-Pred Activity-Compare PNG via Volumen-Slicing.",
+    )
+    parser.add_argument(
+        "--final-act-compare-axial",
+        action="store_true",
+        help="Verwende fuer die finale Compare-PNG axiale Slices (axis2) statt sagittale (axis0).",
+    )
+    parser.add_argument(
+        "--final-act-compare-axis0-idx",
+        type=int,
+        nargs=3,
+        default=[80, 128, 200],
+        metavar=("IDX0", "IDX1", "IDX2"),
+        help="Drei feste axis0-Indizes fuer die finale Activity-Compare Visualisierung (wie in test.py).",
+    )
+    parser.add_argument(
+        "--final-act-compare-axis2-idx",
+        type=int,
+        nargs=3,
+        default=[65, 260, 325],
+        metavar=("Z0", "Z1", "Z2"),
+        help="Drei feste axis2-Indizes fuer den axialen finalen Compare-Plot.",
+    )
+    parser.add_argument(
+        "--final-act-compare-out",
+        type=str,
+        default="final_act_compare_sagittal.png",
+        help="Dateiname fuer die finale Activity-Compare PNG (in outdir/preview/).",
+    )
+    parser.add_argument(
+        "--final-act-compare-scale",
+        type=str,
+        default="shared",
+        choices=["shared", "separate"],
+        help="Color scaling fuer finale Activity-Compare: shared (vergleichbar) oder separate (strukturbetont).",
+    )
+    parser.add_argument(
         "--save-every",
         type=int,
         default=0,
@@ -619,6 +676,7 @@ def export_activity_volume(generator, z_latent, out_path: Path, res: int, device
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(out_path, vol)
+    return vol
 
 
 def poisson_nll(
@@ -1475,28 +1533,104 @@ def save_depth_profile(
     bg_quantile = float(np.clip(bg_quantile, 0.0, 1.0))
     rng = np.random.default_rng(int(seed))
 
-    act_data = act_vol.detach().cpu().numpy() if act_vol is not None else None
-    act_masks = None
-    if act_data is not None:
-        if act_data.ndim == 4:
-            act_data = act_data.squeeze(0)
-        act_zero = act_data < 1e-6
-        act_nonzero = act_data > 1e-6
-        act_masks = (act_zero.max(axis=0), act_nonzero.max(axis=0))
+    perms = [
+        (0, 1, 2),
+        (0, 2, 1),
+        (1, 0, 2),
+        (1, 2, 0),
+        (2, 0, 1),
+        (2, 1, 0),
+    ]
 
-    def extract_curve(vol: torch.Tensor, y_idx: int, x_idx: int):
+    def _to_dhw(vol: Optional[torch.Tensor], name: str) -> Optional[torch.Tensor]:
         if vol is None:
+            return None
+        v = vol.detach()
+        if v.dim() == 4:
+            v = v.squeeze(0)
+        if v.dim() != 3:
+            print(
+                f"[depth-profile][WARN] {name} ist nicht 3D (shape={tuple(v.shape)}); deaktiviere {name}-Kurve.",
+                flush=True,
+            )
+            return None
+        raw_shape = tuple(v.shape)
+        chosen_perm = None
+        v_dhw = None
+        for perm in perms:
+            v_perm = v.permute(perm)
+            shp = tuple(v_perm.shape)
+            if shp[1] == H and shp[2] == W:
+                chosen_perm = perm
+                v_dhw = v_perm.contiguous()
+                break
+        if chosen_perm is None or v_dhw is None:
+            print(
+                f"[depth-profile][WARN] {name} raw shape={raw_shape} kann nicht auf (D,H,W)=(*,{H},{W}) gemappt werden; "
+                f"deaktiviere {name}-Kurve.",
+                flush=True,
+            )
+            return None
+        print(
+            f"[depth-profile] {name} raw shape={raw_shape} | perm={chosen_perm} -> DHW shape={tuple(v_dhw.shape)}",
+            flush=True,
+        )
+        if H > 0 and W > 0:
+            cy = min(H // 2, v_dhw.shape[1] - 1)
+            cx = min(W // 2, v_dhw.shape[2] - 1)
+            center_max = float(v_dhw[:, cy, cx].max().item())
+            print(
+                f"[depth-profile] {name} center-line max @ (y={cy},x={cx}) = {center_max:.3e}",
+                flush=True,
+            )
+        return v_dhw
+
+    act_dhw = _to_dhw(act_vol, "act")
+    ct_dhw = _to_dhw(ct_vol, "ct")
+
+    act_sample_vol = None
+    if act_vol is not None:
+        act_raw = act_vol.detach()
+        if act_raw.dim() == 4:
+            act_raw = act_raw.squeeze(0)
+        if act_raw.dim() != 3:
+            print(
+                f"[depth-profile][WARN] act raw shape={tuple(act_raw.shape)} ist nicht 3D; GT-Ray-Sampling deaktiviert.",
+                flush=True,
+            )
+        else:
+            act_sample_vol = act_raw.float().contiguous()
+            if act_sample_vol.device != generator.device:
+                act_sample_vol = act_sample_vol.to(generator.device, non_blocking=True)
+            print(
+                f"[depth-profile] act raw shape fuer Ray-Sampling: {tuple(act_sample_vol.shape)}",
+                flush=True,
+            )
+
+    act_masks = None
+
+    def extract_curve(vol_dhw: Optional[torch.Tensor], y_idx: int, x_idx: int, name: str):
+        if vol_dhw is None:
             return None, None
-        vol = vol.detach()
-        if vol.dim() == 4:
-            vol = vol.squeeze(0)
-        if vol.dim() != 3:
+        if vol_dhw.dim() != 3:
+            print(
+                f"[depth-profile][WARN] {name} DHW ist nicht 3D (shape={tuple(vol_dhw.shape)}); skippe.",
+                flush=True,
+            )
             return None, None
-        D, H_loc, W_loc = vol.shape[-3:]
+        D_loc, H_loc, W_loc = vol_dhw.shape
+        if H_loc != H or W_loc != W:
+            print(
+                f"[depth-profile][WARN] {name} DHW shape={tuple(vol_dhw.shape)} passt nicht zu (H,W)=({H},{W}); skippe.",
+                flush=True,
+            )
+            return None, None
         if not (0 <= y_idx < H_loc and 0 <= x_idx < W_loc):
             return None, None
-        curve = vol[:, y_idx, x_idx].cpu().numpy()
-        z_coords = idx_to_coord(torch.arange(D, device=vol.device), D, generator.radius if not isinstance(generator.radius, tuple) else generator.radius[1])
+        curve = vol_dhw[:, y_idx, x_idx].detach().float().cpu().numpy()
+        curve = np.nan_to_num(curve, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+        radius_local = generator.radius[1] if isinstance(generator.radius, tuple) else generator.radius
+        z_coords = idx_to_coord(torch.arange(D_loc, device=vol_dhw.device), D_loc, float(radius_local))
         return curve, z_coords
 
     def pick_ray_indices(num_zero: int = 1, num_active: int = 3):
@@ -1643,13 +1777,9 @@ def save_depth_profile(
             return int(y), int(x)
 
         ct_pos_mask = None
-        if ct_vol is not None:
-            ct_data = ct_vol.detach()
-            if ct_data.dim() == 4:
-                ct_data = ct_data.squeeze(0)
-            if ct_data.dim() == 3:
-                ct_depth_max = ct_data.max(dim=0).values.cpu().numpy()
-                ct_pos_mask = ct_depth_max > 1e-8
+        if ct_dhw is not None:
+            ct_depth_max = ct_dhw.max(dim=0).values.detach().cpu().numpy()
+            ct_pos_mask = ct_depth_max > 1e-8
 
         def combine_mask(base_mask, require_ct: bool):
             if base_mask is None:
@@ -1660,7 +1790,7 @@ def save_depth_profile(
             return mask
 
         zero_mask = nonzero_mask = None
-        if act_data is not None and act_masks is not None:
+        if act_masks is not None:
             zero_mask, nonzero_mask = act_masks
 
         zero_needed = max(num_zero, 0)
@@ -1732,14 +1862,65 @@ def save_depth_profile(
                 return data.shape
         return None
 
-    target_shape = first_shape(ct_vol, act_vol)
+    target_shape = None
+    for v in (ct_dhw, act_dhw):
+        if v is not None:
+            target_shape = tuple(v.shape)
+            break
+    if target_shape is None:
+        target_shape = first_shape(ct_vol, act_vol)
     if target_shape is None:
         return
 
-    D = target_shape[0]
     radius = generator.radius
     if isinstance(radius, tuple):
         radius = radius[1]
+    radius = float(radius)
+
+    d_candidates = []
+    if ct_dhw is not None:
+        d_candidates.append(int(ct_dhw.shape[0]))
+    if act_dhw is not None:
+        d_candidates.append(int(act_dhw.shape[0]))
+    if d_candidates:
+        D = int(min(d_candidates))
+        if len(set(d_candidates)) > 1:
+            print(
+                f"[depth-profile][WARN] Uneinheitliche Depth-Dims {d_candidates}; nutze D={D}.",
+                flush=True,
+            )
+    else:
+        D = int(target_shape[0])
+
+    def _clip_depth(vol_dhw: Optional[torch.Tensor], name: str) -> Optional[torch.Tensor]:
+        if vol_dhw is None:
+            return None
+        if vol_dhw.shape[0] < D:
+            print(
+                f"[depth-profile][WARN] {name} depth={vol_dhw.shape[0]} < D={D}; deaktiviere {name}-Kurve.",
+                flush=True,
+            )
+            return None
+        if vol_dhw.shape[0] != D:
+            return vol_dhw[:D]
+        return vol_dhw
+
+    act_dhw = _clip_depth(act_dhw, "act")
+    ct_dhw = _clip_depth(ct_dhw, "ct")
+
+    act_masks = None
+    if act_dhw is not None:
+        act_data = act_dhw.detach().float().cpu().numpy()
+        act_zero = act_data < 1e-6
+        act_nonzero = act_data > 1e-6
+        act_masks = (act_zero.max(axis=0), act_nonzero.max(axis=0))
+        cy = min(H // 2, act_data.shape[1] - 1)
+        cx = min(W // 2, act_data.shape[2] - 1)
+        center_max_np = float(np.max(act_data[:, cy, cx]))
+        print(
+            f"[depth-profile] act_DHW sanity: max over depth @ (y={cy},x={cx}) = {center_max_np:.3e}",
+            flush=True,
+        )
 
     num_zero, num_active = 1, 3
     target_total = max(num_zero + num_active, 1)
@@ -1788,52 +1969,1063 @@ def save_depth_profile(
     depth_axis = np.linspace(0.0, 1.0, D)
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(1, len(ray_indices), figsize=(4 * len(ray_indices), 4), sharex=True, sharey=True)
-    if not isinstance(axes, np.ndarray):
-        axes = [axes]
+    def _depth_axis_from_z(z_vals_t: torch.Tensor) -> np.ndarray:
+        z_np = z_vals_t.detach().float().cpu().numpy().reshape(-1)
+        if z_np.size == 0:
+            return depth_axis
+        z_min = float(np.min(z_np))
+        z_max = float(np.max(z_np))
+        if not np.isfinite(z_min) or not np.isfinite(z_max) or z_max <= z_min + 1e-8:
+            return np.linspace(0.0, 1.0, z_np.size)
+        return (z_np - z_min) / (z_max - z_min + 1e-8)
 
-    for ax, (y_idx, x_idx) in zip(axes, ray_indices):
-        curves = []
-        labels = []
-        curve_ct = extract_curve(ct_vol, y_idx, x_idx) if ct_vol is not None else (None, None)
-        curve_act = extract_curve(act_vol, y_idx, x_idx) if act_vol is not None else (None, None)
+    def _sample_volume_along_pts(vol_3d: torch.Tensor, pts: torch.Tensor) -> Optional[torch.Tensor]:
+        if vol_3d is None or vol_3d.dim() != 3:
+            return None
+        if radius <= 0:
+            return None
+        try:
+            vol = vol_3d.view(1, 1, *vol_3d.shape)
+            grid = (pts / radius).clamp(min=-1.0, max=1.0)
+            grid = grid.view(1, grid.shape[0], 1, 1, 3)
+            sampled = F.grid_sample(
+                vol,
+                grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )
+            return sampled.view(-1)
+        except Exception as exc:
+            print(f"[depth-profile][WARN] grid_sample fehlgeschlagen: {exc}", flush=True)
+            return None
 
-        if curve_ct[0] is not None:
-            curves.append(normalize_curve(curve_ct[0].copy()))
-            labels.append("μ (CT)")
-        if curve_act[0] is not None:
-            curves.append(normalize_curve(curve_act[0].copy()))
-            labels.append("Aktivität (GT)")
+    rays_ap_full = build_pose_rays(generator, generator.pose_ap)
+    prev_flag = bool(generator.use_test_kwargs)
+    generator.use_test_kwargs = True
+    render_kwargs = dict(generator.render_kwargs_test)
+    render_kwargs["features"] = z_latent
+    render_kwargs["retraw"] = True
+    if bool(render_kwargs.get("use_attenuation", False)):
+        render_kwargs["use_attenuation"] = False
+        print(
+            "[depth-profile][WARN] use_attenuation ohne ct_context -> fuer Depth-Profile deaktiviert.",
+            flush=True,
+        )
 
-        x_coord = idx_to_coord(torch.tensor(x_idx, device=generator.device), target_shape[2], radius)
-        y_coord = idx_to_coord(torch.tensor(y_idx, device=generator.device), target_shape[1], radius)
-        coords = torch.stack((x_coord.repeat(D), y_coord.repeat(D), z_coords), dim=1)
-        pred = query_emission_at_points(generator, z_latent, coords).detach().cpu().numpy()
-        curves.append(normalize_curve(pred.copy()))
-        labels.append("Aktivität (NeRF)")
+    warn_no_act = False
+    warn_no_z = False
+    warn_render_fail = False
+    warn_sampling_fail = False
 
-        for curve, label in zip(curves, labels):
-            ax.plot(depth_axis, curve, label=label)
+    fig, axes = plt.subplots(
+        1,
+        len(ray_indices),
+        figsize=(4 * len(ray_indices), 4),
+        sharex=True,
+        sharey=True,
+        constrained_layout=True,
+    )
+    axes = np.atleast_1d(axes)
 
-        title_extra = []
-        if ap_title_img is not None:
-            title_extra.append(f"I_AP={ap_title_img[y_idx, x_idx]:.2e}")
-        if pa_title_img is not None:
-            title_extra.append(f"I_PA={pa_title_img[y_idx, x_idx]:.2e}")
-        aux = " | ".join(title_extra)
-        ax.set_title(f"({y_idx},{x_idx})" + (f"\n{aux}" if aux else ""))
-        ax.set_ylim(0, 1.05)
-        ax.grid(True, alpha=0.2)
-        ax.legend(loc="upper right", fontsize=8)
+    try:
+        with torch.no_grad():
+            generator.eval()
+            for ax, (y_idx, x_idx) in zip(axes, ray_indices):
+                curves = []
+                labels = []
+
+                ray_idx = int(y_idx * W + x_idx)
+                ray_batch = rays_ap_full[:, ray_idx : ray_idx + 1, :]
+                rays_o = ray_batch[0, 0]
+                rays_d = ray_batch[1, 0]
+
+                z_vals_ray = None
+                try:
+                    _, _, _, extras = generator.render(rays=ray_batch, **render_kwargs)
+                    z_vals_ray = extras.get("z_vals")
+                except Exception as exc:
+                    if not warn_render_fail:
+                        print(f"[depth-profile][WARN] render fuer z_vals fehlgeschlagen: {exc}", flush=True)
+                        warn_render_fail = True
+                    z_vals_ray = None
+
+                if z_vals_ray is None:
+                    if not warn_no_z:
+                        print(
+                            "[depth-profile][WARN] Keine z_vals aus render; nutze uniforme Samples entlang des Rays.",
+                            flush=True,
+                        )
+                        warn_no_z = True
+                    z_vals_ray = z_coords
+                else:
+                    z_vals_ray = z_vals_ray.reshape(-1)
+
+                pts = rays_o.view(1, 3) + rays_d.view(1, 3) * z_vals_ray.view(-1, 1)
+                depth_axis_ray = _depth_axis_from_z(z_vals_ray)
+                d_ray = int(depth_axis_ray.size)
+
+                curve_ct = extract_curve(ct_dhw, y_idx, x_idx, "ct") if ct_dhw is not None else (None, None)
+                ct_curve_raw = curve_ct[0]
+                if ct_curve_raw is not None:
+                    ct_curve_raw = np.asarray(ct_curve_raw, dtype=np.float32).reshape(-1)
+                    if ct_curve_raw.size != d_ray and ct_curve_raw.size > 1:
+                        x_src = np.linspace(0.0, 1.0, ct_curve_raw.size)
+                        x_dst = np.linspace(0.0, 1.0, d_ray)
+                        ct_curve_raw = np.interp(x_dst, x_src, ct_curve_raw).astype(np.float32)
+                    if ct_curve_raw.size == d_ray:
+                        curves.append(normalize_curve(ct_curve_raw.copy()))
+                        labels.append("μ (CT)")
+
+                pred = query_emission_at_points(generator, z_latent, pts).detach().float().cpu().numpy().reshape(-1)
+                pred = np.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+                if pred.size != d_ray and pred.size > 1:
+                    x_src = np.linspace(0.0, 1.0, pred.size)
+                    x_dst = np.linspace(0.0, 1.0, d_ray)
+                    pred = np.interp(x_dst, x_src, pred).astype(np.float32)
+                curves.append(normalize_curve(pred.copy()))
+                labels.append("Aktivität (NeRF)")
+
+                gt_curve_raw = None
+                if act_sample_vol is None:
+                    if not warn_no_act:
+                        print("[depth-profile][WARN] act_vol fehlt fuer Ray-Sampling; GT-Kurve wird ausgelassen.", flush=True)
+                        warn_no_act = True
+                else:
+                    gt_curve_t = _sample_volume_along_pts(act_sample_vol, pts)
+                    if gt_curve_t is None:
+                        if not warn_sampling_fail:
+                            print("[depth-profile][WARN] GT-Ray-Sampling fehlgeschlagen; GT-Kurve wird ausgelassen.", flush=True)
+                            warn_sampling_fail = True
+                    else:
+                        gt_curve_raw = gt_curve_t.detach().float().cpu().numpy().reshape(-1)
+                        gt_curve_raw = np.nan_to_num(gt_curve_raw, nan=0.0, posinf=0.0, neginf=0.0).astype(
+                            np.float32, copy=False
+                        )
+                        if gt_curve_raw.size != d_ray and gt_curve_raw.size > 1:
+                            x_src = np.linspace(0.0, 1.0, gt_curve_raw.size)
+                            x_dst = np.linspace(0.0, 1.0, d_ray)
+                            gt_curve_raw = np.interp(x_dst, x_src, gt_curve_raw).astype(np.float32)
+                        if gt_curve_raw.size == d_ray:
+                            curves.insert(0, normalize_curve(gt_curve_raw.copy()))
+                            labels.insert(0, "Aktivität (GT)")
+
+                for curve, label in zip(curves, labels):
+                    ax.plot(depth_axis_ray, curve, label=label)
+
+                def _curve_stats(arr: Optional[np.ndarray]) -> Tuple[float, float, float]:
+                    if arr is None or arr.size == 0:
+                        return float("nan"), float("nan"), float("nan")
+                    finite = np.isfinite(arr)
+                    if not finite.any():
+                        return float("nan"), float("nan"), 0.0
+                    vals = arr[finite]
+                    return float(np.max(vals)), float(np.quantile(vals, 0.95)), float(np.mean(vals > 1e-8))
+
+                gt_max, gt_p95, gt_nz = _curve_stats(gt_curve_raw)
+                pred_max, pred_p95, pred_nz = _curve_stats(pred)
+                print(
+                    f"[depth-profile][ray y={y_idx} x={x_idx}] gt_max={gt_max:.3e} gt_p95={gt_p95:.3e} gt_nz={gt_nz:.3f} "
+                    f"| pred_max={pred_max:.3e} pred_p95={pred_p95:.3e} pred_nz={pred_nz:.3f}",
+                    flush=True,
+                )
+
+                diag_parts = []
+                if np.isfinite(gt_max):
+                    diag_parts.append(f"gt_max={gt_max:.2e}")
+                    diag_parts.append(f"gt_p95={gt_p95:.2e}")
+                    if gt_nz <= 0.0:
+                        diag_parts.append("gt_nonzero=0")
+                if np.isfinite(pred_max):
+                    diag_parts.append(f"pred_max={pred_max:.2e}")
+                if ap_title_img is not None:
+                    diag_parts.append(f"I_AP={ap_title_img[y_idx, x_idx]:.2e}")
+                if pa_title_img is not None:
+                    diag_parts.append(f"I_PA={pa_title_img[y_idx, x_idx]:.2e}")
+
+                ax.set_title(f"({y_idx},{x_idx})", fontsize=9)
+                if diag_parts:
+                    ax.text(
+                        0.02,
+                        0.98,
+                        " | ".join(diag_parts),
+                        transform=ax.transAxes,
+                        ha="left",
+                        va="top",
+                        fontsize=7,
+                    )
+                ax.set_ylim(0, 1.05)
+                ax.set_xlim(0.0, 1.0)
+                ax.grid(True, alpha=0.2)
+                ax.legend(loc="upper right", fontsize=8)
+    finally:
+        generator.use_test_kwargs = prev_flag
+        if hasattr(generator, "train"):
+            generator.train()
 
     axes[0].set_ylabel("normierte Intensität")
     for ax in axes:
         ax.set_xlabel("Tiefe (anterior → posterior)")
-    fig.suptitle(f"Depth-Profile @ step {step:05d}")
-    fig.tight_layout()
     outdir.mkdir(parents=True, exist_ok=True)
     fig.savefig(outdir / f"depth_profile_step_{step:05d}.png", dpi=150)
     plt.close(fig)
+
+
+def robust_norm_np(img: np.ndarray, lo_q: float = 0.01, hi_q: float = 0.99) -> np.ndarray:
+    """Robuste Normierung auf [0,1] via Quantile (NaN/Inf-sicher)."""
+    arr = np.asarray(img, dtype=np.float32)
+    finite = np.isfinite(arr)
+    if not finite.any():
+        return np.zeros_like(arr, dtype=np.float32)
+    vals = arr[finite]
+    lo_q = float(np.clip(lo_q, 0.0, 1.0))
+    hi_q = float(np.clip(hi_q, 0.0, 1.0))
+    if hi_q < lo_q:
+        lo_q, hi_q = hi_q, lo_q
+    try:
+        lo = float(np.quantile(vals, lo_q))
+        hi = float(np.quantile(vals, hi_q))
+    except Exception:
+        lo = float(np.min(vals))
+        hi = float(np.max(vals))
+    if not np.isfinite(lo):
+        lo = float(np.min(vals))
+    if not np.isfinite(hi):
+        hi = float(np.max(vals))
+    if hi <= lo + 1e-8:
+        vmin = float(np.min(vals))
+        vmax = float(np.max(vals))
+        if vmax <= vmin + 1e-8:
+            out = np.zeros_like(arr, dtype=np.float32)
+            out[finite] = 0.0
+            return out
+        lo, hi = vmin, vmax
+    clipped = np.clip(arr, lo, hi)
+    return ((clipped - lo) / (hi - lo + 1e-8)).astype(np.float32)
+
+
+def coord_to_index(coord: torch.Tensor, size: int, radius: float) -> torch.Tensor:
+    """Inverse von idx_to_coord mit Clamping auf gueltige Indizes."""
+    if size <= 1 or radius <= 0:
+        return torch.zeros_like(coord, dtype=torch.long)
+    idx_f = ((coord / (2.0 * float(radius))) + 0.5) * float(size - 1)
+    return torch.clamp(idx_f.round().long(), min=0, max=int(size - 1))
+
+
+def save_final_sagittal_depth_consistency(
+    args,
+    generator,
+    z_latent: torch.Tensor,
+    act_vol: Optional[torch.Tensor],
+    ct_context,
+    outdir: Path,
+):
+    """
+    Finale sagittale GT-vs-Depth-Curtain Visualisierung.
+
+    Links: GT-Slices exakt wie in test.py (fixe axis0-Indizes, extent/aspect/ticks).
+    Rechts: Depth-Curtain pro Slice auf demselben (axis1,axis2)-Raster.
+    """
+    if not bool(getattr(args, "final_sagittal_viz", False)):
+        return
+    if act_vol is None or act_vol.numel() == 0:
+        print("[final-sagittal] act_vol fehlt; skippe sagittale Visualisierung.", flush=True)
+        return
+
+    import matplotlib.pyplot as plt
+
+    preview_dir = outdir / "preview"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    out_path = preview_dir / "final_sagittal_depth_consistency.png"
+    debug_path = preview_dir / "final_sagittal_debug.png"
+
+    act_t = act_vol.detach()
+    if act_t.dim() == 4:
+        act_t = act_t.squeeze(0)
+    if act_t.dim() != 3:
+        print(f"[final-sagittal][WARN] act_vol ist nicht 3D (shape={tuple(act_t.shape)}); skippe.", flush=True)
+        return
+
+    act_np = act_t.float().cpu().numpy()
+    A, B, C = act_np.shape  # axis0, axis1, axis2
+    H, W = int(generator.H), int(generator.W)
+    print(
+        f"[final-sagittal] act_vol.shape={(A, B, C)} | generator.HW={(H, W)}",
+        flush=True,
+    )
+
+    idx_list_raw = list(getattr(args, "final_sagittal_axis0_idx", [80, 128, 200]))
+    idx_list = []
+    for idx in idx_list_raw:
+        idx_i = int(idx)
+        if 0 <= idx_i < A:
+            idx_list.append(idx_i)
+        else:
+            print(f"[final-sagittal][WARN] axis0 idx={idx_i} out of bounds fuer A={A}; ignoriere.", flush=True)
+    if not idx_list:
+        print("[final-sagittal][WARN] Keine gueltigen axis0-Indizes; skippe.", flush=True)
+        return
+
+    # gemeinsame Ticks exakt wie in test.py
+    y_step = max(1, B // 10)
+    z_step = max(1, C // 10)
+    y_ticks = np.arange(0, B, y_step)
+    z_ticks = np.arange(0, C, z_step)
+
+    def _save_gt_only():
+        fig, axs = plt.subplots(1, len(idx_list), figsize=(5 * len(idx_list), 6), constrained_layout=True)
+        if not isinstance(axs, np.ndarray):
+            axs = np.asarray([axs])
+        last_im = None
+        for ax, idx in zip(axs, idx_list):
+            img = act_np[idx, :, :].astype(np.float32)
+            # Optional: Orientierungskorrekturen wie in test.py.
+            # img = np.flipud(img)
+            # img = np.fliplr(img)
+            last_im = ax.imshow(
+                img,
+                origin="upper",
+                extent=[0, C - 1, B - 1, 0],
+                aspect="equal",
+                cmap="viridis",
+            )
+            ax.set_title(f"GT sagittal (act) @ axis0={idx}")
+            ax.set_xlabel("axis2 (z-like)")
+            ax.set_ylabel("axis1 (y-like)")
+            ax.set_xticks(z_ticks)
+            ax.set_yticks(y_ticks)
+        if last_im is not None:
+            cbar = fig.colorbar(last_im, ax=axs, shrink=0.9)
+            cbar.set_label("Activity (raw units)")
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        print(f"[final-sagittal] Saved GT-only {out_path}", flush=True)
+
+    # Shape-Sanity: fuer korrektes Mapping braucht das Ray-Raster (axis1,axis2).
+    if (B != H) or (C != W):
+        print(
+            "[final-sagittal][WARN] act (axis1,axis2) passt nicht zu generator.HW -> speichere GT-only.",
+            flush=True,
+        )
+        _save_gt_only()
+        return
+
+    rays_ap_full = build_pose_rays(generator, generator.pose_ap)
+    if rays_ap_full.dim() != 3 or rays_ap_full.shape[0] != 2:
+        print(
+            f"[final-sagittal][WARN] Unerwartete Ray-Shape: {tuple(rays_ap_full.shape)}; speichere GT-only.",
+            flush=True,
+        )
+        _save_gt_only()
+        return
+
+    # Render-Setup mit retraw, um Depth-Gewichte pro Ray zu rekonstruieren.
+    prev_flag = bool(generator.use_test_kwargs)
+    generator.use_test_kwargs = True
+    render_kwargs = dict(generator.render_kwargs_test)
+    render_kwargs["features"] = z_latent
+    render_kwargs["retraw"] = True
+    use_atten = bool(render_kwargs.get("use_attenuation", False))
+    atten_scale = float(render_kwargs.get("atten_scale", ATTEN_SCALE_DEFAULT))
+    if ct_context is not None:
+        render_kwargs["ct_context"] = ct_context
+    elif use_atten:
+        render_kwargs["use_attenuation"] = False
+
+    eps = 1e-8
+    ray_chunk = int(render_kwargs.get("chunk", 1024 * 32))
+    ray_chunk = max(1024, min(ray_chunk, 16384))
+    n_rays = int(rays_ap_full.shape[1])
+    print(
+        f"[final-sagittal] rays={n_rays} | ray_chunk={ray_chunk} | atten={use_atten} | atten_scale={atten_scale:.3f}",
+        flush=True,
+    )
+
+    def _compute_depth_weights(extras: dict) -> Optional[torch.Tensor]:
+        raw_out = extras.get("raw")
+        dists = extras.get("dists")
+        if raw_out is None or dists is None:
+            return None
+        lambda_vals = F.softplus(raw_out[..., 0])
+        weights = lambda_vals * dists
+        mu_vals = extras.get("mu")
+        if mu_vals is not None:
+            mu = torch.clamp(mu_vals, min=0.0)
+            mu_dists = mu * dists
+            attenuation = torch.cumsum(mu_dists, dim=-1) * float(atten_scale)
+            attenuation = F.pad(attenuation[..., :-1], (1, 0), mode="constant", value=0.0)
+            attenuation = torch.clamp(attenuation, min=0.0, max=60.0)
+            transmission = torch.exp(-attenuation)
+            mu_t = mu * transmission
+            # Bevorzugt: mu*T (muT). Fallback ist lambda*dists.
+            weights = mu_t * dists
+        weights = torch.clamp(weights, min=0.0)
+        return weights
+
+    expected_map = torch.zeros((B, C), dtype=torch.float32, device="cpu")
+    peak_map = torch.zeros((B, C), dtype=torch.float32, device="cpu")
+    sumw_map = torch.zeros((B, C), dtype=torch.float32, device="cpu")
+    argmax_map = torch.zeros((B, C), dtype=torch.int64, device="cpu")
+    valid_map = torch.zeros((B, C), dtype=torch.bool, device="cpu")
+    D_samples: Optional[int] = None
+    curtain_available = True
+    logged_shapes = False
+    try:
+        with torch.no_grad():
+            generator.eval()
+            for start in range(0, n_rays, ray_chunk):
+                end = min(n_rays, start + ray_chunk)
+                rays_chunk = rays_ap_full[:, start:end, :]
+                _, _, _, extras = generator.render(rays=rays_chunk, **render_kwargs)
+                raw_out = extras.get("raw")
+                dists = extras.get("dists")
+                mu_vals = extras.get("mu")
+                weights_raw = _compute_depth_weights(extras)
+                z_vals = extras.get("z_vals")
+                if not logged_shapes:
+                    raw_shape = tuple(raw_out.shape) if raw_out is not None else None
+                    dists_shape = tuple(dists.shape) if dists is not None else None
+                    z_shape = tuple(z_vals.shape) if z_vals is not None else None
+                    w_shape = tuple(weights_raw.shape) if weights_raw is not None else None
+                    print(
+                        "[final-sagittal][chunk0] "
+                        f"raw={raw_shape} | dists={dists_shape} | z_vals={z_shape} | "
+                        f"weights_raw={w_shape} | mu_present={mu_vals is not None}",
+                        flush=True,
+                    )
+                    logged_shapes = True
+                if weights_raw is None or z_vals is None:
+                    curtain_available = False
+                    print(
+                        "[final-sagittal][WARN] Extras ohne raw/dists/z_vals -> speichere GT-only.",
+                        flush=True,
+                    )
+                    break
+
+                sum_w_raw = weights_raw.sum(dim=-1, keepdim=True)
+                weights = weights_raw / (sum_w_raw + eps)
+
+                D_here = int(weights.shape[-1])
+                if D_samples is None:
+                    D_samples = D_here
+                elif D_samples != D_here:
+                    d_use = min(D_samples, D_here)
+                    print(
+                        f"[final-sagittal][WARN] Inkonsistente Sample-Anzahl ({D_samples} vs {D_here}); nutze {d_use}.",
+                        flush=True,
+                    )
+                    weights = weights[..., :d_use]
+                    D_here = d_use
+                    D_samples = d_use
+
+                sample_idx = torch.arange(D_here, device=weights.device, dtype=weights.dtype)
+                expected_ray = torch.sum(weights * sample_idx.view(1, -1), dim=-1)
+                peak_ray = torch.max(weights, dim=-1).values
+                sumw_ray = torch.sum(weights, dim=-1)
+                argmax_ray = torch.argmax(weights, dim=-1)
+
+                expected_cpu = expected_ray.detach().cpu().float()
+                peak_cpu = peak_ray.detach().cpu().float()
+                sumw_cpu = sumw_ray.detach().cpu().float()
+                argmax_cpu = argmax_ray.detach().cpu().long()
+
+                ray_idx_np = np.arange(start, end, dtype=np.int64)
+                y_idx_np = ray_idx_np // C
+                x_idx_np = ray_idx_np % C
+                y_idx = torch.from_numpy(y_idx_np).long()
+                x_idx = torch.from_numpy(x_idx_np).long()
+
+                expected_map[y_idx, x_idx] = expected_cpu
+                peak_map[y_idx, x_idx] = peak_cpu
+                sumw_map[y_idx, x_idx] = sumw_cpu
+                argmax_map[y_idx, x_idx] = argmax_cpu
+                valid_map[y_idx, x_idx] = True
+    finally:
+        # Generator-Zustand robust wiederherstellen (ohne .training Zugriff).
+        generator.use_test_kwargs = prev_flag
+        if hasattr(generator, "train"):
+            generator.train()
+
+    if (not curtain_available) or (D_samples is None):
+        _save_gt_only()
+        return
+
+    valid_np = valid_map.cpu().numpy()
+    expected_np = expected_map.cpu().numpy()
+    peak_np = peak_map.cpu().numpy()
+    sumw_np = sumw_map.cpu().numpy()
+    if not valid_np.any():
+        print("[final-sagittal][WARN] Keine gueltigen Rays fuer expected_map; speichere GT-only.", flush=True)
+        _save_gt_only()
+        return
+    # Nur fuer die Visualisierung in float casten.
+    argmax_np = argmax_map.cpu().numpy().astype(np.float32)
+
+    def _stats(vals: np.ndarray) -> Tuple[float, float, float, float]:
+        return (
+            float(np.min(vals)),
+            float(np.median(vals)),
+            float(np.quantile(vals, 0.95)),
+            float(np.max(vals)),
+        )
+
+    exp_vals = expected_np[valid_np]
+    peak_vals = peak_np[valid_np]
+    sumw_vals = sumw_np[valid_np]
+    valid_frac = float(np.mean(valid_np))
+    frac_peak_sharp = float(np.mean(peak_vals > (3.0 / float(max(D_samples, 1)))))
+    exp_stats = _stats(exp_vals)
+    peak_stats = _stats(peak_vals)
+    sumw_stats = _stats(sumw_vals)
+    frac_sumw_low = float(np.mean(sumw_vals < 0.99))
+    print(
+        f"[final-sagittal] expected_map.shape={expected_np.shape} | "
+        f"E[sample] min/median/p95/max="
+        f"{exp_stats[0]:.2f}/{exp_stats[1]:.2f}/{exp_stats[2]:.2f}/{exp_stats[3]:.2f} "
+        f"| valid_frac={valid_frac:.3f}",
+        flush=True,
+    )
+    print(
+        "[final-sagittal] peak_map min/median/p95/max="
+        f"{peak_stats[0]:.3f}/{peak_stats[1]:.3f}/{peak_stats[2]:.3f}/{peak_stats[3]:.3f} "
+        f"| frac(peak>3/D)={frac_peak_sharp:.3f}",
+        flush=True,
+    )
+    print(
+        "[final-sagittal] sumw_map min/median/p95/max="
+        f"{sumw_stats[0]:.3f}/{sumw_stats[1]:.3f}/{sumw_stats[2]:.3f}/{sumw_stats[3]:.3f} "
+        f"| frac(sumw<0.99)={frac_sumw_low:.3f}",
+        flush=True,
+    )
+
+    # Sanity-Checks: Index-Mapping + Ray-Summen fuer Testpunkte.
+    rng = np.random.default_rng(12345)
+    for idx in idx_list:
+        points = [(B // 2, C // 2)]
+        for _ in range(4):
+            points.append((int(rng.integers(0, B)), int(rng.integers(0, C))))
+        print(f"[final-sagittal][slice axis0={idx}] Sanity-Checks:", flush=True)
+        for (yy, zz) in points[:5]:
+            ray_idx = int(yy * C + zz)
+            act_val = float(act_np[idx, yy, zz])
+            exp_d = float(expected_np[yy, zz])
+            peak_v = float(peak_np[yy, zz])
+            sum_w = float(sumw_np[yy, zz])
+            print(
+                f"  (axis1,axis2)=({yy},{zz}) | act={act_val:.3e} | ray_idx=y*C+z={ray_idx} "
+                f"| E[sample]={exp_d:.2f} | peak={peak_v:.3f} | sum_w={sum_w:.3f}",
+                flush=True,
+            )
+
+    cmap_name = "viridis"
+    cmap = plt.get_cmap(cmap_name)
+
+    # Hauptfigure: 3 Slices, jeweils GT links, expected_map rechts.
+    n_rows = len(idx_list)
+    fig, axs = plt.subplots(n_rows, 2, figsize=(12, 4 * n_rows), constrained_layout=True)
+    if n_rows == 1:
+        axs = np.asarray([axs])
+
+    last_im = None
+    depth_vmin, depth_vmax = 0.0, float(max(D_samples - 1, 1))
+    last_depth_im = None
+    for row, idx in enumerate(idx_list):
+        gt_ax = axs[row, 0]
+        cur_ax = axs[row, 1]
+        gt_img = act_np[idx, :, :].astype(np.float32)
+        # Optional: Orientierungskorrekturen wie in test.py.
+        # gt_img = np.flipud(gt_img)
+        # gt_img = np.fliplr(gt_img)
+
+        last_im = gt_ax.imshow(
+            gt_img,
+            origin="upper",
+            extent=[0, C - 1, B - 1, 0],
+            aspect="equal",
+            cmap=cmap_name,
+        )
+        gt_ax.set_title(f"GT sagittal (act) @ axis0={idx}")
+        gt_ax.set_xlabel("axis2 (z-like)")
+        gt_ax.set_ylabel("axis1 (y-like)")
+        gt_ax.set_xticks(z_ticks)
+        gt_ax.set_yticks(y_ticks)
+
+        if row == 0:
+            last_depth_im = cur_ax.imshow(
+                expected_np,
+                origin="upper",
+                extent=[0, C - 1, B - 1, 0],
+                aspect="equal",
+                cmap="magma",
+                vmin=depth_vmin,
+                vmax=depth_vmax,
+            )
+            cur_ax.set_title("Expected sample index (AP, shared across slices)")
+            cur_ax.set_xlabel("axis2 (z-like)")
+            cur_ax.set_ylabel("axis1 (y-like)")
+            cur_ax.set_xticks(z_ticks)
+            cur_ax.set_yticks(y_ticks)
+        else:
+            cur_ax.axis("off")
+
+    if last_im is not None:
+        cbar = fig.colorbar(last_im, ax=axs.ravel().tolist(), shrink=0.9)
+        cbar.set_label("Activity (raw units)")
+    if last_depth_im is not None:
+        cbar_depth = fig.colorbar(last_depth_im, ax=axs[:, 1].ravel().tolist(), shrink=0.9)
+        cbar_depth.set_label("Expected sample index")
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    print(f"[final-sagittal] Saved {out_path}", flush=True)
+
+    # Optionale Debug-Visualisierung: expected_map, peak_map und argmax_map.
+    if bool(getattr(args, "final_sagittal_debug", False)):
+        fig_dbg, axs_dbg = plt.subplots(1, 3, figsize=(18, 5), constrained_layout=True)
+        exp_im = axs_dbg[0].imshow(
+            expected_np,
+            origin="upper",
+            extent=[0, C - 1, B - 1, 0],
+            aspect="equal",
+            cmap="magma",
+            vmin=depth_vmin,
+            vmax=depth_vmax,
+        )
+        axs_dbg[0].set_title("Expected sample index (AP)")
+        axs_dbg[0].set_xlabel("axis2 (z-like)")
+        axs_dbg[0].set_ylabel("axis1 (y-like)")
+        axs_dbg[0].set_xticks(z_ticks)
+        axs_dbg[0].set_yticks(y_ticks)
+
+        peak_im = axs_dbg[1].imshow(
+            peak_np,
+            origin="upper",
+            extent=[0, C - 1, B - 1, 0],
+            aspect="equal",
+            cmap="viridis",
+        )
+        axs_dbg[1].set_title("Peak weight per ray (AP)")
+        axs_dbg[1].set_xlabel("axis2 (z-like)")
+        axs_dbg[1].set_ylabel("axis1 (y-like)")
+        axs_dbg[1].set_xticks(z_ticks)
+        axs_dbg[1].set_yticks(y_ticks)
+
+        argmax_im = axs_dbg[2].imshow(
+            argmax_np,
+            origin="upper",
+            extent=[0, C - 1, B - 1, 0],
+            aspect="equal",
+            cmap="magma",
+            vmin=depth_vmin,
+            vmax=depth_vmax,
+        )
+        axs_dbg[2].set_title("Argmax sample index (AP)")
+        axs_dbg[2].set_xlabel("axis2 (z-like)")
+        axs_dbg[2].set_ylabel("axis1 (y-like)")
+        axs_dbg[2].set_xticks(z_ticks)
+        axs_dbg[2].set_yticks(y_ticks)
+
+        fig_dbg.colorbar(exp_im, ax=axs_dbg[0], shrink=0.9, label="Expected sample index")
+        fig_dbg.colorbar(peak_im, ax=axs_dbg[1], shrink=0.9, label="Peak weight")
+        fig_dbg.colorbar(argmax_im, ax=axs_dbg[2], shrink=0.9, label="Argmax sample index")
+        fig_dbg.savefig(debug_path, dpi=200)
+        plt.close(fig_dbg)
+        print(f"[final-sagittal] Saved debug {debug_path}", flush=True)
+
+
+def save_final_act_compare_volume_slicing(
+    args,
+    act_vol: Optional[torch.Tensor],
+    outdir: Path,
+    pred_path: Path,
+    pred_vol_np: Optional[np.ndarray] = None,
+):
+    """Finale GT-vs-Pred Activity-Compare PNG via reinem Volumen-Slicing (wie in test.py)."""
+    if not bool(getattr(args, "final_act_compare", False)):
+        return
+
+    if act_vol is None or act_vol.numel() == 0:
+        print("[final-act-compare] act_vol fehlt; skippe Activity-Compare.", flush=True)
+        return
+
+    if pred_vol_np is None and (not pred_path.exists()):
+        print(
+            f"[final-act-compare][WARN] Pred-Datei fehlt: {pred_path}; skippe Activity-Compare.",
+            flush=True,
+        )
+        return
+
+    import matplotlib.pyplot as plt
+
+    preview_dir = outdir / "preview"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    axial_mode = bool(getattr(args, "final_act_compare_axial", False))
+    # Immer eine eindeutige Datei schreiben, die nicht mit final_sagittal kollidiert.
+    out_path = preview_dir / ("final_act_compare_axial.png" if axial_mode else "final_act_compare_sagittal.png")
+
+    act_t = act_vol.detach()
+    if act_t.dim() == 4:
+        act_t = act_t.squeeze(0)
+    if act_t.dim() != 3:
+        print(
+            f"[final-act-compare][WARN] act_vol ist nicht 3D (shape={tuple(act_t.shape)}); skippe.",
+            flush=True,
+        )
+        return
+
+    gt_np = act_t.float().cpu().numpy()
+    if pred_vol_np is not None:
+        pred_np = np.asarray(pred_vol_np, dtype=np.float32)
+    else:
+        try:
+            pred_np = np.load(pred_path).astype(np.float32, copy=False)
+        except Exception as exc:
+            print(f"[final-act-compare][WARN] Konnte Pred nicht laden: {exc}; skippe.", flush=True)
+            return
+
+    if pred_np.ndim != 3:
+        print(
+            f"[final-act-compare][WARN] Pred ist nicht 3D (shape={tuple(pred_np.shape)}); skippe.",
+            flush=True,
+        )
+        return
+
+    gt_shape = tuple(int(x) for x in gt_np.shape)
+    pred_shape = tuple(int(x) for x in pred_np.shape)
+    print(
+        f"[final-act-compare] GT shape={gt_shape} | Pred shape={pred_shape} | mode={'axial' if axial_mode else 'sagittal'}",
+        flush=True,
+    )
+
+    def _linspace_norm(n: int, device: torch.device) -> torch.Tensor:
+        if n <= 1:
+            return torch.zeros((1,), device=device, dtype=torch.float32)
+        return torch.linspace(-1.0, 1.0, n, device=device, dtype=torch.float32)
+
+    def _resample_gt_to_pred_grid(gt_arr: np.ndarray, pred_shape: Tuple[int, int, int]) -> np.ndarray:
+        """Resample GT (A,B,C) -> pred grid (A2,B2,C2) via grid_sample (trilinear)."""
+        device = torch.device("cpu")
+        gt_t = torch.from_numpy(gt_arr.astype(np.float32, copy=False)).to(device)
+        gt_t = gt_t.unsqueeze(0).unsqueeze(0)  # [1,1,A,B,C]
+        A2, B2, C2 = (int(pred_shape[0]), int(pred_shape[1]), int(pred_shape[2]))
+        z_norm = _linspace_norm(A2, device)
+        y_norm = _linspace_norm(B2, device)
+        x_norm = _linspace_norm(C2, device)
+        zz, yy, xx = torch.meshgrid(z_norm, y_norm, x_norm, indexing="ij")
+        grid = torch.stack((xx, yy, zz), dim=-1).unsqueeze(0)  # [1,A2,B2,C2,3] mit (x,y,z)
+        gt_rs = F.grid_sample(
+            gt_t,
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        gt_rs = gt_rs.squeeze(0).squeeze(0)  # [A2,B2,C2]
+        return gt_rs.cpu().numpy().astype(np.float32, copy=False)
+
+    def _map_axis0_idx(idx_gt: int, A: int, A2: int) -> int:
+        idx_gt = int(idx_gt)
+        if A <= 1 or A2 <= 1:
+            return int(np.clip(idx_gt, 0, max(A2 - 1, 0)))
+        scale = float(A2 - 1) / float(A - 1)
+        idx_pred = int(round(float(idx_gt) * scale))
+        return int(np.clip(idx_pred, 0, A2 - 1))
+
+    def _robust_limits(arr: np.ndarray) -> Tuple[float, float]:
+        finite = np.isfinite(arr)
+        if not finite.any():
+            return 0.0, 1.0
+        vals = arr[finite].astype(np.float32, copy=False).ravel()
+        if vals.size == 0:
+            return 0.0, 1.0
+        try:
+            lo, hi = np.quantile(vals, [0.01, 0.99])
+        except Exception:
+            lo = float(np.min(vals))
+            hi = float(np.max(vals))
+        lo = float(lo)
+        hi = float(hi)
+        if (not np.isfinite(lo)) or (not np.isfinite(hi)) or (hi <= lo + 1e-8):
+            lo = float(np.min(vals))
+            hi = float(np.max(vals))
+            if hi <= lo + 1e-8:
+                hi = lo + 1e-6
+        return lo, hi
+
+    def _slice_stats(img: np.ndarray) -> Tuple[float, float, float, float, float]:
+        finite = np.isfinite(img)
+        if not finite.any():
+            return float("nan"), float("nan"), float("nan"), float("nan"), float("nan")
+        vals = img[finite].astype(np.float32, copy=False).ravel()
+        if vals.size == 0:
+            return float("nan"), float("nan"), float("nan"), float("nan"), float("nan")
+        nz_frac = float(np.mean(np.abs(vals) > 1e-8))
+        return float(np.min(vals)), float(np.mean(vals)), float(np.max(vals)), nz_frac, float(np.std(vals))
+
+    if axial_mode:
+        A, B, C = gt_shape
+        R = int(pred_shape[0])
+        z_list_raw = list(getattr(args, "final_act_compare_axis2_idx", [65, 260, 325]))
+
+        def _map_axis2_idx(z_gt: int, C_gt: int, R_pred: int) -> int:
+            z_gt = int(z_gt)
+            if C_gt <= 1 or R_pred <= 1:
+                return int(np.clip(z_gt, 0, max(R_pred - 1, 0)))
+            scale = float(R_pred - 1) / float(C_gt - 1)
+            z_pred = int(round(float(z_gt) * scale))
+            return int(np.clip(z_pred, 0, R_pred - 1))
+
+        z_pairs: list[Tuple[int, int]] = []
+        for z_gt in z_list_raw:
+            z_i = int(z_gt)
+            if 0 <= z_i < C:
+                z_pairs.append((z_i, _map_axis2_idx(z_i, C, R)))
+            else:
+                print(
+                    f"[final-act-compare][WARN] axis2 idx_gt={z_i} out of bounds fuer C_gt={C}; ignoriere.",
+                    flush=True,
+                )
+        if not z_pairs:
+            print("[final-act-compare][WARN] Keine gueltigen axis2-Indizes; skippe.", flush=True)
+            return
+
+        x_step_gt = max(1, B // 10)
+        y_step_gt = max(1, A // 10)
+        x_ticks_gt = np.arange(0, B, x_step_gt)
+        y_ticks_gt = np.arange(0, A, y_step_gt)
+
+        x_step_pr = max(1, R // 10)
+        y_step_pr = max(1, R // 10)
+        x_ticks_pr = np.arange(0, R, x_step_pr)
+        y_ticks_pr = np.arange(0, R, y_step_pr)
+
+        scale_mode = str(getattr(args, "final_act_compare_scale", "shared"))
+        shared_vmin = shared_vmax = None
+        if scale_mode == "shared":
+            vals_list = []
+            for z_gt, z_pred in z_pairs:
+                gt_img = gt_np[:, :, z_gt]
+                pr_img = pred_np[:, :, z_pred]
+                gt_vals = gt_img[np.isfinite(gt_img)].ravel()
+                pr_vals = pr_img[np.isfinite(pr_img)].ravel()
+                if gt_vals.size:
+                    vals_list.append(gt_vals)
+                if pr_vals.size:
+                    vals_list.append(pr_vals)
+            if vals_list:
+                shared_vals = np.concatenate(vals_list, axis=0)
+                shared_vmin, shared_vmax = _robust_limits(shared_vals)
+            else:
+                shared_vmin, shared_vmax = 0.0, 1.0
+
+        rows = len(z_pairs)
+        fig, axs = plt.subplots(rows, 2, figsize=(12, 4 * rows), constrained_layout=True)
+        axs = np.asarray(axs)
+        if axs.ndim == 1:
+            axs = axs.reshape(1, 2)
+
+        im_gt_first = None
+        im_pr_first = None
+        for row, (z_gt, z_pred) in enumerate(z_pairs):
+            ax_gt = axs[row, 0]
+            ax_pr = axs[row, 1]
+
+            gt_img = gt_np[:, :, z_gt].astype(np.float32, copy=False)
+            pr_img = pred_np[:, :, z_pred].astype(np.float32, copy=False)
+
+            gt_min, gt_mean, gt_max, gt_nz, gt_std = _slice_stats(gt_img)
+            pr_min, pr_mean, pr_max, pr_nz, pr_std = _slice_stats(pr_img)
+            print(
+                f"[final-act-compare][axial axis2_gt={z_gt} -> axis2_pred={z_pred}] "
+                f"GT min/mean/max={gt_min:.3e}/{gt_mean:.3e}/{gt_max:.3e} std={gt_std:.3e} nz_frac={gt_nz:.3f} | "
+                f"Pred min/mean/max={pr_min:.3e}/{pr_mean:.3e}/{pr_max:.3e} std={pr_std:.3e} nz_frac={pr_nz:.3f}",
+                flush=True,
+            )
+            if np.isfinite(pr_std) and pr_std < 1e-8:
+                print(
+                    f"[final-act-compare][WARN] Pred axial slice axis2_pred={z_pred} ist nahezu konstant (std={pr_std:.3e}).",
+                    flush=True,
+                )
+
+            if scale_mode == "shared":
+                gt_vmin, gt_vmax = float(shared_vmin), float(shared_vmax)
+                pr_vmin, pr_vmax = float(shared_vmin), float(shared_vmax)
+            else:
+                gt_vmin, gt_vmax = _robust_limits(gt_img)
+                pr_vmin, pr_vmax = _robust_limits(pr_img)
+
+            im_gt = ax_gt.imshow(
+                gt_img,
+                origin="upper",
+                extent=[0, B - 1, A - 1, 0],
+                aspect="equal",
+                cmap="viridis",
+                vmin=gt_vmin,
+                vmax=gt_vmax,
+            )
+            im_pr = ax_pr.imshow(
+                pr_img,
+                origin="upper",
+                extent=[0, R - 1, R - 1, 0],
+                aspect="equal",
+                cmap="viridis",
+                vmin=pr_vmin,
+                vmax=pr_vmax,
+            )
+
+            if im_gt_first is None:
+                im_gt_first = im_gt
+            if im_pr_first is None:
+                im_pr_first = im_pr
+
+            ax_gt.set_title(f"GT axial (act) @ axis2={z_gt}")
+            ax_pr.set_title(f"Pred axial (act_pred) @ axis2_pred={z_pred} (from {z_gt})")
+
+            ax_gt.set_xlabel("axis1 (x-like)")
+            ax_pr.set_xlabel("axis1 (x-like)")
+            ax_gt.set_ylabel("axis0 (y-like)")
+            ax_pr.set_ylabel("axis0 (y-like)")
+
+            ax_gt.set_xticks(x_ticks_gt)
+            ax_gt.set_yticks(y_ticks_gt)
+            ax_pr.set_xticks(x_ticks_pr)
+            ax_pr.set_yticks(y_ticks_pr)
+
+        if scale_mode == "shared":
+            if im_gt_first is not None:
+                cbar = fig.colorbar(im_gt_first, ax=axs.ravel().tolist(), shrink=0.92)
+                cbar.set_label("Activity (shared robust scale)")
+        else:
+            if im_gt_first is not None:
+                cbar_gt = fig.colorbar(im_gt_first, ax=axs[:, 0].ravel().tolist(), shrink=0.92)
+                cbar_gt.set_label("GT activity (robust scale)")
+            if im_pr_first is not None:
+                cbar_pr = fig.colorbar(im_pr_first, ax=axs[:, 1].ravel().tolist(), shrink=0.92)
+                cbar_pr.set_label("Pred activity (robust scale)")
+
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        print(f"[final-act-compare] Saved {out_path.resolve()}", flush=True)
+        return
+
+    resampling_active = gt_shape != pred_shape
+    if resampling_active:
+        gt_vis_np = _resample_gt_to_pred_grid(gt_np, pred_shape)
+    else:
+        gt_vis_np = gt_np.astype(np.float32, copy=False)
+
+    A_gt = gt_shape[0]
+    A_vis, B_vis, C_vis = pred_shape
+    idx_list_raw = list(getattr(args, "final_act_compare_axis0_idx", [80, 128, 200]))
+    idx_pairs: list[Tuple[int, int]] = []
+    for idx in idx_list_raw:
+        idx_i = int(idx)
+        if 0 <= idx_i < A_gt:
+            idx_pairs.append((idx_i, _map_axis0_idx(idx_i, A_gt, A_vis)))
+        else:
+            print(
+                f"[final-act-compare][WARN] axis0 idx_gt={idx_i} out of bounds fuer A_gt={A_gt}; ignoriere.",
+                flush=True,
+            )
+    if not idx_pairs:
+        print("[final-act-compare][WARN] Keine gueltigen axis0-Indizes; skippe.", flush=True)
+        return
+
+    y_step = max(1, B_vis // 10)
+    z_step = max(1, C_vis // 10)
+    y_ticks = np.arange(0, B_vis, y_step)
+    z_ticks = np.arange(0, C_vis, z_step)
+
+    scale_mode = str(getattr(args, "final_act_compare_scale", "shared"))
+    if scale_mode == "shared":
+        gt_vals = gt_vis_np[np.isfinite(gt_vis_np)].ravel()
+        pred_vals = pred_np[np.isfinite(pred_np)].ravel()
+        if gt_vals.size == 0 and pred_vals.size == 0:
+            print("[final-act-compare][WARN] Keine finiten Werte fuer Skalierung; skippe.", flush=True)
+            return
+        if gt_vals.size == 0:
+            shared_vals = pred_vals
+        elif pred_vals.size == 0:
+            shared_vals = gt_vals
+        else:
+            shared_vals = np.concatenate([gt_vals, pred_vals], axis=0)
+        shared_vmin, shared_vmax = _robust_limits(shared_vals)
+        gt_vmin, gt_vmax = shared_vmin, shared_vmax
+        pred_vmin, pred_vmax = shared_vmin, shared_vmax
+    else:
+        gt_vmin, gt_vmax = _robust_limits(gt_vis_np)
+        pred_vmin, pred_vmax = _robust_limits(pred_np)
+
+    rows = len(idx_pairs)
+    fig, axs = plt.subplots(rows, 2, figsize=(12, 4 * rows), constrained_layout=True)
+    axs = np.asarray(axs)
+    if axs.ndim == 1:
+        axs = axs.reshape(1, 2)
+
+    im_gt_first = None
+    for row, (idx_gt, idx_pred) in enumerate(idx_pairs):
+        ax_gt = axs[row, 0]
+        ax_pred = axs[row, 1]
+
+        img_gt = gt_vis_np[idx_pred, :, :].astype(np.float32, copy=False)
+        img_pred = pred_np[idx_pred, :, :].astype(np.float32, copy=False)
+
+        gt_min, gt_mean, gt_max, gt_nz, _ = _slice_stats(img_gt)
+        pr_min, pr_mean, pr_max, pr_nz, _ = _slice_stats(img_pred)
+        print(
+            f"[final-act-compare][axis0_gt={idx_gt} -> axis0_pred={idx_pred}] "
+            f"GT min/mean/max={gt_min:.3e}/{gt_mean:.3e}/{gt_max:.3e} nz_frac={gt_nz:.3f} | "
+            f"Pred min/mean/max={pr_min:.3e}/{pr_mean:.3e}/{pr_max:.3e} nz_frac={pr_nz:.3f}",
+            flush=True,
+        )
+
+        im_gt = ax_gt.imshow(
+            img_gt,
+            origin="upper",
+            extent=[0, C_vis - 1, B_vis - 1, 0],
+            aspect="equal",
+            cmap="viridis",
+            vmin=gt_vmin,
+            vmax=gt_vmax,
+        )
+        im_pred = ax_pred.imshow(
+            img_pred,
+            origin="upper",
+            extent=[0, C_vis - 1, B_vis - 1, 0],
+            aspect="equal",
+            cmap="viridis",
+            vmin=pred_vmin,
+            vmax=pred_vmax,
+        )
+
+        if im_gt_first is None:
+            im_gt_first = im_gt
+
+        if resampling_active and idx_pred != idx_gt:
+            ax_gt.set_title(f"GT sagittal (act→pred grid) @ axis0_gt={idx_gt} → {idx_pred}")
+        else:
+            ax_gt.set_title(f"GT sagittal (act) @ axis0={idx_gt}")
+        ax_pred.set_title(f"Pred sagittal (act_pred) @ axis0={idx_pred}")
+
+        ax_gt.set_xlabel("axis2 (z-like)")
+        ax_pred.set_xlabel("axis2 (z-like)")
+        ax_gt.set_ylabel("axis1 (y-like)")
+        ax_pred.set_ylabel("axis1 (y-like)")
+
+        ax_gt.set_xticks(z_ticks)
+        ax_gt.set_yticks(y_ticks)
+        ax_pred.set_xticks(z_ticks)
+        ax_pred.set_yticks(y_ticks)
+
+    if im_gt_first is not None:
+        cbar = fig.colorbar(im_gt_first, ax=axs.ravel().tolist(), shrink=0.92)
+        if scale_mode == "shared":
+            cbar.set_label("Activity (shared robust scale)")
+        else:
+            cbar.set_label("Activity (robust scale; separate per side)")
+
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    print(f"[final-act-compare] Saved {out_path.resolve()}", flush=True)
 
 
 def evaluate_pixel_subsets(
@@ -3938,8 +5130,31 @@ def train():
             print("🖼️ Finale Previews gespeichert.", flush=True)
             print("   ", (fp / "final_AP.png").resolve(), flush=True)
             print("   ", (fp / "final_PA.png").resolve(), flush=True)
-    
-        export_activity_volume(generator, last_z_latent.detach(), outdir / "activity_pred_final.npy", args.export_vol_res, device)
+
+        save_final_sagittal_depth_consistency(
+            args,
+            generator,
+            last_z_latent.detach(),
+            act_vol,
+            ct_context,
+            outdir,
+        )
+
+        pred_path_final = outdir / "activity_pred_final.npy"
+        pred_vol_final = export_activity_volume(
+            generator,
+            last_z_latent.detach(),
+            pred_path_final,
+            args.export_vol_res,
+            device,
+        )
+        save_final_act_compare_volume_slicing(
+            args,
+            act_vol,
+            outdir,
+            pred_path_final,
+            pred_vol_final,
+        )
         save_checkpoint(
             max_steps,
             generator,
