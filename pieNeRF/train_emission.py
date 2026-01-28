@@ -236,6 +236,25 @@ def parse_args():
         help="Poisson-Rate-Definition: softplus_shift (legacy) oder identity (rate=pred).",
     )
     parser.add_argument(
+        "--poisson-rate-floor",
+        type=float,
+        default=0.0,
+        help="Optionaler Floor fuer Poisson-Rate (Counts-Skala). >0 aktiviert Stabilisierung.",
+    )
+    parser.add_argument(
+        "--poisson-rate-floor-mode",
+        type=str,
+        default="clamp",
+        choices=["clamp", "softplus_hinge"],
+        help="Poisson-Rate-Floor-Modus: clamp oder softplus_hinge (smooth clamp, no bias at boundary).",
+    )
+    parser.add_argument(
+        "--lambda-ray-tv-weight",
+        type=float,
+        default=0.0,
+        help="Optionaler TV-Smoothness auf lambda entlang der Ray-Depth-Achse (nur Projection-Pfad).",
+    )
+    parser.add_argument(
         "--proj-loss-weight",
         type=float,
         default=0.1,
@@ -265,6 +284,12 @@ def parse_args():
         default="counts",
         choices=["counts", "norm"],
         help="Quelle fuer Projection Targets: counts (ap_counts/pa_counts) oder norm (ap/pa).",
+    )
+    parser.add_argument(
+        "--pred-to-counts-scale-override",
+        type=float,
+        default=-1.0,
+        help="Override fuer pred_to_counts_scale (>0 nutzt diesen Wert statt proj_scale_joint_p99).",
     )
     parser.add_argument(
         "--proj-gain-source",
@@ -321,6 +346,13 @@ def parse_args():
         type=float_or_none,
         default=5.0,
         help="Optionales Maximum fuer Gain (nur im proj-loss Pfad). Setze 'none' fuer aus.",
+    )
+    parser.add_argument(
+        "--gain-warmup-mode",
+        type=str,
+        default="none",
+        choices=["none", "one", "prior"],
+        help="Fixiert Gain waehrend proj_warmup_steps (one=1.0, prior=gain_prior_value).",
     )
     parser.add_argument(
         "--encoder-proj-transform",
@@ -740,6 +772,23 @@ def compute_poisson_rate(pred_raw: torch.Tensor, mode: str, eps: float = 1e-6) -
     if mode == "identity":
         return pred_raw.clamp_min(eps)
     raise ValueError(f"Unknown poisson_rate_mode: {mode}")
+
+
+def apply_poisson_rate_floor(
+    rate: torch.Tensor, floor: float, mode: str = "clamp"
+) -> Tuple[torch.Tensor, Optional[float]]:
+    floor = float(floor)
+    if floor <= 0.0:
+        return rate, None
+    floor_t = torch.tensor(floor, device=rate.device, dtype=rate.dtype)
+    floor_frac = float((rate < floor_t).float().mean().item())
+    mode = str(mode or "clamp")
+    if mode == "clamp":
+        return torch.clamp(rate, min=floor_t), floor_frac
+    if mode == "softplus_hinge":
+        offset = rate.new_tensor(math.log(2.0))
+        return floor_t + F.softplus(rate - floor_t) - offset, floor_frac
+    raise ValueError(f"Unknown poisson_rate_floor_mode: {mode}")
 
 
 def sqrt_mse_loss(
@@ -1287,9 +1336,12 @@ def log_effective_config(outdir: Path, config: dict, args):
         f"| act_pos_threshold={args.act_pos_threshold} "
         f"| ct_loss_weight={args.ct_loss_weight} | ct_threshold={args.ct_threshold} | z_reg_weight={args.z_reg_weight} "
         f"| ray_tv_weight={args.ray_tv_weight} | ray_tv_edge_aware={args.ray_tv_edge_aware} | ray_tv_alpha={args.ray_tv_alpha} "
-        f"| ray_tv_w_clamp_min={args.ray_tv_w_clamp_min} | ct_padding_mode={args.ct_padding_mode} "
+        f"| ray_tv_w_clamp_min={args.ray_tv_w_clamp_min} | lambda_ray_tv_weight={args.lambda_ray_tv_weight} "
+        f"| ct_padding_mode={args.ct_padding_mode} "
         f"| bg_depth_mass_weight={args.bg_depth_mass_weight} | bg_depth_eps={args.bg_depth_eps} | bg_depth_mode={args.bg_depth_mode} "
-        f"| poisson_rate_mode={args.poisson_rate_mode} | debug_sanity_checks={bool(getattr(args, 'debug_sanity_checks', False))}",
+        f"| poisson_rate_mode={args.poisson_rate_mode} | poisson_rate_floor={args.poisson_rate_floor} "
+        f"| poisson_rate_floor_mode={args.poisson_rate_floor_mode} "
+        f"| debug_sanity_checks={bool(getattr(args, 'debug_sanity_checks', False))}",
         flush=True,
     )
     if getattr(args, "hybrid", False):
@@ -1465,56 +1517,82 @@ def maybe_render_preview(
     print("   ", (out_dir / f"step_{step:05d}_PA.png").resolve(), flush=True)
 
 
-def init_log_file(path: Path):
-    # CSV-Header nur einmal schreiben
+def init_log_file(path: Path) -> Path:
+    # CSV-Header nur einmal schreiben; bei Header-Mismatch neuen Log erstellen.
+    header = [
+        "step",
+        "loss",
+        "loss_ap",
+        "loss_pa",
+        "loss_act",
+        "loss_ct",
+        "ray_tv",
+        "ray_tv_w",
+        "lambda_ray_tv",
+        "lambda_floor_frac",
+        "lambda_mean",
+        "lambda_p95",
+        "lambda_eff_mean",
+        "lambda_eff_p95",
+        "bg_depth_mass",
+        "bg_depth_mass_w",
+        "bg_depth_frac",
+        "loss_tv",
+        "zreg",
+        "mae_ap",
+        "mae_pa",
+        "psnr_ap",
+        "psnr_pa",
+        "pred_mean_ap",
+        "pred_mean_pa",
+        "pred_std_ap",
+        "pred_std_pa",
+        "loss_test_all",
+        "loss_test_ap",
+        "loss_test_pa",
+        "psnr_test_all",
+        "psnr_test_ap",
+        "psnr_test_pa",
+        "mae_test_all",
+        "mae_test_ap",
+        "mae_test_pa",
+        "loss_test_fg",
+        "psnr_test_fg",
+        "mae_test_fg",
+        "loss_test_top10",
+        "psnr_test_top10",
+        "mae_test_top10",
+        "iter_ms",
+        "lr",
+        "ray_tv_mode",
+        "ray_tv_w_mean",
+    ]
     if path.exists():
-        return
+        existing_header = None
+        try:
+            with path.open("r", newline="") as f:
+                reader = csv.reader(f)
+                existing_header = next(reader, None)
+        except Exception:
+            existing_header = None
+        if existing_header == header:
+            return path
+        # Header mismatch -> write to a new versioned log file.
+        base = path.with_name(f"{path.stem}_v2{path.suffix}")
+        candidate = base
+        v = 2
+        while candidate.exists():
+            v += 1
+            candidate = path.with_name(f"{path.stem}_v{v}{path.suffix}")
+        print(
+            f"[log][warn] train_log header mismatch; using new log file: {candidate}",
+            flush=True,
+        )
+        path = candidate
     with path.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(
-            [
-                "step",
-                "loss",
-                "loss_ap",
-                "loss_pa",
-                "loss_act",
-                "loss_ct",
-                "ray_tv",
-                "ray_tv_w",
-                "bg_depth_mass",
-                "bg_depth_mass_w",
-                "bg_depth_frac",
-                "loss_tv",
-                "zreg",
-                "mae_ap",
-                "mae_pa",
-                "psnr_ap",
-                "psnr_pa",
-                "pred_mean_ap",
-                "pred_mean_pa",
-                "pred_std_ap",
-                "pred_std_pa",
-                "loss_test_all",
-                "loss_test_ap",
-                "loss_test_pa",
-                "psnr_test_all",
-                "psnr_test_ap",
-                "psnr_test_pa",
-                "mae_test_all",
-                "mae_test_ap",
-                "mae_test_pa",
-                "loss_test_fg",
-                "psnr_test_fg",
-                "mae_test_fg",
-                "loss_test_top10",
-                "psnr_test_top10",
-                "mae_test_top10",
-                "iter_ms",
-                "lr",
-                "ray_tv_mode",
-                "ray_tv_w_mean",
-            ]
-        )
+        writer.writerow(header)
+    return path
 
 
 def append_log(path: Path, row):
@@ -1823,8 +1901,33 @@ def save_depth_profile(
         def is_far_enough(idx):
             return all(dist(idx, c) > 8 for c in chosen)
 
-        # Deterministische, target-basierte Auswahl: 1x Background (niedrig),
-        # 3x Signal (oberstes Quantil), bevorzugt mit Count-Targets.
+        ct_good_mask = None
+        if ct_dhw is not None:
+            ct_depth_max = ct_dhw.max(dim=0).values.detach().cpu().numpy()
+            ct_depth_min = ct_dhw.min(dim=0).values.detach().cpu().numpy()
+            ct_good_mask = (ct_depth_max - ct_depth_min) > 1e-8
+            ct_good_mask = ct_good_mask & (ct_depth_max > 1e-8)
+
+        act_zero_mask = act_nonzero_mask = None
+        if act_masks is not None:
+            act_zero_mask, act_nonzero_mask = act_masks
+
+        def prefer_mask(base_mask: np.ndarray, preferred_mask: Optional[np.ndarray]):
+            if preferred_mask is None:
+                return base_mask
+            masked = base_mask & preferred_mask
+            if masked.any():
+                return masked
+            return preferred_mask if preferred_mask.any() else base_mask
+
+        def apply_optional_mask(base_mask: np.ndarray, extra_mask: Optional[np.ndarray]):
+            if extra_mask is None:
+                return base_mask
+            masked = base_mask & extra_mask
+            return masked if masked.any() else base_mask
+
+        # Deterministische, target-basierte Auswahl: Background (niedrig),
+        # Signal (oberstes Quantil), bevorzugt mit Count-Targets.
         if score_map is not None and np.isfinite(score_map).any():
             valid_mask = np.isfinite(score_map)
             scores_valid = score_map[valid_mask]
@@ -1839,6 +1942,9 @@ def save_depth_profile(
                 many_zeros = zero_count >= bg_needed or q_bg <= 0.0
                 bg_mask = zero_mask if many_zeros else ((score_map <= q_bg) & valid_mask)
                 sig_mask = (score_map >= q_sig) & valid_mask
+                bg_mask = prefer_mask(bg_mask, act_zero_mask)
+                bg_mask = apply_optional_mask(bg_mask, ct_good_mask)
+                sig_mask = prefer_mask(sig_mask, act_nonzero_mask)
 
                 def sample_from_coords(coords: np.ndarray):
                     if coords.size == 0:
@@ -1859,7 +1965,11 @@ def save_depth_profile(
                 if bg_idx is None:
                     min_val = float(np.min(scores_valid))
                     min_mask = valid_mask & np.isclose(score_map, min_val, rtol=0.0, atol=1e-12)
-                    bg_idx = sample_from_coords(np.argwhere(min_mask if min_mask.any() else valid_mask))
+                    min_mask = prefer_mask(min_mask, act_zero_mask)
+                    min_mask = apply_optional_mask(min_mask, ct_good_mask)
+                    fallback_mask = min_mask if min_mask.any() else prefer_mask(valid_mask, act_zero_mask)
+                    fallback_mask = apply_optional_mask(fallback_mask, ct_good_mask)
+                    bg_idx = sample_from_coords(np.argwhere(fallback_mask))
                 add_unique(bg_idx)
 
                 sig_coords = np.argwhere(sig_mask)
@@ -1949,10 +2059,7 @@ def save_depth_profile(
                 return None
             return int(y), int(x)
 
-        ct_pos_mask = None
-        if ct_dhw is not None:
-            ct_depth_max = ct_dhw.max(dim=0).values.detach().cpu().numpy()
-            ct_pos_mask = ct_depth_max > 1e-8
+        ct_pos_mask = ct_good_mask
 
         def combine_mask(base_mask, require_ct: bool):
             if base_mask is None:
@@ -2095,7 +2202,7 @@ def save_depth_profile(
             flush=True,
         )
 
-    num_zero, num_active = 1, 3
+    num_zero, num_active = 1, 1
     target_total = max(num_zero + num_active, 1)
     cache_attr = "_depth_profile_rays_cache"
     cache = getattr(generator, cache_attr, None)
@@ -2201,8 +2308,14 @@ def save_depth_profile(
         sharex=True,
         sharey=True,
     )
-    fig.subplots_adjust(wspace=0.35)
+    fig.suptitle(f"Depth-Profile - Step {step}", fontsize=12)
+    fig.subplots_adjust(wspace=0.35, top=0.80)
     axes = np.atleast_1d(axes)
+    color_map = {
+        "μ (CT)": "black",
+        "Aktivität (GT)": "red",
+        "Aktivität (NeRF)": "lime",
+    }
 
     try:
         with torch.no_grad():
@@ -2287,7 +2400,7 @@ def save_depth_profile(
                             labels.insert(0, "Aktivität (GT)")
 
                 for curve, label in zip(curves, labels):
-                    ax.plot(depth_axis_ray, curve, label=label)
+                    ax.plot(depth_axis_ray, curve, label=label, color=color_map.get(label))
 
                 def _curve_stats(arr: Optional[np.ndarray]) -> Tuple[float, float, float]:
                     if arr is None or arr.size == 0:
@@ -2319,24 +2432,15 @@ def save_depth_profile(
                 if pa_title_img is not None:
                     diag_parts.append(f"I_PA={pa_title_img[y_idx, x_idx]:.2e}")
 
-                ax.set_title(f"({y_idx},{x_idx})", fontsize=9)
-                if diag_parts:
-                    # Break the diagnostic text into multiple short lines so it
-                    # does not influence layout as aggressively.
-                    max_parts_per_line = 3
-                    diag_lines = [
-                        " | ".join(diag_parts[i : i + max_parts_per_line])
-                        for i in range(0, len(diag_parts), max_parts_per_line)
-                    ]
-                    ax.text(
-                        0.02,
-                        0.98,
-                        "\n".join(diag_lines),
-                        transform=ax.transAxes,
-                        ha="left",
-                        va="top",
-                        fontsize=7,
-                    )
+                # Break the diagnostic text into multiple short lines so it
+                # stays above the plot area without overlapping curves.
+                max_parts_per_line = 3
+                diag_lines = [
+                    " | ".join(diag_parts[i : i + max_parts_per_line])
+                    for i in range(0, len(diag_parts), max_parts_per_line)
+                ]
+                title_lines = [f"({y_idx},{x_idx})"] + diag_lines
+                ax.set_title("\n".join(title_lines), fontsize=8, pad=10)
                 ax.set_ylim(0, 1.05)
                 ax.set_xlim(0.0, 1.0)
                 ax.grid(True, alpha=0.2)
@@ -2825,6 +2929,7 @@ def save_final_act_compare_volume_slicing(
     outdir: Path,
     pred_path: Path,
     pred_vol_np: Optional[np.ndarray] = None,
+    out_path_override: Optional[Path] = None,
 ):
     """Finale GT-vs-Pred Activity-Compare PNG via reinem Volumen-Slicing (wie in test.py)."""
     if not bool(getattr(args, "final_act_compare", False)):
@@ -2848,7 +2953,7 @@ def save_final_act_compare_volume_slicing(
     # Axial ist der Default; das Flag wird aus Kompatibilitaetsgruenden gelesen.
     _ = bool(getattr(args, "final_act_compare_axial", True))
     # Finale Compare-PNG ist axial und kollidiert nicht mit final_sagittal.
-    out_path = preview_dir / "final_act_compare_axial.png"
+    out_path = out_path_override if out_path_override is not None else (preview_dir / "final_act_compare_axial.png")
 
     act_t = act_vol.detach()
     if act_t.dim() == 4:
@@ -3077,6 +3182,9 @@ def evaluate_pixel_subsets(
     scale_pa: Optional[float] = None,
     loss_fn=poisson_nll,
     poisson_rate_mode: str = "softplus_shift",
+    poisson_rate_floor: float = 0.0,
+    poisson_rate_floor_mode: str = "clamp",
+    proj_loss_active: bool = True,
     pred_scale: float = 1.0,
     gain: Optional[torch.Tensor] = None,
 ):
@@ -3107,14 +3215,17 @@ def evaluate_pixel_subsets(
                 lambda_ap_used = pred_ap_raw
                 lambda_pa_used = pred_pa_raw
 
-            if pred_scale != 1.0:
+            if proj_loss_active and pred_scale != 1.0:
                 lambda_ap_used = lambda_ap_used * float(pred_scale)
                 lambda_pa_used = lambda_pa_used * float(pred_scale)
-            if gain is not None:
+            if proj_loss_active and gain is not None:
                 lambda_ap_used = lambda_ap_used * gain
                 lambda_pa_used = lambda_pa_used * gain
             pred_ap = lambda_ap_used
             pred_pa = lambda_pa_used
+            if loss_fn == poisson_nll and proj_loss_active and float(poisson_rate_floor) > 0.0:
+                pred_ap, _ = apply_poisson_rate_floor(pred_ap, poisson_rate_floor, poisson_rate_floor_mode)
+                pred_pa, _ = apply_poisson_rate_floor(pred_pa, poisson_rate_floor, poisson_rate_floor_mode)
 
             target_ap = ap_flat_proc[0, idx_ap].unsqueeze(0)
             target_pa = pa_flat_proc[0, idx_pa].unsqueeze(0)
@@ -3352,6 +3463,8 @@ def train():
     training_cfg["tv_weight"] = args.tv_weight
     training_cfg.setdefault("ray_tv_weight", 0.0)
     training_cfg["ray_tv_weight"] = args.ray_tv_weight
+    training_cfg.setdefault("lambda_ray_tv_weight", 0.0)
+    training_cfg["lambda_ray_tv_weight"] = args.lambda_ray_tv_weight
     training_cfg.setdefault("ray_tv_edge_aware", False)
     training_cfg["ray_tv_edge_aware"] = bool(args.ray_tv_edge_aware)
     training_cfg.setdefault("ray_tv_alpha", 0.0)
@@ -3404,7 +3517,7 @@ def train():
     log_effective_config(outdir, config, args)
     ckpt_dir = outdir / "checkpoints"
     log_path = outdir / "train_log.csv"
-    init_log_file(log_path)
+    log_path = init_log_file(log_path)
     hybrid_log_path = None
     if hybrid_enabled:
         hybrid_log_path = outdir / "hybrid_stats.csv"
@@ -3454,6 +3567,7 @@ def train():
     val_interval = int(training_cfg.get("val_interval", 0) or 0)
     tv_weight = float(training_cfg.get("tv_weight", 0.0))
     ray_tv_weight = float(training_cfg.get("ray_tv_weight", 0.0))
+    lambda_ray_tv_weight = float(training_cfg.get("lambda_ray_tv_weight", 0.0))
     ray_tv_edge_aware = bool(training_cfg.get("ray_tv_edge_aware", False))
     ray_tv_alpha = float(training_cfg.get("ray_tv_alpha", 0.0))
     ray_tv_w_clamp_min = float(training_cfg.get("ray_tv_w_clamp_min", 0.0))
@@ -3771,6 +3885,47 @@ def train():
         if ct_vol is not None and ct_vol.numel() == 0:
             ct_vol = None
         ct_context = generator.build_ct_context(ct_vol, padding_mode=args.ct_padding_mode) if ct_vol is not None else None
+        if debug_sanity_checks:
+            ap_counts_log = batch.get("ap_counts")
+            pa_counts_log = batch.get("pa_counts")
+            if ap_counts_log is not None and ap_counts_log.numel() > 0:
+                ap_counts_log = ap_counts_log.to(device, non_blocking=True).float()
+            else:
+                ap_counts_log = None
+            if pa_counts_log is not None and pa_counts_log.numel() > 0:
+                pa_counts_log = pa_counts_log.to(device, non_blocking=True).float()
+            else:
+                pa_counts_log = None
+            ap_min = float(ap.min().item())
+            ap_mean = float(ap.mean().item())
+            ap_max = float(ap.max().item())
+            pa_min = float(pa.min().item())
+            pa_mean = float(pa.mean().item())
+            pa_max = float(pa.max().item())
+            apc_min = float(ap_counts_log.min().item()) if ap_counts_log is not None else float("nan")
+            apc_mean = float(ap_counts_log.mean().item()) if ap_counts_log is not None else float("nan")
+            apc_max = float(ap_counts_log.max().item()) if ap_counts_log is not None else float("nan")
+            pac_min = float(pa_counts_log.min().item()) if pa_counts_log is not None else float("nan")
+            pac_mean = float(pa_counts_log.mean().item()) if pa_counts_log is not None else float("nan")
+            pac_max = float(pa_counts_log.max().item()) if pa_counts_log is not None else float("nan")
+            print(
+                f"[sanity][proj-input] ap(min/mean/max)={ap_min:.3e}/{ap_mean:.3e}/{ap_max:.3e} "
+                f"| pa(min/mean/max)={pa_min:.3e}/{pa_mean:.3e}/{pa_max:.3e} "
+                f"| ap_counts(min/mean/max)={apc_min:.3e}/{apc_mean:.3e}/{apc_max:.3e} "
+                f"| pa_counts(min/mean/max)={pac_min:.3e}/{pac_mean:.3e}/{pac_max:.3e}",
+                flush=True,
+            )
+            # Interpretation hint:
+            # ratio ≈ 1    -> counts already normalized
+            # ratio ≈ p99  -> counts ≈ norm * proj_scale_joint_p99
+            # ratio >> p99 -> counts are in different physical units
+            eps = 1e-8
+            ratio_ap = (apc_mean / (ap_mean + eps)) if ap_counts_log is not None else float("nan")
+            ratio_pa = (pac_mean / (pa_mean + eps)) if pa_counts_log is not None else float("nan")
+            print(
+                f"[sanity][proj-ratio] ratio_ap={ratio_ap:.3e} | ratio_pa={ratio_pa:.3e}",
+                flush=True,
+            )
 
         z_base = z_train
         if z_base.shape[0] != ap.shape[0]:
@@ -3826,6 +3981,41 @@ def train():
             else:
                 target_ap = ap.reshape(ap.shape[0], -1)[0, idx_ap].unsqueeze(0)
                 target_pa = pa.reshape(pa.shape[0], -1)[0, idx_pa].unsqueeze(0)
+            if debug_sanity_checks:
+                tap_min = float(target_ap.min().item())
+                tap_mean = float(target_ap.mean().item())
+                tap_max = float(target_ap.max().item())
+                tpa_min = float(target_pa.min().item())
+                tpa_mean = float(target_pa.mean().item())
+                tpa_max = float(target_pa.max().item())
+                print(
+                    f"[sanity][proj-target] target_ap(min/mean/max)={tap_min:.3e}/{tap_mean:.3e}/{tap_max:.3e} "
+                    f"| target_pa(min/mean/max)={tpa_min:.3e}/{tpa_mean:.3e}/{tpa_max:.3e}",
+                    flush=True,
+                )
+
+            pred_to_counts_scale = scale_joint_used if use_counts else 1.0
+            pred_to_counts_override = float(args.pred_to_counts_scale_override)
+            if use_counts and pred_to_counts_override > 0:
+                pred_to_counts_scale = pred_to_counts_override
+            if use_counts:
+                print(
+                    f"[scale][smoke] pred_to_counts_scale: orig={scale_joint_used:.3e} "
+                    f"override={pred_to_counts_override:.3e} used={pred_to_counts_scale:.3e}",
+                    flush=True,
+                )
+            if debug_sanity_checks:
+                meta_val = float(meta_scale) if isinstance(meta_scale, (int, float)) and math.isfinite(meta_scale) else float("nan")
+                override_val = pred_to_counts_override if pred_to_counts_override > 0 else float("nan")
+                orig_val = float(scale_joint_used) if use_counts else float("nan")
+                used_val = float(pred_to_counts_scale) if use_counts else float("nan")
+                print(
+                    f"[sanity][proj-scale] proj_scale_joint_p99={meta_val:.3e} "
+                    f"| pred_to_counts_scale_orig={orig_val:.3e} "
+                    f"| pred_to_counts_scale_override={override_val:.3e} "
+                    f"| pred_to_counts_scale_used={used_val:.3e}",
+                    flush=True,
+                )
 
             if proj_loss_type == "poisson":
                 pred_ap = compute_poisson_rate(pred_ap_raw, args.poisson_rate_mode, eps=1e-6)
@@ -3834,8 +4024,8 @@ def train():
                 pred_ap = pred_ap_raw
                 pred_pa = pred_pa_raw
             if use_counts:
-                pred_ap = pred_ap * float(scale_joint_used)
-                pred_pa = pred_pa * float(scale_joint_used)
+                pred_ap = pred_ap * float(pred_to_counts_scale)
+                pred_pa = pred_pa * float(pred_to_counts_scale)
                 if gain_head is not None and z_enc is not None:
                     gain_val = F.softplus(gain_head(z_enc))
                     pred_ap = pred_ap * gain_val
@@ -3844,6 +4034,9 @@ def train():
                     gain_val = F.softplus(gain_param)
                     pred_ap = pred_ap * gain_val
                     pred_pa = pred_pa * gain_val
+            if proj_loss_type == "poisson" and float(args.poisson_rate_floor) > 0.0:
+                pred_ap, _ = apply_poisson_rate_floor(pred_ap, args.poisson_rate_floor, args.poisson_rate_floor_mode)
+                pred_pa, _ = apply_poisson_rate_floor(pred_pa, args.poisson_rate_floor, args.poisson_rate_floor_mode)
             loss_ap = loss_fn(pred_ap, target_ap)
             loss_pa = loss_fn(pred_pa, target_pa)
             loss_proj = 0.5 * (loss_ap + loss_pa)
@@ -4009,6 +4202,37 @@ def train():
                 pa_counts = pa_counts.to(device, non_blocking=True).float()
             else:
                 pa_counts = None
+            if debug_sanity_checks and step == 1:
+                ap_min = float(ap.min().item())
+                ap_mean = float(ap.mean().item())
+                ap_max = float(ap.max().item())
+                pa_min = float(pa.min().item())
+                pa_mean = float(pa.mean().item())
+                pa_max = float(pa.max().item())
+                apc_min = float(ap_counts.min().item()) if ap_counts is not None else float("nan")
+                apc_mean = float(ap_counts.mean().item()) if ap_counts is not None else float("nan")
+                apc_max = float(ap_counts.max().item()) if ap_counts is not None else float("nan")
+                pac_min = float(pa_counts.min().item()) if pa_counts is not None else float("nan")
+                pac_mean = float(pa_counts.mean().item()) if pa_counts is not None else float("nan")
+                pac_max = float(pa_counts.max().item()) if pa_counts is not None else float("nan")
+                print(
+                    f"[sanity][proj-input] ap(min/mean/max)={ap_min:.3e}/{ap_mean:.3e}/{ap_max:.3e} "
+                    f"| pa(min/mean/max)={pa_min:.3e}/{pa_mean:.3e}/{pa_max:.3e} "
+                    f"| ap_counts(min/mean/max)={apc_min:.3e}/{apc_mean:.3e}/{apc_max:.3e} "
+                    f"| pa_counts(min/mean/max)={pac_min:.3e}/{pac_mean:.3e}/{pac_max:.3e}",
+                    flush=True,
+                )
+                # Interpretation hint:
+                # ratio ≈ 1    -> counts already normalized
+                # ratio ≈ p99  -> counts ≈ norm * proj_scale_joint_p99
+                # ratio >> p99 -> counts are in different physical units
+                eps = 1e-8
+                ratio_ap = (apc_mean / (ap_mean + eps)) if ap_counts is not None else float("nan")
+                ratio_pa = (pac_mean / (pa_mean + eps)) if pa_counts is not None else float("nan")
+                print(
+                    f"[sanity][proj-ratio] ratio_ap={ratio_ap:.3e} | ratio_pa={ratio_pa:.3e}",
+                    flush=True,
+                )
     
             use_counts = (
                 (ap_counts is not None)
@@ -4030,12 +4254,34 @@ def train():
             pa_flat_proc = target_pa_full.reshape(batch_size, -1)
     
             pred_to_counts_scale = scale_joint_used if use_counts else 1.0
+            pred_to_counts_orig = pred_to_counts_scale
+            pred_to_counts_override = float(args.pred_to_counts_scale_override)
+            if use_counts and pred_to_counts_override > 0:
+                pred_to_counts_scale = pred_to_counts_override
             if use_counts:
                 scale_ap_used = 1.0
                 scale_pa_used = 1.0
             else:
                 scale_ap_used = scale_joint_used
                 scale_pa_used = scale_joint_used
+            if debug_sanity_checks and step == 1:
+                meta_val = float(meta_scale) if isinstance(meta_scale, (int, float)) and math.isfinite(meta_scale) else float("nan")
+                override_val = pred_to_counts_override if pred_to_counts_override > 0 else float("nan")
+                orig_val = float(pred_to_counts_orig) if use_counts else float("nan")
+                used_val = float(pred_to_counts_scale) if use_counts else float("nan")
+                print(
+                    f"[sanity][proj-scale] proj_scale_joint_p99={meta_val:.3e} "
+                    f"| pred_to_counts_scale_orig={orig_val:.3e} "
+                    f"| pred_to_counts_scale_override={override_val:.3e} "
+                    f"| pred_to_counts_scale_used={used_val:.3e}",
+                    flush=True,
+                )
+            if use_counts and step == 1:
+                print(
+                    f"[scale] pred_to_counts_scale: orig={scale_joint_used:.3e} "
+                    f"override={pred_to_counts_override:.3e} used={pred_to_counts_scale:.3e}",
+                    flush=True,
+                )
     
             z_base = z_train
             if z_base.shape[0] != ap.shape[0]:
@@ -4066,6 +4312,33 @@ def train():
                 z_latent = z_base
             last_z_latent = z_latent
 
+            skip_proj = bool(args.act_only)
+            debug_act_step = bool(args.debug_act and step == 1)
+            proj_warmup_active = bool(args.proj_warmup_steps > 0 and step <= args.proj_warmup_steps)
+            proj_weight = 0.0
+            if not skip_proj:
+                proj_weight = 1.0
+                if hybrid_enabled:
+                    proj_weight_min = float(args.proj_weight_min)
+                    proj_weight_max = float(args.proj_loss_weight)
+                    if proj_warmup_active:
+                        proj_weight = 0.0
+                    else:
+                        ramp_steps = max(1, int(args.proj_ramp_steps))
+                        ramp_t = min(1.0, max(0.0, (step - max(args.proj_warmup_steps, 0)) / float(ramp_steps)))
+                        proj_weight = proj_weight_min + ramp_t * (proj_weight_max - proj_weight_min)
+                elif proj_warmup_active:
+                    proj_weight = 0.0
+
+            proj_weight_used = 0.0 if proj_warmup_active else float(proj_weight)
+            proj_loss_active = (
+                (not skip_proj)
+                and (proj_loss_type == "poisson")
+                and (not proj_warmup_active)
+                and (not hybrid_enabled or proj_weight_used > 0.0)
+            )
+            proj_metrics_enabled = proj_loss_active
+
             if debug_sanity_checks and (not geometry_checked) and step == 1:
                 geometry_checked = True
                 try:
@@ -4081,10 +4354,10 @@ def train():
                     H, W = generator.H, generator.W
                     pred_ap_full = proj_ap_full.view(1, -1)
                     pred_pa_full = proj_pa_full.view(1, -1)
-                    if proj_loss_type == "poisson":
+                    if proj_loss_type == "poisson" and proj_loss_active:
                         pred_ap_full = compute_poisson_rate(pred_ap_full, args.poisson_rate_mode, eps=1e-6)
                         pred_pa_full = compute_poisson_rate(pred_pa_full, args.poisson_rate_mode, eps=1e-6)
-                    if use_counts:
+                    if use_counts and proj_loss_active:
                         pred_ap_full = pred_ap_full * float(pred_to_counts_scale)
                         pred_pa_full = pred_pa_full * float(pred_to_counts_scale)
                         gain_val_dbg = None
@@ -4137,23 +4410,26 @@ def train():
                 except Exception as exc:
                     print(f"[sanity][geometry][WARN] check failed: {exc.__class__.__name__}: {exc}", flush=True)
     
-            skip_proj = bool(args.act_only)
-            debug_act_step = bool(args.debug_act and step == 1)
-            proj_metrics_enabled = (not skip_proj) and not (hybrid_enabled and args.proj_loss_weight <= 0.0)
-    
             optimizer.zero_grad(set_to_none=True)
             t0 = time.perf_counter()
-    
-            need_ray_tv = (not skip_proj) and ray_tv_weight != 0.0
-            need_bg_depth = (not skip_proj) and args.bg_depth_mass_weight > 0.0
-            need_raw_stats = proj_metrics_enabled and hybrid_enabled and args.log_every > 0 and (step % args.log_every == 0 or step == 1)
-            need_raw = need_ray_tv or need_bg_depth or need_raw_stats or depth_checks_active or debug_sanity_checks
-    
+
             idx_ap = None
             idx_pa = None
             ray_batch_ap = None
             ray_batch_pa = None
-            proj_weight = 0.0
+            need_ray_tv = (not skip_proj) and ray_tv_weight != 0.0
+            need_lambda_ray_tv = proj_loss_active and lambda_ray_tv_weight != 0.0
+            need_bg_depth = (not skip_proj) and args.bg_depth_mass_weight > 0.0
+            need_raw_stats = proj_metrics_enabled and hybrid_enabled and args.log_every > 0 and (step % args.log_every == 0 or step == 1)
+            need_raw = (
+                need_ray_tv
+                or need_lambda_ray_tv
+                or need_bg_depth
+                or need_raw_stats
+                or depth_checks_active
+                or debug_sanity_checks
+            )
+
             if not skip_proj:
                 if ray_split_enabled and pixel_split_np is not None and rng_train is not None:
                     idx_np = sample_train_indices(pixel_split_np, rays_per_proj, ray_train_fg_frac, rng_train)
@@ -4162,20 +4438,9 @@ def train():
                 else:
                     idx_ap = sample_split_indices(ray_indices["pixel"]["train_idx_all"], rays_per_proj)
                     idx_pa = map_pa_indices_torch(idx_ap, W, pa_xflip)
-    
+
                 ray_batch_ap = slice_rays(rays_cache["ap"], idx_ap)
                 ray_batch_pa = slice_rays(rays_cache["pa"], idx_pa)
-    
-                proj_weight = 1.0
-                if hybrid_enabled:
-                    proj_weight_min = float(args.proj_weight_min)
-                    proj_weight_max = float(args.proj_loss_weight)
-                    if args.proj_warmup_steps > 0 and step <= args.proj_warmup_steps:
-                        proj_weight = proj_weight_min
-                    else:
-                        ramp_steps = max(1, int(args.proj_ramp_steps))
-                        ramp_t = min(1.0, max(0.0, (step - max(args.proj_warmup_steps, 0)) / float(ramp_steps)))
-                        proj_weight = proj_weight_min + ramp_t * (proj_weight_max - proj_weight_min)
     
             loss = torch.tensor(0.0, device=device)
             loss_ap = torch.tensor(0.0, device=device)
@@ -4190,6 +4455,9 @@ def train():
             extras_ap = None
             extras_pa = None
             gain_val = None
+            gain_val_used = None
+            lambda_ap_used = None
+            lambda_pa_used = None
             lambda_floor_frac = None
     
             with torch.cuda.amp.autocast(enabled=amp_enabled):
@@ -4213,49 +4481,99 @@ def train():
     
                     target_ap = ap_flat_proc[0, idx_ap].unsqueeze(0)
                     target_pa = pa_flat_proc[0, idx_pa].unsqueeze(0)
+                    if debug_sanity_checks and step == 1:
+                        tap_min = float(target_ap.min().item())
+                        tap_mean = float(target_ap.mean().item())
+                        tap_max = float(target_ap.max().item())
+                        tpa_min = float(target_pa.min().item())
+                        tpa_mean = float(target_pa.mean().item())
+                        tpa_max = float(target_pa.max().item())
+                        print(
+                            f"[sanity][proj-target] target_ap(min/mean/max)={tap_min:.3e}/{tap_mean:.3e}/{tap_max:.3e} "
+                            f"| target_pa(min/mean/max)={tpa_min:.3e}/{tpa_mean:.3e}/{tpa_max:.3e}",
+                            flush=True,
+                        )
     
                     pred_ap_raw = pred_ap
                     pred_pa_raw = pred_pa
-    
+                    for extras in (extras_ap, extras_pa):
+                        if not isinstance(extras, dict):
+                            continue
+                        if extras.get("lambda_ray") is not None and extras.get("lambda_ray_pre_act") is not None:
+                            continue
+                        raw_out = extras.get("raw")
+                        if raw_out is None:
+                            continue
+                        if raw_out.dim() >= 3:
+                            raw_lambda = raw_out[..., 0]
+                        elif raw_out.dim() == 2:
+                            raw_lambda = raw_out
+                        else:
+                            continue
+                        if extras.get("lambda_ray_pre_act") is None:
+                            extras["lambda_ray_pre_act"] = raw_lambda
+                        if extras.get("lambda_ray") is None:
+                            extras["lambda_ray"] = F.softplus(raw_lambda)
+
                     if proj_loss_type == "poisson":
-                        lambda_ap_used = compute_poisson_rate(pred_ap_raw, args.poisson_rate_mode, eps=1e-6)
-                        lambda_pa_used = compute_poisson_rate(pred_pa_raw, args.poisson_rate_mode, eps=1e-6)
-                        floor_eps = 1e-6
-                        floor_ap = float((lambda_ap_used <= (floor_eps * 1.001)).float().mean().item())
-                        floor_pa = float((lambda_pa_used <= (floor_eps * 1.001)).float().mean().item())
-                        lambda_floor_frac = 0.5 * (floor_ap + floor_pa)
+                        if proj_loss_active:
+                            lambda_ap_used = compute_poisson_rate(pred_ap_raw, args.poisson_rate_mode, eps=1e-6)
+                            lambda_pa_used = compute_poisson_rate(pred_pa_raw, args.poisson_rate_mode, eps=1e-6)
+                        else:
+                            lambda_ap_used = pred_ap_raw
+                            lambda_pa_used = pred_pa_raw
                     else:
                         lambda_ap_used = pred_ap_raw
                         lambda_pa_used = pred_pa_raw
     
                     gain_val_raw = None
                     gain_val = None
+                    gain_val_used = None
                     if use_counts:
-                        lambda_ap_used = lambda_ap_used * float(pred_to_counts_scale)
-                        lambda_pa_used = lambda_pa_used * float(pred_to_counts_scale)
                         if gain_head is not None and z_enc is not None:
                             gain_raw = gain_head(z_enc)
                             gain_val_raw = F.softplus(gain_raw)
                         elif gain_param is not None:
                             gain_val_raw = F.softplus(gain_param)
-                        if gain_val_raw is not None:
-                            g_min = float(args.gain_clamp_min) if args.gain_clamp_min is not None else None
-                            g_max = args.gain_clamp_max
-                            if g_min is not None or g_max is not None:
-                                gmin = g_min if g_min is not None else -float("inf")
-                                gmax = g_max if g_max is not None else float("inf")
-                                gain_val = torch.clamp(gain_val_raw, min=gmin, max=gmax)
+                        gain_val = gain_val_raw
+                        if proj_warmup_active and args.gain_warmup_mode != "none":
+                            fixed_gain = 1.0 if args.gain_warmup_mode == "one" else float(args.gain_prior_value)
+                            if gain_val_raw is not None:
+                                gain_val = gain_val_raw.new_full(gain_val_raw.shape, fixed_gain)
                             else:
-                                gain_val = gain_val_raw
-                            lambda_ap_used = lambda_ap_used * gain_val
-                            lambda_pa_used = lambda_pa_used * gain_val
-                    pred_ap = lambda_ap_used
-                    pred_pa = lambda_pa_used
-                    last_gain_val = gain_val
+                                gain_val = torch.tensor(fixed_gain, device=device)
+                        if proj_loss_active:
+                            lambda_ap_used = lambda_ap_used * float(pred_to_counts_scale)
+                            lambda_pa_used = lambda_pa_used * float(pred_to_counts_scale)
+                            if gain_val is not None:
+                                g_min = float(args.gain_clamp_min) if args.gain_clamp_min is not None else None
+                                g_max = args.gain_clamp_max
+                                if g_min is not None or g_max is not None:
+                                    gmin = g_min if g_min is not None else -float("inf")
+                                    gmax = g_max if g_max is not None else float("inf")
+                                    gain_val_used = torch.clamp(gain_val, min=gmin, max=gmax)
+                                else:
+                                    gain_val_used = gain_val
+                                lambda_ap_used = lambda_ap_used * gain_val_used
+                                lambda_pa_used = lambda_pa_used * gain_val_used
+                    lambda_ap_eff = lambda_ap_used
+                    lambda_pa_eff = lambda_pa_used
+                    if proj_loss_type == "poisson" and proj_loss_active and float(args.poisson_rate_floor) > 0.0:
+                        lambda_ap_eff, floor_ap = apply_poisson_rate_floor(
+                            lambda_ap_eff, args.poisson_rate_floor, args.poisson_rate_floor_mode
+                        )
+                        lambda_pa_eff, floor_pa = apply_poisson_rate_floor(
+                            lambda_pa_eff, args.poisson_rate_floor, args.poisson_rate_floor_mode
+                        )
+                        if floor_ap is not None and floor_pa is not None:
+                            lambda_floor_frac = 0.5 * (float(floor_ap) + float(floor_pa))
+                    pred_ap = lambda_ap_eff
+                    pred_pa = lambda_pa_eff
+                    last_gain_val = gain_val_used if gain_val_used is not None else gain_val
     
-                    if (target_ap < 0).any() or (target_pa < 0).any():
+                    if proj_loss_active and ((target_ap < 0).any() or (target_pa < 0).any()):
                         print("[WARN] Negative projection targets detected.", flush=True)
-                    if proj_loss_type == "poisson":
+                    if proj_loss_active and proj_loss_type == "poisson":
                         if not torch.isfinite(pred_ap).all() or not torch.isfinite(pred_pa).all():
                             raise RuntimeError("Non-finite lambda in Poisson projection loss.")
                         if (pred_ap <= 0).any() or (pred_pa <= 0).any():
@@ -4278,7 +4596,8 @@ def train():
                                 pred_max = float(pred_ap.max().item())
                                 target_mean = float(target_ap.mean().item())
                                 gain_pre = float(gain_val_raw.mean().item()) if gain_val_raw is not None else float("nan")
-                                gain_post = float(gain_val.mean().item()) if gain_val is not None else float("nan")
+                                gain_post_tensor = gain_val_used if gain_val_used is not None else gain_val
+                                gain_post = float(gain_post_tensor.mean().item()) if gain_post_tensor is not None else float("nan")
                                 print(
                                     "[WARN][proj] Projection lambda collapsed: pred std ~0 while target std is large.",
                                     flush=True,
@@ -4314,10 +4633,40 @@ def train():
                             atten_scale=atten_scale,
                             label="train",
                         )
-                        if lambda_floor_frac is not None:
+                        if proj_loss_type == "poisson" and (pred_ap is not None) and (lambda_ap_used is not None):
+                            lambda_stats = tensor_stats(lambda_ap_used)
+                            lambda_eff_stats = tensor_stats(pred_ap)
+                            floor_active = proj_loss_active and float(args.poisson_rate_floor) > 0.0
+                            floor_frac = float(lambda_floor_frac) if lambda_floor_frac is not None else 0.0
                             print(
-                                f"[sanity][step {step}] lambda_floor_frac={lambda_floor_frac:.3f} "
-                                f"(mode={args.poisson_rate_mode})",
+                                f"[sanity][step {step}] lambda(min/mean/p95/max)={fmt_stats(lambda_stats)} "
+                                f"| lambda_eff(min/mean/p95/max)={fmt_stats(lambda_eff_stats)} "
+                                f"| floor={float(args.poisson_rate_floor):.3e} "
+                                f"| floor_mode={args.poisson_rate_floor_mode} "
+                                f"| floor_active={bool(floor_active)} "
+                                f"| floor_frac={floor_frac:.3f} "
+                                f"| proj_warmup_active={bool(proj_warmup_active)} "
+                                f"| proj_weight_used={float(proj_weight_used):.3e} "
+                                f"| proj_loss_active={bool(proj_loss_active)}",
+                                flush=True,
+                            )
+                        pre_vals = []
+                        post_vals = []
+                        for extras in (extras_ap, extras_pa):
+                            if not isinstance(extras, dict):
+                                continue
+                            pre = extras.get("lambda_ray_pre_act")
+                            post = extras.get("lambda_ray")
+                            if pre is not None:
+                                pre_vals.append(pre.reshape(-1))
+                            if post is not None:
+                                post_vals.append(post.reshape(-1))
+                        if pre_vals or post_vals:
+                            pre_stats = tensor_stats(torch.cat(pre_vals, dim=0)) if pre_vals else None
+                            post_stats = tensor_stats(torch.cat(post_vals, dim=0)) if post_vals else None
+                            print(
+                                f"[sanity][step {step}] lambda_ray_pre_act(min/mean/p95/max)={fmt_stats(pre_stats)} "
+                                f"| lambda_ray(min/mean/p95/max)={fmt_stats(post_stats)}",
                                 flush=True,
                             )
                         if use_counts:
@@ -4327,12 +4676,23 @@ def train():
                             if gain_val is not None:
                                 gain_stats = tensor_stats(gain_val)
                             scale_gain_stats = None
-                            if gain_val is not None:
-                                scale_gain_stats = tensor_stats(gain_val * float(pred_to_counts_scale))
+                            if proj_loss_active and gain_val_used is not None:
+                                scale_gain_stats = tensor_stats(gain_val_used * float(pred_to_counts_scale))
                             print(
                                 f"[sanity][step {step}] pred_to_counts_scale={pred_to_counts_scale:.3e} "
                                 f"| gain(min/mean/p95/max)={fmt_stats(gain_stats)} "
                                 f"| scale*gain(min/mean/p95/max)={fmt_stats(scale_gain_stats)}",
+                                flush=True,
+                            )
+                            gain_raw_mean = float(gain_val_raw.mean().item()) if gain_val_raw is not None else float("nan")
+                            gain_used_mean = float(gain_val.mean().item()) if gain_val is not None else float("nan")
+                            gain_clamped_mean = (
+                                float(gain_val_used.mean().item()) if gain_val_used is not None else float("nan")
+                            )
+                            print(
+                                f"[sanity][step {step}] gain_raw={gain_raw_mean:.3e} "
+                                f"| gain_used={gain_used_mean:.3e} "
+                                f"| gain_clamped={gain_clamped_mean:.3e}",
                                 flush=True,
                             )
                             if gain_stats is not None:
@@ -4345,10 +4705,13 @@ def train():
                                         flush=True,
                                     )
     
-                    weight_ap = build_loss_weights(target_ap, args.bg_weight, args.weight_threshold)
-                    weight_pa = build_loss_weights(target_pa, args.bg_weight, args.weight_threshold)
+                    weight_ap = None
+                    weight_pa = None
+                    if proj_loss_active:
+                        weight_ap = build_loss_weights(target_ap, args.bg_weight, args.weight_threshold)
+                        weight_pa = build_loss_weights(target_pa, args.bg_weight, args.weight_threshold)
     
-                    if step in (1, 50):
+                    if proj_loss_active and step in (1, 50):
                         pred_raw_mean = float(pred_ap_raw.mean().item())
                         pred_raw_std = float(pred_ap_raw.std().item())
                         pred_mean = float(pred_ap.mean().item())
@@ -4356,7 +4719,8 @@ def train():
                         target_mean = float(target_ap.mean().item())
                         target_std = float(target_ap.std().item())
                         gain_pre = float(gain_val_raw.mean().item()) if gain_val_raw is not None else float("nan")
-                        gain_post = float(gain_val.mean().item()) if gain_val is not None else float("nan")
+                        gain_post_tensor = gain_val_used if gain_val_used is not None else gain_val
+                        gain_post = float(gain_post_tensor.mean().item()) if gain_post_tensor is not None else float("nan")
                         print(
                             f"[DEBUG][proj][step {step}] pred_raw_mean={pred_raw_mean:.3e} pred_raw_std={pred_raw_std:.3e} "
                             f"| pred_mean={pred_mean:.3e} pred_std={pred_std:.3e} "
@@ -4367,33 +4731,38 @@ def train():
                             flush=True,
                         )
     
-                    loss_ap = loss_fn(pred_ap, target_ap, weight=weight_ap)
-                    loss_pa = loss_fn(pred_pa, target_pa, weight=weight_pa)
-                    loss_proj = 0.5 * (loss_ap + loss_pa)
-                    if step == 1:
-                        tmin = float(target_ap.min().item()) if target_ap.numel() > 0 else float("nan")
-                        tmax = float(target_ap.max().item()) if target_ap.numel() > 0 else float("nan")
-                        lmin = float(pred_ap.min().item()) if pred_ap.numel() > 0 else float("nan")
-                        lmax = float(pred_ap.max().item()) if pred_ap.numel() > 0 else float("nan")
-                        print(
-                            f"[DEBUG][proj][step 1] use_counts={use_counts} "
-                            f"| target_min/max=({tmin:.3e},{tmax:.3e}) "
-                            f"| lambda_min/max=({lmin:.3e},{lmax:.3e})",
-                            flush=True,
-                        )
-                    if hybrid_enabled:
-                        if proj_weight > 0.0:
-                            loss = loss + proj_weight * loss_proj
+                    if proj_loss_active:
+                        loss_ap = loss_fn(pred_ap, target_ap, weight=weight_ap)
+                        loss_pa = loss_fn(pred_pa, target_pa, weight=weight_pa)
+                        loss_proj = 0.5 * (loss_ap + loss_pa)
+                        if step == 1:
+                            tmin = float(target_ap.min().item()) if target_ap.numel() > 0 else float("nan")
+                            tmax = float(target_ap.max().item()) if target_ap.numel() > 0 else float("nan")
+                            lmin = float(pred_ap.min().item()) if pred_ap.numel() > 0 else float("nan")
+                            lmax = float(pred_ap.max().item()) if pred_ap.numel() > 0 else float("nan")
+                            print(
+                                f"[DEBUG][proj][step 1] use_counts={use_counts} "
+                                f"| target_min/max=({tmin:.3e},{tmax:.3e}) "
+                                f"| lambda_min/max=({lmin:.3e},{lmax:.3e})",
+                                flush=True,
+                            )
+                        if hybrid_enabled:
+                            if proj_weight_used > 0.0:
+                                loss = loss + proj_weight_used * loss_proj
+                        else:
+                            loss = loss_proj
+                        if DEBUG_PRINTS and (step % 50 == 0):
+                            print(
+                                f"[DEBUG][step {step}] TARGET AP min/max: {target_ap.min().item():.3e}/{target_ap.max().item():.3e} | "
+                                f"PRED AP min/max: {pred_ap.min().item():.3e}/{pred_ap.max().item():.3e} | "
+                                f"TARGET PA min/max: {target_pa.min().item():.3e}/{target_pa.max().item():.3e} | "
+                                f"PRED PA min/max: {pred_pa.min().item():.3e}/{pred_pa.max().item():.3e}",
+                                flush=True,
+                            )
                     else:
-                        loss = loss_proj
-                    if DEBUG_PRINTS and (step % 50 == 0):
-                        print(
-                            f"[DEBUG][step {step}] TARGET AP min/max: {target_ap.min().item():.3e}/{target_ap.max().item():.3e} | "
-                            f"PRED AP min/max: {pred_ap.min().item():.3e}/{pred_ap.max().item():.3e} | "
-                            f"TARGET PA min/max: {target_pa.min().item():.3e}/{target_pa.max().item():.3e} | "
-                            f"PRED PA min/max: {pred_pa.min().item():.3e}/{pred_pa.max().item():.3e}",
-                            flush=True,
-                        )
+                        loss_ap = torch.tensor(float("nan"), device=device)
+                        loss_pa = torch.tensor(float("nan"), device=device)
+                        loss_proj = torch.tensor(float("nan"), device=device)
     
                 bg_depth_mass = torch.tensor(0.0, device=device)
                 bg_depth_mass_w = torch.tensor(0.0, device=device)
@@ -4512,8 +4881,9 @@ def train():
     
                 loss_gain = torch.tensor(0.0, device=device)
                 gain_prior = None
-                if hybrid_enabled and gain_val is not None and args.gain_reg_weight > 0.0:
-                    gain_mean = float(gain_val.detach().mean().item())
+                gain_for_reg = gain_val_used if gain_val_used is not None else gain_val
+                if hybrid_enabled and gain_for_reg is not None and args.gain_reg_weight > 0.0:
+                    gain_mean = float(gain_for_reg.detach().mean().item())
                     if args.gain_prior_mode == "fixed":
                         gain_prior = float(args.gain_prior_value)
                     else:
@@ -4529,7 +4899,7 @@ def train():
                                 gain_prior_final = gain_prior_ema
                             gain_prior = gain_prior_final
                     if gain_prior is not None and gain_prior > 0:
-                        log_gain = torch.log(gain_val.clamp_min(1e-12))
+                        log_gain = torch.log(gain_for_reg.clamp_min(1e-12))
                         log_prior = math.log(max(gain_prior, 1e-12))
                         loss_gain = ((log_gain - log_prior) ** 2).mean()
                         loss_gain = loss_gain * float(args.gain_reg_scale)
@@ -4560,6 +4930,8 @@ def train():
                 loss_tv = torch.tensor(0.0, device=device)
                 loss_ray_tv = torch.tensor(0.0, device=device)
                 loss_ray_tv_w = torch.tensor(0.0, device=device)
+                loss_lambda_ray_tv = torch.tensor(0.0, device=device)
+                loss_lambda_ray_tv_w = torch.tensor(0.0, device=device)
                 ray_tv_mode = "plain"
                 ray_tv_w_mean = None
                 ray_tv_w_min = None
@@ -4623,6 +4995,80 @@ def train():
                     if edge_aware_active and ray_tv_w_terms:
                         ray_tv_w_mean = torch.stack(ray_tv_w_terms).mean().item()
                         ray_tv_mode = "edgeaware"
+
+                if proj_loss_active and proj_loss_type == "poisson" and lambda_ray_tv_weight != 0.0:
+                    lambda_ray_tv_terms = []
+                    lambda_ray_tv_norm_used = False
+                    lambda_ray_tv_norm_missing = False
+                    lambda_ray_tv_nsamples = None
+                    for extras in (extras_ap, extras_pa):
+                        if not isinstance(extras, dict):
+                            continue
+                        lambda_ray = extras.get("lambda_ray")
+                        if lambda_ray is None:
+                            raw_out = extras.get("raw")
+                            if raw_out is None:
+                                continue
+                            if raw_out.dim() >= 3:
+                                raw_lambda = raw_out[..., 0]
+                            elif raw_out.dim() == 2:
+                                raw_lambda = raw_out
+                            else:
+                                continue
+                            if extras.get("lambda_ray_pre_act") is None:
+                                extras["lambda_ray_pre_act"] = raw_lambda
+                            if debug_sanity_checks:
+                                raw_stats = tensor_stats(raw_lambda)
+                                raw_min = raw_stats["min"] if raw_stats is not None else float("nan")
+                                raw_mean = raw_stats["mean"] if raw_stats is not None else float("nan")
+                                raw_max = raw_stats["max"] if raw_stats is not None else float("nan")
+                                print(
+                                    f"[sanity][step {step}] lambda_ray fallback=raw shape={tuple(raw_out.shape)} "
+                                    f"| raw(min/mean/max)={raw_min:.3e}/{raw_mean:.3e}/{raw_max:.3e}",
+                                    flush=True,
+                                )
+                            lambda_ray = F.softplus(raw_lambda)
+                            extras["lambda_ray"] = lambda_ray
+                        if lambda_ray.shape[-1] < 2:
+                            continue
+                        tv_raw = torch.mean(torch.abs(lambda_ray[..., 1:] - lambda_ray[..., :-1]))
+                        dz_mean = None
+                        dists = extras.get("dists")
+                        if torch.is_tensor(dists) and dists.shape == lambda_ray.shape:
+                            dz_mean = torch.mean(dists)
+                        else:
+                            z_vals = extras.get("z_vals")
+                            if torch.is_tensor(z_vals):
+                                if z_vals.dim() == 1 and z_vals.shape[0] == lambda_ray.shape[-1]:
+                                    dz = z_vals[1:] - z_vals[:-1]
+                                    dz_mean = torch.mean(torch.abs(dz))
+                                elif z_vals.shape[-1] == lambda_ray.shape[-1]:
+                                    dz = z_vals[..., 1:] - z_vals[..., :-1]
+                                    dz_mean = torch.mean(torch.abs(dz))
+                        if dz_mean is not None and torch.isfinite(dz_mean) and float(dz_mean.item()) > 0.0:
+                            tv_val = tv_raw / dz_mean
+                            lambda_ray_tv_norm_used = True
+                        else:
+                            tv_val = tv_raw
+                            lambda_ray_tv_norm_missing = True
+                            lambda_ray_tv_nsamples = int(lambda_ray.shape[-1])
+                        lambda_ray_tv_terms.append(tv_val)
+                    if lambda_ray_tv_terms:
+                        loss_lambda_ray_tv = torch.stack(lambda_ray_tv_terms).mean()
+                        loss_lambda_ray_tv_w = loss_lambda_ray_tv * float(lambda_ray_tv_weight)
+                        loss = loss + loss_lambda_ray_tv_w
+                    if debug_sanity_checks and (step == 1 or (step % debug_sanity_every) == 0):
+                        print(
+                            f"[sanity][step {step}] lambda_ray_tv={loss_lambda_ray_tv.item():.6f} "
+                            f"| lambda_ray_tv_weight={float(lambda_ray_tv_weight):.3e}",
+                            flush=True,
+                        )
+                        if lambda_ray_tv_norm_missing and not lambda_ray_tv_norm_used:
+                            print(
+                                f"[sanity][step {step}] lambda_ray_tv unnormalized (no dists/z_vals) "
+                                f"-> depends on N_samples={lambda_ray_tv_nsamples}",
+                                flush=True,
+                            )
     
                 if depth_checks_active and (step % depth_sanity_every == 0 or step == 1):
                     # Single-Phantom ist inhaltlich stabil, wenn:
@@ -4630,17 +5076,19 @@ def train():
                     # - Depth-Regularizer nicht trivial sind,
                     # - lambda-Std entlang Rays stabil > 1e-4,
                     # - Gain im physikalischen Bereich bleibt.
-                    proj_loss_active = (not skip_proj) and (not hybrid_enabled or proj_weight > 0.0)
+                    proj_loss_active_depth = (not skip_proj) and (proj_loss_type == "poisson") and (
+                        not hybrid_enabled or (proj_weight_used > 0.0 and not proj_warmup_active)
+                    )
                     atten_flag = bool(generator.render_kwargs_train.get("use_attenuation", False))
                     atten_active = atten_flag and (ct_context is not None)
-                    if proj_loss_active and not atten_active:
+                    if proj_loss_active_depth and not atten_active:
                         reason = "use_attenuation=False" if not atten_flag else "ct_context=None"
                         print(
                             f"[WARN][depth] Attenuation inaktiv bei aktivem Projection-Loss -> Depth unterbestimmt. "
                             f"Ursache: {reason}.",
                             flush=True,
                         )
-                    if proj_loss_active and atten_active:
+                    if proj_loss_active_depth and atten_active:
                         mu_terms = []
                         atten_terms = []
                         atten_default = globals().get("ATTEN_SCALE_DEFAULT", 1.0)
@@ -4753,7 +5201,11 @@ def train():
                                 "-> Gain kann Strukturfreiheit kompensieren.",
                                 flush=True,
                             )
-            proj_loss_for_grad = proj_weight * 0.5 * (loss_ap + loss_pa) if not skip_proj else torch.tensor(0.0, device=device)
+            proj_loss_for_grad = (
+                proj_weight_used * 0.5 * (loss_ap + loss_pa)
+                if (not skip_proj and proj_loss_active)
+                else torch.tensor(0.0, device=device)
+            )
     
             if debug_act_step:
                 net_module = generator.render_kwargs_train.get("network_fn")
@@ -4804,13 +5256,16 @@ def train():
             iter_ms = (time.perf_counter() - t0) * 1000.0
     
             with torch.no_grad():
+                pred_mean_raw = (float("nan"), float("nan"))
+                pred_std_raw = (float("nan"), float("nan"))
+                if pred_ap_raw is not None and pred_pa_raw is not None:
+                    pred_mean_raw = (pred_ap_raw.mean().item(), pred_pa_raw.mean().item())
+                    pred_std_raw = (pred_ap_raw.std().item(), pred_pa_raw.std().item())
                 if not proj_metrics_enabled:
                     mae_ap = float("nan")
                     mae_pa = float("nan")
-                    pred_mean = (float("nan"), float("nan"))
-                    pred_std = (float("nan"), float("nan"))
-                    pred_mean_raw = (float("nan"), float("nan"))
-                    pred_std_raw = (float("nan"), float("nan"))
+                    pred_mean = pred_mean_raw
+                    pred_std = pred_std_raw
                     psnr_ap = float("nan")
                     psnr_pa = float("nan")
                     psnr_ap_phys = None
@@ -4820,10 +5275,8 @@ def train():
                 else:
                     mae_ap = torch.mean(torch.abs(pred_ap - target_ap)).item()
                     mae_pa = torch.mean(torch.abs(pred_pa - target_pa)).item()
-                    pred_mean = (pred_ap.mean().item(), pred_pa.mean().item())              # skaliert gemäß Projektnorm
+                    pred_mean = (pred_ap.mean().item(), pred_pa.mean().item())
                     pred_std = (pred_ap.std().item(), pred_pa.std().item())
-                    pred_mean_raw = (pred_ap_raw.mean().item(), pred_pa_raw.mean().item())  # physikalischer Maßstab
-                    pred_std_raw = (pred_ap_raw.std().item(), pred_pa_raw.std().item())
                     psnr_ap = compute_psnr(pred_ap, target_ap)
                     psnr_pa = compute_psnr(pred_pa, target_pa)
                     psnr_ap_phys = None
@@ -4839,6 +5292,22 @@ def train():
                         psnr_pa_phys = compute_psnr(pred_pa_phys, target_pa_phys)
                         mae_ap_phys = torch.mean(torch.abs(pred_ap_phys - target_ap_phys)).item()
                         mae_pa_phys = torch.mean(torch.abs(pred_pa_phys - target_pa_phys)).item()
+                if debug_sanity_checks and (step == 1 or (step % debug_sanity_every) == 0):
+                    if proj_warmup_active and proj_loss_active:
+                        print(
+                            f"[sanity][step {step}] WARN: proj_warmup_active=True but proj_loss_active=True",
+                            flush=True,
+                        )
+                    if proj_warmup_active:
+                        if all(math.isfinite(x) for x in pred_mean) and all(math.isfinite(x) for x in pred_mean_raw):
+                            diff_ap = abs(pred_mean[0] - pred_mean_raw[0])
+                            diff_pa = abs(pred_mean[1] - pred_mean_raw[1])
+                            if max(diff_ap, diff_pa) > 1e-6:
+                                print(
+                                    f"[sanity][step {step}] WARN: warmup pred_mean != pred_mean_raw "
+                                    f"(diff_ap={diff_ap:.3e}, diff_pa={diff_pa:.3e})",
+                                    flush=True,
+                                )
                 bg_depth_frac = float(bg_depth_frac_t.detach().cpu().item())
                 if hybrid_enabled and hybrid_log_path is not None and need_raw_stats:
                     target_ap_stats = tensor_stats(target_ap)
@@ -4859,7 +5328,8 @@ def train():
                     proj_scale_enc_val = (
                         float(proj_scale_enc.mean().item()) if torch.is_tensor(proj_scale_enc) else float("nan")
                     )
-                    gain_log = float(gain_val.mean().item()) if gain_val is not None else float("nan")
+                    gain_log_src = gain_val_used if gain_val_used is not None else gain_val
+                    gain_log = float(gain_log_src.mean().item()) if gain_log_src is not None else float("nan")
                     z_train_l2 = float(z_train.detach().norm().item())
                     z_enc_l2 = (
                         float(z_enc_proj.detach().norm(dim=1).mean().item()) if z_enc_proj is not None else float("nan")
@@ -4904,7 +5374,7 @@ def train():
                         hybrid_log_path,
                         [
                             step,
-                            proj_weight,
+                            proj_weight_used,
                             float(loss_proj.item()),
                             float(loss_ap.item()),
                             float(loss_pa.item()),
@@ -4957,7 +5427,7 @@ def train():
                         ],
                     )
                 val_stats = None
-                if val_interval > 0 and (step % val_interval) == 0 and (not args.no_val):
+                if val_interval > 0 and (step % val_interval) == 0 and (not args.no_val) and proj_loss_active:
                     rays_eval = None if ray_split_enabled else rays_per_proj
                     # Testmetriken:
                     # test_all  → gesamter Test-Split (dominiert von BG, kann “zu gut” aussehen)
@@ -4987,8 +5457,15 @@ def train():
                         scale_pa=scale_pa_used if log_proj_metrics_physical else None,
                         loss_fn=loss_fn,
                         poisson_rate_mode=args.poisson_rate_mode,
+                        poisson_rate_floor=args.poisson_rate_floor,
+                        poisson_rate_floor_mode=args.poisson_rate_floor_mode,
+                        proj_loss_active=proj_loss_active,
                         pred_scale=pred_to_counts_scale if (hybrid_enabled and args.proj_target_source == "counts") else 1.0,
-                        gain=gain_val if (hybrid_enabled and args.proj_target_source == "counts") else None,
+                        gain=(
+                            (gain_val_used if gain_val_used is not None else gain_val)
+                            if (hybrid_enabled and args.proj_target_source == "counts")
+                            else None
+                        ),
                     )
             val_all = val_stats.get("test_all") if isinstance(val_stats, dict) else None
             val_fg = val_stats.get("test_fg") if isinstance(val_stats, dict) else None
@@ -5099,6 +5576,33 @@ def train():
                     f" | test_pa_loss={val_loss_pa:.6f} | test_pa_psnr={val_psnr_pa_val:.2f} | test_pa_mae={val_mae_pa_val:.6f}"
                 )
             print(msg, flush=True)
+            lambda_mean = float("nan")
+            lambda_p95 = float("nan")
+            lambda_eff_mean = float("nan")
+            lambda_eff_p95 = float("nan")
+            do_quantiles = args.log_every > 0 and (step % args.log_every == 0 or step == 1)
+            if (
+                proj_loss_active
+                and proj_loss_type == "poisson"
+                and lambda_ap_used is not None
+                and lambda_pa_used is not None
+                and pred_ap is not None
+                and pred_pa is not None
+            ):
+                lambda_all = torch.cat([lambda_ap_used.reshape(-1), lambda_pa_used.reshape(-1)], dim=0).detach()
+                if lambda_all.numel() > 0:
+                    lambda_mean = float(lambda_all.mean().item())
+                    if do_quantiles:
+                        lambda_p95 = float(torch.quantile(lambda_all, 0.95).item())
+                lambda_eff_all = torch.cat([pred_ap.reshape(-1), pred_pa.reshape(-1)], dim=0).detach()
+                if lambda_eff_all.numel() > 0:
+                    lambda_eff_mean = float(lambda_eff_all.mean().item())
+                    if do_quantiles:
+                        lambda_eff_p95 = float(torch.quantile(lambda_eff_all, 0.95).item())
+            lambda_floor_frac_log = float("nan")
+            if proj_loss_active and proj_loss_type == "poisson" and float(args.poisson_rate_floor) > 0.0:
+                lambda_floor_frac_log = float(lambda_floor_frac) if lambda_floor_frac is not None else 0.0
+            lambda_ray_tv_log = float(loss_lambda_ray_tv.item()) if torch.is_tensor(loss_lambda_ray_tv) else float("nan")
             append_log(
                 log_path,
                 [
@@ -5110,6 +5614,12 @@ def train():
                     loss_ct.item(),
                     loss_ray_tv.item(),
                     loss_ray_tv_w.item(),
+                    lambda_ray_tv_log,
+                    lambda_floor_frac_log,
+                    lambda_mean,
+                    lambda_p95,
+                    lambda_eff_mean,
+                    lambda_eff_p95,
                     bg_depth_mass.item(),
                     bg_depth_mass_w.item(),
                     bg_depth_frac,
@@ -5171,11 +5681,41 @@ def train():
                 target_ap_counts=ap_counts,
                 target_pa_counts=pa_counts,
             )
+            pred_path_step = None
+            pred_vol_step = None
             if args.export_vol_every > 0 and (step % args.export_vol_every == 0):
-                export_path = outdir / f"activity_pred_step_{step:05d}.npy"
-                export_activity_volume(generator, z_latent.detach(), export_path, args.export_vol_res, device)
+                pred_path_step = outdir / f"activity_pred_step_{step:05d}.npy"
+                pred_vol_step = export_activity_volume(
+                    generator,
+                    z_latent.detach(),
+                    pred_path_step,
+                    args.export_vol_res,
+                    device,
+                )
+            if bool(getattr(args, "final_act_compare", False)) and step >= 200 and (step % 200 == 0):
+                if act_vol is not None and act_vol.numel() > 0:
+                    if pred_path_step is None:
+                        pred_path_step = outdir / f"activity_pred_step_{step:05d}.npy"
+                        pred_vol_step = export_activity_volume(
+                            generator,
+                            z_latent.detach(),
+                            pred_path_step,
+                            args.export_vol_res,
+                            device,
+                        )
+                    out_path = (outdir / "preview") / f"{step}_act_compare_axial.png"
+                    save_final_act_compare_volume_slicing(
+                        args,
+                        act_vol,
+                        outdir,
+                        pred_path_step,
+                        pred_vol_step,
+                        out_path_override=out_path,
+                    )
     
-        proj_metrics_enabled_final = not (args.act_only or (args.hybrid and args.proj_loss_weight <= 0.0))
+        proj_metrics_enabled_final = proj_loss_active and not (
+            args.act_only or (args.hybrid and args.proj_loss_weight <= 0.0)
+        )
         if proj_metrics_enabled_final:
             prev_flag = generator.use_test_kwargs
             generator.eval()
@@ -5193,12 +5733,16 @@ def train():
                 and (pa_counts.numel() > 0)
             )
             if proj_loss_type == "poisson":
-                lambda_ap_used = compute_poisson_rate(proj_ap, args.poisson_rate_mode, eps=1e-6)
-                lambda_pa_used = compute_poisson_rate(proj_pa, args.poisson_rate_mode, eps=1e-6)
+                if proj_loss_active:
+                    lambda_ap_used = compute_poisson_rate(proj_ap, args.poisson_rate_mode, eps=1e-6)
+                    lambda_pa_used = compute_poisson_rate(proj_pa, args.poisson_rate_mode, eps=1e-6)
+                else:
+                    lambda_ap_used = proj_ap
+                    lambda_pa_used = proj_pa
             else:
                 lambda_ap_used = proj_ap
                 lambda_pa_used = proj_pa
-            if use_counts_final:
+            if use_counts_final and proj_loss_active:
                 lambda_ap_used = lambda_ap_used * float(pred_to_counts_scale)
                 lambda_pa_used = lambda_pa_used * float(pred_to_counts_scale)
                 gain_val_final = None

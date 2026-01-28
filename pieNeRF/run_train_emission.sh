@@ -39,30 +39,26 @@ srun ${PYTHON_BIN} -u train_emission.py \
   --max-steps 800 \
   --save-every 200 \
   \
-  --proj-target-source counts \
   --proj-loss-type poisson \
-  --poisson-rate-mode identity \
-  --proj-loss-weight 0.02 \
-  --proj-weight-min 0.0 \
-  --proj-warmup-steps 100 \
-  --proj-ramp-steps 400 \
+  --proj-loss-weight 0.01 \
+  --proj-warmup-steps 400 \
+  --proj-ramp-steps 300 \
+  --proj-target-source counts \
   \
-  --gain-clamp-min 0.98 \
-  --gain-clamp-max 1.02 \
-  --gain-reg-weight 5e-2 \
-  \
-  --act-loss-weight 2e-1 \
-  --act-pos-weight 2.0 \
-  \
+  --act-loss-weight 0.2 \
   --ct-loss-weight 5e-5 \
   \
-  --debug-sanity-checks \
-  --debug-sanity-every 1 \
+  --poisson-rate-mode identity \
+  --poisson-rate-floor 0.05 \
+  --poisson-rate-floor-mode softplus_hinge \
+  --lambda-ray-tv-weight 1e-3 \
   \
   --final-act-compare \
   --final-act-compare-axial \
   --final-act-compare-axis2-idx 65 260 325 \
-  --final-act-compare-scale separate || exit_code=$?
+  --final-act-compare-scale separate \
+  \
+  --debug-sanity-checks || exit_code=$?
 echo "python_exit=$exit_code"
 if [ $exit_code -ne 0 ]; then
   echo "[ERROR] Training failed with exit_code=$exit_code"
