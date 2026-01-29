@@ -1,18 +1,14 @@
 """Mini-training script for the SPECT emission NeRF."""
 import argparse
 import csv
-import json
 import math
 import logging
-import re
 import signal
 import subprocess
-import sys
 import time
 import traceback
 from pathlib import Path
 from typing import Optional, Tuple, Dict
-from collections import Counter
 
 import numpy as np
 import torch
@@ -20,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import yaml
 
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 
 from graf.config import get_data, build_models
 from graf.encoders import ProjectionEncoder
@@ -188,11 +184,6 @@ def parse_args():
         type=int,
         default=100,
         help="Intervall in Steps fuer Sanity-Checks (nur bei --debug-sanity-checks).",
-    )
-    parser.add_argument(
-        "--no-final-test",
-        action="store_true",
-        help="Disable the final test evaluation after training.",
     )
     parser.add_argument(
         "--weight-threshold",
@@ -399,7 +390,7 @@ def parse_args():
         "--z-enc-alpha",
         type=float,
         default=0.1,
-        help="Skalierung fuer z_enc im Hybrid-Conditioning (z_latent = alpha * z_enc_proj ohne trainables z).",
+        help="Skalierung fuer z_enc im Hybrid-Conditioning (z_latent = z_train + alpha * z_enc_proj).",
     )
     parser.add_argument(
         "--smoke-test",
@@ -439,6 +430,12 @@ def parse_args():
         "--debug-act",
         action="store_true",
         help="Einmalige Debug-Logs für ACT-Targets/Normierung/Pred/Grad (Step 1).",
+    )
+    parser.add_argument(
+        "--z-reg-weight",
+        type=float,
+        default=0.0,
+        help="L2-Regularisierung auf dem latenten Code z.",
     )
     parser.add_argument(
         "--ct-loss-weight",
@@ -621,77 +618,6 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-def _extract_patient_id_from_batch(batch) -> Optional[str]:
-    """Versucht patient_id aus einem DataLoader-Batch zu lesen (ohne Annahmen zu erzwingen)."""
-    if not isinstance(batch, dict):
-        return None
-    meta = batch.get("meta")
-    if isinstance(meta, dict):
-        pid = meta.get("patient_id")
-        if torch.is_tensor(pid):
-            if pid.numel() == 0:
-                return None
-            return str(pid.view(-1)[0].item())
-        if isinstance(pid, (list, tuple)):
-            return str(pid[0]) if pid else None
-        return str(pid) if pid is not None else None
-    if isinstance(meta, (list, tuple)) and meta:
-        first = meta[0]
-        if isinstance(first, dict):
-            pid = first.get("patient_id")
-            return str(pid) if pid is not None else None
-    return None
-
-
-def _slugify_patient_id(patient_id: Optional[str]) -> str:
-    if patient_id is None:
-        return "unknown"
-    slug = re.sub(r"[^\w.-]+", "_", patient_id.strip())
-    return slug or "unknown"
-
-
-def print_dataset_summary(dataset, max_print: int = 20):
-    """Gibt eine kompakte Zusammenfassung der Dataset-Struktur aus (ohne Bild/Volumen-Loading)."""
-    if dataset is None:
-        print("[debug][dataset] dataset=None; skip summary.", flush=True)
-        return
-    n = len(dataset)
-    patient_ids = []
-    if hasattr(dataset, "get_patient_id"):
-        for idx in range(n):
-            pid = dataset.get_patient_id(idx)
-            if pid is not None:
-                patient_ids.append(pid)
-    elif hasattr(dataset, "entries"):
-        for e in getattr(dataset, "entries", []):
-            pid = e.get("patient_id") if isinstance(e, dict) else None
-            if pid is not None:
-                patient_ids.append(pid)
-    else:
-        print("[debug][dataset] No lightweight patient_id accessor found.", flush=True)
-        return
-
-    counts = Counter(patient_ids)
-    n_unique = len(counts)
-    count_vals = list(counts.values())
-    if count_vals:
-        min_c = int(np.min(count_vals))
-        med_c = float(np.median(count_vals))
-        max_c = int(np.max(count_vals))
-    else:
-        min_c = med_c = max_c = float("nan")
-    print(
-        f"[debug][dataset] #samples={n} | #unique patient_id={n_unique} | "
-        f"samples/patient min/median/max={min_c}/{med_c}/{max_c}",
-        flush=True,
-    )
-    if counts:
-        top_k = min(10, len(counts))
-        top = counts.most_common(top_k)
-        top_str = ", ".join([f"{pid}:{cnt}" for pid, cnt in top[:max_print]])
-        print(f"[debug][dataset] top patient_id (count): {top_str}", flush=True)
-
-
 def save_img(arr, path, title=None):
     """Robust PNG visualisation with optional logarithmic stretch."""
     import matplotlib.pyplot as plt
@@ -802,90 +728,6 @@ def export_activity_volume(generator, z_latent, out_path: Path, res: int, device
     np.save(out_path, vol)
     return vol
 
-
-def _radius_to_float(radius):
-    if radius is None:
-        return None
-    if isinstance(radius, (tuple, list)):
-        if not radius:
-            return None
-        radius = radius[-1]
-    return float(radius)
-
-
-def save_test_volume_slices(
-    args,
-    generator,
-    z_latent,
-    test_loader,
-    outdir: Path,
-    device: torch.device,
-    max_patients: int = 2,
-    slice_percents=(0.1, 0.5, 0.9),
-):
-    if test_loader is None or len(test_loader.dataset) == 0:
-        return
-    slice_root = outdir / "test_slices"
-    slice_root.mkdir(parents=True, exist_ok=True)
-    seen_ids: set[str] = set()
-    saved_info: list[dict] = []
-    prev_use_test = generator.use_test_kwargs
-    generator.eval()
-    patient_iter = iter(test_loader)
-    try:
-        while len(seen_ids) < max_patients:
-            batch = next(patient_iter)
-            patient_id = _extract_patient_id_from_batch(batch) or f"patient_{len(seen_ids)+1}"
-            if patient_id in seen_ids:
-                continue
-            seen_ids.add(patient_id)
-            patient_dir = slice_root / patient_id
-            patient_dir.mkdir(parents=True, exist_ok=True)
-            pred_path = patient_dir / "activity_pred.npy"
-            pred_vol = export_activity_volume(generator, z_latent, pred_path, args.export_vol_res, device)
-            pred_vol = np.asarray(pred_vol, dtype=np.float32)
-            act_tensor = batch.get("act")
-            gt_vol = None
-            act_vol_plot = None
-            if isinstance(act_tensor, torch.Tensor) and act_tensor.numel() > 0:
-                act_nd = act_tensor.detach()
-                if act_nd.dim() == 4:
-                    act_nd = act_nd.squeeze(0)
-                if act_nd.ndim == 3:
-                    gt_vol = act_nd.cpu().numpy().astype(np.float32)
-                    act_vol_plot = act_nd
-            final_filename = patient_dir / f"final_{patient_id}_act_compare_axial.png"
-            save_final_act_compare_volume_slicing(
-                args,
-                act_vol_plot,
-                patient_dir,
-                pred_path,
-                pred_vol_np=pred_vol,
-                out_path_override=final_filename,
-                grid_radius=_radius_to_float(generator.radius),
-            )
-            saved_info.append(
-                {
-                    "patient_id": patient_id,
-                    "files": [str(final_filename)],
-                    "gt_included": act_vol_plot is not None,
-                }
-            )
-    except StopIteration:
-        pass
-    finally:
-        if prev_use_test:
-            generator.eval()
-        else:
-            generator.train()
-    if not saved_info:
-        return
-    meta_path = slice_root / "slices_meta.json"
-    meta_path.write_text(json.dumps(saved_info, indent=2))
-    print(
-        f"[test][slices] saved {len(saved_info)} patient(s) slices under {slice_root.resolve()}",
-        flush=True,
-    )
 
 def poisson_nll(
     pred: torch.Tensor,
@@ -1492,7 +1334,7 @@ def log_effective_config(outdir: Path, config: dict, args):
         f"| act_loss_weight={args.act_loss_weight} | act_samples={args.act_samples} "
         f"| act_pos_weight={args.act_pos_weight} | act_pos_fraction={args.act_pos_fraction} "
         f"| act_pos_threshold={args.act_pos_threshold} "
-        f"| ct_loss_weight={args.ct_loss_weight} | ct_threshold={args.ct_threshold} "
+        f"| ct_loss_weight={args.ct_loss_weight} | ct_threshold={args.ct_threshold} | z_reg_weight={args.z_reg_weight} "
         f"| ray_tv_weight={args.ray_tv_weight} | ray_tv_edge_aware={args.ray_tv_edge_aware} | ray_tv_alpha={args.ray_tv_alpha} "
         f"| ray_tv_w_clamp_min={args.ray_tv_w_clamp_min} | lambda_ray_tv_weight={args.lambda_ray_tv_weight} "
         f"| ct_padding_mode={args.ct_padding_mode} "
@@ -1696,6 +1538,7 @@ def init_log_file(path: Path) -> Path:
         "bg_depth_mass_w",
         "bg_depth_frac",
         "loss_tv",
+        "zreg",
         "mae_ap",
         "mae_pa",
         "psnr_ap",
@@ -1823,6 +1666,7 @@ def init_hybrid_log_file(path: Path):
                 "grad_norm_global",
                 "grad_norm_gen",
                 "clip_event",
+                "z_train_l2",
                 "z_enc_l2",
                 "z_latent_l2",
             ]
@@ -1835,11 +1679,12 @@ def append_hybrid_log(path: Path, row):
         writer.writerow(row)
 
 
-def save_checkpoint(step, generator, optimizer, scaler, ckpt_dir: Path, encoder=None, z_fuser=None, gain_head=None, gain_param=None):
+def save_checkpoint(step, generator, z_train, optimizer, scaler, ckpt_dir: Path, encoder=None, z_fuser=None, gain_head=None, gain_param=None):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     # Minimal-Checkpoint: coarse/fine Netze, Optimizer, AMP-Scaler
     state = {
         "step": step,
+        "z_train": z_train.detach().cpu(),
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict(),
         "generator_coarse": generator.render_kwargs_train["network_fn"].state_dict(),
@@ -3085,7 +2930,6 @@ def save_final_act_compare_volume_slicing(
     pred_path: Path,
     pred_vol_np: Optional[np.ndarray] = None,
     out_path_override: Optional[Path] = None,
-    grid_radius: Optional[float] = None,
 ):
     """Finale GT-vs-Pred Activity-Compare PNG via reinem Volumen-Slicing (wie in test.py)."""
     if not bool(getattr(args, "final_act_compare", False)):
@@ -3137,57 +2981,11 @@ def save_final_act_compare_volume_slicing(
             flush=True,
         )
         return
-    gt_raw_shape = tuple(int(x) for x in gt_np.shape)
-    pred_shape = tuple(int(x) for x in pred_np.shape)
 
-    def _volume_stats(arr: np.ndarray) -> Tuple[float, float, float]:
-        finite = np.isfinite(arr)
-        if finite.any():
-            vals = arr[finite].astype(np.float32, copy=False).ravel()
-            if vals.size:
-                return float(vals.min()), float(vals.mean()), float(vals.max())
-        return float("nan"), float("nan"), float("nan")
-
-    def _spacing_for_dim(dim: int) -> float:
-        if grid_radius is None or dim <= 1:
-            return float("nan")
-        return (2.0 * float(grid_radius)) / float(dim - 1)
-
-    def _resample_gt_to_pred(gt_arr: np.ndarray, target_shape: Tuple[int, int, int]) -> np.ndarray:
-        if gt_arr.shape == target_shape:
-            return gt_arr.astype(np.float32, copy=True)
-        tensor = torch.from_numpy(gt_arr.astype(np.float32)).unsqueeze(0).unsqueeze(0)
-        with torch.no_grad():
-            resampled = F.interpolate(tensor, size=target_shape, mode="trilinear", align_corners=False)
-        return resampled.squeeze(0).squeeze(0).cpu().numpy().astype(np.float32, copy=False)
-
-    gt_np = _resample_gt_to_pred(gt_np, pred_shape)
     gt_shape = tuple(int(x) for x in gt_np.shape)
-    gt_spacing_raw = tuple(_spacing_for_dim(dim) for dim in gt_raw_shape)
-    gt_spacing_resampled = tuple(_spacing_for_dim(dim) for dim in gt_shape)
-    pred_spacing = tuple(_spacing_for_dim(dim) for dim in pred_shape)
-
+    pred_shape = tuple(int(x) for x in pred_np.shape)
     print(
-        "[final-act-compare][debug] "
-        f"GT raw shape={gt_raw_shape} (D,H,W) -> resampled shape={gt_shape}; Pred shape={pred_shape}; "
-        "axis meaning: axial depth=axis2 (z-axis).",
-        flush=True,
-    )
-    if grid_radius is not None:
-        print(
-            "[final-act-compare][debug] "
-            f"World extent assumed [-{grid_radius:.3f},+{grid_radius:.3f}] along each axis; "
-            f"voxel spacings (GT raw/resampled/Pred)={gt_spacing_raw}/{gt_spacing_resampled}/{pred_spacing}.",
-            flush=True,
-        )
-    else:
-        print(
-            "[final-act-compare][debug] World extent unknown; assuming uniform voxels aligned via idx scaling.",
-            flush=True,
-        )
-    print(
-        "[final-act-compare][debug] Resampling direction: GT -> Pred grid (trilinear, align_corners=False); "
-        f"Resampled stats: min/mean/max={_volume_stats(gt_np)}; Pred stats: min/mean/max={_volume_stats(pred_np)}.",
+        f"[final-act-compare] GT shape={gt_shape} | Pred shape={pred_shape} | mode=axial",
         flush=True,
     )
 
@@ -3224,7 +3022,6 @@ def save_final_act_compare_volume_slicing(
 
     A, B, C = gt_shape
     R = int(pred_shape[0])
-    _, _, C_gt_raw = gt_raw_shape
     z_list_raw = list(getattr(args, "final_act_compare_axis2_idx", [65, 260, 325]))
 
     def _map_axis2_idx(z_gt: int, C_gt: int, R_pred: int) -> int:
@@ -3238,11 +3035,11 @@ def save_final_act_compare_volume_slicing(
     z_pairs: list[Tuple[int, int]] = []
     for z_gt in z_list_raw:
         z_i = int(z_gt)
-        if 0 <= z_i < C_gt_raw:
-            z_pairs.append((z_i, _map_axis2_idx(z_i, C_gt_raw, R)))
+        if 0 <= z_i < C:
+            z_pairs.append((z_i, _map_axis2_idx(z_i, C, R)))
         else:
             print(
-                f"[final-act-compare][WARN] axis2 idx_gt={z_i} out of bounds fuer C_gt={C_gt_raw}; ignoriere.",
+                f"[final-act-compare][WARN] axis2 idx_gt={z_i} out of bounds fuer C_gt={C}; ignoriere.",
                 flush=True,
             )
     if not z_pairs:
@@ -3264,7 +3061,7 @@ def save_final_act_compare_volume_slicing(
     if scale_mode == "shared":
         vals_list = []
         for z_gt, z_pred in z_pairs:
-            gt_img = gt_np[:, :, z_pred]
+            gt_img = gt_np[:, :, z_gt]
             pr_img = pred_np[:, :, z_pred]
             gt_vals = gt_img[np.isfinite(gt_img)].ravel()
             pr_vals = pr_img[np.isfinite(pr_img)].ravel()
@@ -3290,7 +3087,7 @@ def save_final_act_compare_volume_slicing(
         ax_gt = axs[row, 0]
         ax_pr = axs[row, 1]
 
-        gt_img = gt_np[:, :, z_pred].astype(np.float32, copy=False)
+        gt_img = gt_np[:, :, z_gt].astype(np.float32, copy=False)
         pr_img = pred_np[:, :, z_pred].astype(np.float32, copy=False)
 
         gt_min, gt_mean, gt_max, gt_nz, gt_std = _slice_stats(gt_img)
@@ -3498,200 +3295,6 @@ def evaluate_pixel_subsets(
     return results
 
 
-def _prepare_val_batch_for_eval(batch, generator, device, args):
-    ap = batch["ap"].to(device, non_blocking=True).float()
-    pa = batch["pa"].to(device, non_blocking=True).float()
-    if (ap.shape[-2], ap.shape[-1]) != (generator.H, generator.W):
-        raise ValueError(
-            f"Val batch shape {tuple(ap.shape[-2:])} inconsistent with generator image size "
-            f"({generator.H}, {generator.W})."
-        )
-    meta = batch.get("meta")
-    meta_scale = _extract_meta_scalar(meta, "proj_scale_joint_p99")
-    if meta_scale is None or not math.isfinite(meta_scale):
-        scale_joint_used = 1.0
-    else:
-        scale_joint_used = float(meta_scale)
-
-    ap_counts = batch.get("ap_counts")
-    pa_counts = batch.get("pa_counts")
-    if ap_counts is not None and ap_counts.numel() > 0:
-        ap_counts = ap_counts.to(device, non_blocking=True).float()
-    else:
-        ap_counts = None
-    if pa_counts is not None and pa_counts.numel() > 0:
-        pa_counts = pa_counts.to(device, non_blocking=True).float()
-    else:
-        pa_counts = None
-
-    batch_size_val = ap.shape[0] if ap.dim() >= 3 else 1
-    if batch_size_val != 1:
-        raise ValueError("Val loader currently expects batch_size == 1.")
-
-    use_counts = (
-        (ap_counts is not None)
-        and (pa_counts is not None)
-        and ap_counts.numel() > 0
-        and pa_counts.numel() > 0
-    )
-    target_ap_full = ap_counts if use_counts else ap
-    target_pa_full = pa_counts if use_counts else pa
-    ap_flat_proc = target_ap_full.reshape(batch_size_val, -1)
-    pa_flat_proc = target_pa_full.reshape(batch_size_val, -1)
-
-    pred_to_counts_scale = scale_joint_used if use_counts else 1.0
-    pred_to_counts_override = float(args.pred_to_counts_scale_override)
-    if use_counts and pred_to_counts_override > 0:
-        pred_to_counts_scale = pred_to_counts_override
-    if use_counts:
-        scale_ap_used = 1.0
-        scale_pa_used = 1.0
-    else:
-        scale_ap_used = scale_joint_used
-        scale_pa_used = scale_joint_used
-
-    ct_vol = batch.get("ct")
-    if ct_vol is not None and ct_vol.numel() > 0:
-        ct_vol = ct_vol.to(device, non_blocking=True).float()
-    else:
-        ct_vol = None
-    ct_context = generator.build_ct_context(ct_vol, padding_mode=args.ct_padding_mode) if ct_vol is not None else None
-
-    return {
-        "ap_flat_proc": ap_flat_proc,
-        "pa_flat_proc": pa_flat_proc,
-        "scale_ap": scale_ap_used,
-        "scale_pa": scale_pa_used,
-        "pred_to_counts_scale": pred_to_counts_scale,
-        "ct_context": ct_context,
-    }
-
-
-def _aggregate_subset_metrics(metrics_list):
-    if not metrics_list:
-        return None
-
-    def _mean(values):
-        return float(np.mean(values)) if values else float("nan")
-
-    aggregated = {
-        "loss": _mean([m["loss"] for m in metrics_list]),
-        "loss_ap": _mean([m["loss_ap"] for m in metrics_list]),
-        "loss_pa": _mean([m["loss_pa"] for m in metrics_list]),
-        "psnr": _mean([m["psnr"] for m in metrics_list]),
-        "mae": _mean([m["mae"] for m in metrics_list]),
-        "pred_mean": (
-            _mean([m["pred_mean"][0] for m in metrics_list]),
-            _mean([m["pred_mean"][1] for m in metrics_list]),
-        ),
-        "target_mean": (
-            _mean([m["target_mean"][0] for m in metrics_list]),
-            _mean([m["target_mean"][1] for m in metrics_list]),
-        ),
-        "view": {
-            "ap": {
-                "loss": _mean([m["view"]["ap"]["loss"] for m in metrics_list]),
-                "psnr": _mean([m["view"]["ap"]["psnr"] for m in metrics_list]),
-                "mae": _mean([m["view"]["ap"]["mae"] for m in metrics_list]),
-            },
-            "pa": {
-                "loss": _mean([m["view"]["pa"]["loss"] for m in metrics_list]),
-                "psnr": _mean([m["view"]["pa"]["psnr"] for m in metrics_list]),
-                "mae": _mean([m["view"]["pa"]["mae"] for m in metrics_list]),
-            },
-        },
-    }
-
-    phys_list = [m.get("phys") for m in metrics_list if m.get("phys") is not None]
-    if phys_list:
-        aggregated["phys"] = {
-            "psnr": _mean([p["psnr"] for p in phys_list]),
-            "mae": _mean([p["mae"] for p in phys_list]),
-            "view": {
-                "ap": {
-                    "psnr": _mean([p["view"]["ap"]["psnr"] for p in phys_list]),
-                    "mae": _mean([p["view"]["ap"]["mae"] for p in phys_list]),
-                },
-                "pa": {
-                    "psnr": _mean([p["view"]["pa"]["psnr"] for p in phys_list]),
-                    "mae": _mean([p["view"]["pa"]["mae"] for p in phys_list]),
-                },
-            },
-        }
-    else:
-        aggregated["phys"] = None
-
-    return aggregated
-
-
-def _format_val_metrics_keys(keys):
-    return sorted(k.replace("test_", "val_", 1) if k.startswith("test_") else k for k in keys)
-
-
-def evaluate_val_loader(
-    val_loader,
-    generator,
-    z_latent,
-    rays_cache,
-    subsets,
-    device,
-    args,
-    loss_fn,
-    proj_loss_active,
-    rays_per_eval,
-    bg_weight,
-    weight_threshold,
-    pa_xflip,
-    W,
-    gain,
-    log_proj_metrics_physical,
-):
-    if val_loader is None or len(val_loader.dataset) == 0:
-        print("[eval][warn] val_loader empty; skipping evaluation.", flush=True)
-        return None
-
-    proj_counts_active = bool(getattr(args, "hybrid", False)) and (args.proj_target_source == "counts")
-    val_metrics = []
-    for batch in val_loader:
-        prepared = _prepare_val_batch_for_eval(batch, generator, device, args)
-        batch_stats = evaluate_pixel_subsets(
-            generator,
-            z_latent,
-            rays_cache,
-            subsets,
-            prepared["ap_flat_proc"],
-            prepared["pa_flat_proc"],
-            rays_per_eval,
-            bg_weight,
-            weight_threshold,
-            pa_xflip,
-            ct_context=prepared["ct_context"],
-            W=W,
-            scale_ap=prepared["scale_ap"] if log_proj_metrics_physical else None,
-            scale_pa=prepared["scale_pa"] if log_proj_metrics_physical else None,
-            loss_fn=loss_fn,
-            poisson_rate_mode=args.poisson_rate_mode,
-            poisson_rate_floor=args.poisson_rate_floor,
-            poisson_rate_floor_mode=args.poisson_rate_floor_mode,
-            proj_loss_active=proj_loss_active,
-            pred_scale=prepared["pred_to_counts_scale"] if proj_counts_active else 1.0,
-            gain=gain,
-        )
-        val_metrics.append(batch_stats)
-
-    if not val_metrics:
-        print("[eval][warn] val_loader produced no batches; skipping evaluation.", flush=True)
-        return None
-
-    aggregated = {}
-    subset_names = set().union(*(m.keys() for m in val_metrics if m is not None))
-    for subset in subset_names:
-        subset_list = [m.get(subset) for m in val_metrics if m is not None and m.get(subset) is not None]
-        aggregated[subset] = _aggregate_subset_metrics(subset_list)
-
-    return aggregated
-
-
 def sample_act_points(
     act: torch.Tensor, nsamples: int, radius: float, pos_fraction: float = 0.5, pos_threshold: float = 1e-8
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -3854,7 +3457,6 @@ def train():
     data_cfg.setdefault("act_scale", 1.0)
     data_cfg["debug_proj_stats"] = bool(args.debug_proj_stats)
     data_cfg["ray_split_ratio"] = float(args.ray_split)
-    debug_dataset_summary = bool(data_cfg.get("debug_dataset_summary", False))
     training_cfg = config.setdefault("training", {})
     training_cfg.setdefault("val_interval", 0)
     training_cfg.setdefault("tv_weight", 0.001)
@@ -3875,19 +3477,10 @@ def train():
     training_cfg["bg_depth_eps"] = float(args.bg_depth_eps)
     training_cfg.setdefault("bg_depth_mode", "integral")
     training_cfg["bg_depth_mode"] = str(args.bg_depth_mode)
-    training_cfg.setdefault("run_final_test", True)
-    training_cfg.setdefault("debug_eval_flow", False)
     training_cfg.setdefault("act_samples", 16384)
     training_cfg.setdefault("act_pos_weight", 2.0)
     training_cfg.setdefault("act_pos_fraction", 0.5)
     training_cfg.setdefault("act_pos_threshold", 1e-8)
-    training_cfg.setdefault("act_loss_weight", args.act_loss_weight)
-    cli_act_loss_flag = "--act-loss-weight" in sys.argv
-    if cli_act_loss_flag:
-        training_cfg["act_loss_weight"] = float(args.act_loss_weight)
-    else:
-        args.act_loss_weight = float(training_cfg.get("act_loss_weight", args.act_loss_weight))
-        training_cfg["act_loss_weight"] = args.act_loss_weight
     if args.act_samples is None:
         args.act_samples = int(training_cfg.get("act_samples", 16384))
     else:
@@ -3910,6 +3503,8 @@ def train():
     training_cfg["ct_loss_weight"] = args.ct_loss_weight
     training_cfg["ct_threshold"] = args.ct_threshold
     training_cfg["ct_samples"] = args.ct_samples
+    training_cfg.setdefault("z_reg_weight", 0.0)
+    training_cfg["z_reg_weight"] = args.z_reg_weight
     if hybrid_enabled and args.act_loss_weight <= 0.0:
         print("[WARN] Hybrid aktiv, aber --act-loss-weight <= 0: ACT-Hauptloss ist deaktiviert.", flush=True)
     if hybrid_enabled and "ct_prefer_raw" not in data_cfg:
@@ -3920,7 +3515,6 @@ def train():
     (outdir / "preview").mkdir(parents=True, exist_ok=True)
     print(f"🗂️ Output-Ordner: {outdir}", flush=True)
     log_effective_config(outdir, config, args)
-    print(f"[cfg][check] training.act_loss_weight={args.act_loss_weight}", flush=True)
     ckpt_dir = outdir / "checkpoints"
     log_path = outdir / "train_log.csv"
     log_path = init_log_file(log_path)
@@ -3940,94 +3534,20 @@ def train():
             raise
     config["data"]["hwfr"] = hwfr
 
-    if debug_dataset_summary and dataset is not None:
-        print_dataset_summary(dataset, max_print=20)
-
     batch_size = config["training"]["batch_size"]
     if batch_size != 1:
         raise ValueError("This mini-training script currently assumes batch_size == 1.")
 
-    train_loader = None
-    val_loader = None
-    test_loader = None
-    loader_kwargs = dict(
-        batch_size=batch_size,
-        num_workers=config["training"]["nworkers"],
-        pin_memory=True,
-        drop_last=False,
-    )
-
-    split_flag = bool(data_cfg.get("split_by_patient_id", False))
-    dataset_split_stats = None
+    dataloader = None
     if dataset is not None:
-        if split_flag:
-            split_seed = int(data_cfg.get("split_seed", 0))
-            split_train = float(data_cfg.get("split_train", 0.8))
-            split_val = float(data_cfg.get("split_val", 0.1))
-            split_test = float(data_cfg.get("split_test", 0.1))
-            split_mode = str(data_cfg.get("split_mode", "ratios")).lower()
-            split_train_count = int(data_cfg.get("split_train_count", -1))
-            split_val_count = int(data_cfg.get("split_val_count", -1))
-            split_test_count = int(data_cfg.get("split_test_count", -1))
-            (
-                train_subset,
-                val_subset,
-                test_subset,
-                split_stats,
-            ) = split_by_patient_id(
-                dataset,
-                seed=split_seed,
-                split_mode=split_mode,
-                train_ratio=split_train,
-                val_ratio=split_val,
-                test_ratio=split_test,
-                train_count=split_train_count,
-                val_count=split_val_count,
-                test_count=split_test_count,
-            )
-            print("[debug][dataset] split stats:", flush=True)
-            for key, val in split_stats.items():
-                print(f"   {key} = {val}", flush=True)
-            dataset_split_stats = split_stats
-            split_info = {
-                "seed": split_seed,
-                "mode": split_mode,
-                "train_ids": split_stats.get("patient_ids_train_full", []),
-                "val_ids": split_stats.get("patient_ids_val_full", []),
-                "test_ids": split_stats.get("patient_ids_test_full", []),
-                "n_samples_train": split_stats.get("n_samples_train"),
-                "n_samples_val": split_stats.get("n_samples_val"),
-                "n_samples_test": split_stats.get("n_samples_test"),
-                "n_patients_train": split_stats.get("n_patients_train"),
-                "n_patients_val": split_stats.get("n_patients_val"),
-                "n_patients_test": split_stats.get("n_patients_test"),
-            }
-            split_path = outdir / "split.json"
-            split_path.write_text(json.dumps(split_info, indent=2))
-
-            train_loader = DataLoader(
-                train_subset,
-                shuffle=True,
-                **loader_kwargs,
-            )
-            if len(val_subset) > 0:
-                val_loader = DataLoader(
-                    val_subset,
-                    shuffle=False,
-                    **loader_kwargs,
-                )
-            if len(test_subset) > 0:
-                test_loader = DataLoader(
-                    test_subset,
-                    shuffle=False,
-                    **loader_kwargs,
-                )
-        else:
-            train_loader = DataLoader(
-                dataset,
-                shuffle=True,
-                **loader_kwargs,
-            )
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=config["training"]["nworkers"],
+            pin_memory=True,
+            drop_last=False,
+        )
 
     act_global_scale = float(data_cfg.get("act_scale", 1.0))
     if act_global_scale != 1.0:
@@ -4045,20 +3565,6 @@ def train():
     ray_train_fg_frac = float(np.clip(args.ray_train_fg_frac, 0.0, 1.0))
     log_proj_metrics_physical = bool(args.log_proj_metrics_physical)
     val_interval = int(training_cfg.get("val_interval", 0) or 0)
-    debug_eval_flow = bool(training_cfg.get("debug_eval_flow", False))
-    n_val_batches_cfg = "NA"
-    if val_loader is not None and hasattr(val_loader, "__len__"):
-        try:
-            n_val_batches_cfg = len(val_loader)
-        except Exception:
-            n_val_batches_cfg = "NA"
-    run_final_test = bool(training_cfg.get("run_final_test", True)) and (not args.no_final_test)
-    print(
-        f"[cfg][training] val_interval={val_interval} no_val={args.no_val} max_steps={args.max_steps} "
-        f"split_by_patient_id={split_flag} n_val_batches={n_val_batches_cfg} "
-        f"run_final_test={run_final_test} debug_eval_flow={debug_eval_flow}",
-        flush=True,
-    )
     tv_weight = float(training_cfg.get("tv_weight", 0.0))
     ray_tv_weight = float(training_cfg.get("ray_tv_weight", 0.0))
     lambda_ray_tv_weight = float(training_cfg.get("lambda_ray_tv_weight", 0.0))
@@ -4113,7 +3619,8 @@ def train():
     generator.set_fixed_ap_pa(radius=hwfr[3])
 
     z_dim = config["z_dist"]["dim"]
-    z_latent_base = torch.zeros(1, z_dim, device=device)
+    z_train = torch.nn.Parameter(torch.zeros(1, z_dim, device=device))
+    torch.nn.init.normal_(z_train, mean=0.0, std=1.0)
     encoder = None
     z_fuser = None
     z_enc_alpha = float(args.z_enc_alpha)
@@ -4139,7 +3646,7 @@ def train():
     with torch.no_grad():
         generator.eval()
         generator.use_test_kwargs = True
-        z_smoke = z_latent_base
+        z_smoke = z_train.detach()
         proj_ap, _, _, _ = generator.render_from_pose(z_smoke, generator.pose_ap)
         proj_pa, _, _, _ = generator.render_from_pose(z_smoke, generator.pose_pa)
         generator.train()
@@ -4317,7 +3824,7 @@ def train():
         raise ValueError("rays-per-step must be > 0.")
     rays_per_proj = min(rays_per_proj, num_pixels)
 
-    opt_params = list(generator.parameters())
+    opt_params = list(generator.parameters()) + [z_train]
     if hybrid_enabled and encoder is not None:
         opt_params += list(encoder.parameters())
     if hybrid_enabled and z_fuser is not None:
@@ -4351,11 +3858,11 @@ def train():
 
     if args.smoke_test:
         batch = None
-        if train_loader is not None:
+        if dataloader is not None:
             try:
-                batch = next(iter(train_loader))
+                batch = next(iter(dataloader))
             except Exception as exc:
-                print(f"[smoke-test] train_loader failed ({exc.__class__.__name__}); using synthetic batch.", flush=True)
+                print(f"[smoke-test] dataloader failed ({exc.__class__.__name__}); using synthetic batch.", flush=True)
         if batch is None:
             batch = build_synthetic_batch(generator.H, generator.W, device=device)
             ap = batch["ap"]
@@ -4420,7 +3927,7 @@ def train():
                 flush=True,
             )
 
-            z_base = z_latent_base
+        z_base = z_train
         if z_base.shape[0] != ap.shape[0]:
             z_base = z_base.expand(ap.shape[0], -1)
         z_enc = None
@@ -4577,7 +4084,7 @@ def train():
         )
         return
 
-    data_iter = iter(train_loader) if train_loader is not None else iter([])
+    data_iter = iter(dataloader)
     ct_context = None
     max_steps_cfg = None
     if isinstance(training_cfg, dict):
@@ -4619,16 +4126,13 @@ def train():
     scale_missing_warned = False
     counts_missing_warned = False
     act_norm_global = None
-    last_z_latent = z_latent_base
+    last_z_latent = z_train
     last_gain_val = None
     gain_prior_ema = None
     gain_prior_final = None
     gain_prior_decay = 0.9
     gain_prior_steps = 50
     proj_collapse_count = 0
-
-    last_patient_id: Optional[str] = None
-    last_safe_patient_id: str = "unknown"
 
     print(
         f"[sanity] max_steps={max_steps} proj_warmup_steps={args.proj_warmup_steps} "
@@ -4641,7 +4145,7 @@ def train():
             try:
                 batch = next(data_iter)
             except StopIteration:
-                data_iter = iter(train_loader)
+                data_iter = iter(dataloader)
                 batch = next(data_iter)
     
             ap = batch["ap"].to(device, non_blocking=True).float()
@@ -4658,23 +4162,6 @@ def train():
                     meta_scale = meta_scale.item() if meta_scale.numel() > 0 else None
                 if torch.is_tensor(meta_missing):
                     meta_missing = bool(meta_missing.item()) if meta_missing.numel() > 0 else False
-            current_patient_id = _extract_patient_id_from_batch(batch)
-            safe_patient_id = _slugify_patient_id(current_patient_id)
-            last_patient_id = current_patient_id
-            last_safe_patient_id = safe_patient_id
-            if debug_dataset_summary and step == 1:
-                meta_obj = batch.get("meta") if isinstance(batch, dict) else None
-                path_hint = None
-                if isinstance(meta_obj, dict) and "patient_id" in meta_obj:
-                    path_hint = "batch['meta']['patient_id']"
-                elif isinstance(meta_obj, (list, tuple)) and meta_obj and isinstance(meta_obj[0], dict) and "patient_id" in meta_obj[0]:
-                    path_hint = "batch['meta'][0]['patient_id']"
-                pid = current_patient_id
-                meta_type = type(meta_obj).__name__ if meta_obj is not None else "None"
-                print(
-                    f"[debug][dataset] batch meta type={meta_type} | patient_id={pid} | path_hint={path_hint}",
-                    flush=True,
-                )
             if meta_scale is None or (isinstance(meta_scale, float) and math.isnan(meta_scale)) or meta_missing:
                 scale_joint_used = 1.0
                 if not scale_missing_warned:
@@ -4796,7 +4283,7 @@ def train():
                     flush=True,
                 )
     
-            z_base = z_latent_base
+            z_base = z_train
             if z_base.shape[0] != ap.shape[0]:
                 z_base = z_base.expand(ap.shape[0], -1)
             z_enc = None
@@ -5434,6 +4921,11 @@ def train():
                         loss_ct = torch.mean(torch.abs(pred1 - pred2) * weights)
                         loss = loss + args.ct_loss_weight * loss_ct
     
+                loss_reg = torch.tensor(0.0, device=device)
+                if args.z_reg_weight > 0.0:
+                    loss_reg = z_train.pow(2).mean()
+                    loss = loss + args.z_reg_weight * loss_reg
+    
                 tv_base_loss = torch.tensor(0.0, device=device)
                 loss_tv = torch.tensor(0.0, device=device)
                 loss_ray_tv = torch.tensor(0.0, device=device)
@@ -5733,10 +5225,12 @@ def train():
                     "proj": grad_norm_of(proj_loss_for_grad, [z_latent]),
                     "act": grad_norm_of(args.act_loss_weight * loss_act, [z_latent]) if args.act_loss_weight > 0 else 0.0,
                     "ct": grad_norm_of(args.ct_loss_weight * loss_ct, [z_latent]) if args.ct_loss_weight > 0 else 0.0,
+                    "zreg": grad_norm_of(args.z_reg_weight * loss_reg, [z_latent]) if args.z_reg_weight > 0 else 0.0,
                 }
                 print(
                     f"[grad][step {step:05d}] ||g_proj||={grad_stats['proj']:.3e} "
-                    f"| ||g_act||={grad_stats['act']:.3e} | ||g_ct||={grad_stats['ct']:.3e}",
+                    f"| ||g_act||={grad_stats['act']:.3e} | ||g_ct||={grad_stats['ct']:.3e} "
+                    f"| ||g_zreg||={grad_stats['zreg']:.3e}",
                     flush=True,
                 )
     
@@ -5836,6 +5330,7 @@ def train():
                     )
                     gain_log_src = gain_val_used if gain_val_used is not None else gain_val
                     gain_log = float(gain_log_src.mean().item()) if gain_log_src is not None else float("nan")
+                    z_train_l2 = float(z_train.detach().norm().item())
                     z_enc_l2 = (
                         float(z_enc_proj.detach().norm(dim=1).mean().item()) if z_enc_proj is not None else float("nan")
                     )
@@ -5926,30 +5421,18 @@ def train():
                             grad_norm_global,
                             float(grad_norm_gen),
                             int(clip_event),
+                            z_train_l2,
                             z_enc_l2,
                             z_latent_l2,
                         ],
                     )
                 val_stats = None
-                should_run_val = (
-                    val_interval > 0
-                    and (step % val_interval) == 0
-                    and (not args.no_val)
-                    and proj_loss_active
-                )
-                def _should_log_val_skip(reason_str):
-                    if debug_eval_flow:
-                        return True
-                    if step == 1:
-                        return True
-                    if val_interval > 0:
-                        interval_reason = f"step%val_interval={step % val_interval}"
-                        if reason_str == interval_reason:
-                            return False
-                    return True
-
-                if should_run_val:
+                if val_interval > 0 and (step % val_interval) == 0 and (not args.no_val) and proj_loss_active:
                     rays_eval = None if ray_split_enabled else rays_per_proj
+                    # Testmetriken:
+                    # test_all  → gesamter Test-Split (dominiert von BG, kann “zu gut” aussehen)
+                    # test_fg   → nur Vordergrund-Rays, misst eigentliche Rekonstruktionsqualität
+                    # test_top10→ oberste 10% Test-Intensitäten, fokussiert auf stärkste Aktivität
                     subsets = {
                         "test_all": ray_indices["pixel"]["test_idx_all"],
                     }
@@ -5957,88 +5440,33 @@ def train():
                         subsets["test_fg"] = ray_indices["pixel"]["test_idx_fg"]
                         subsets["test_top10"] = ray_indices["pixel"]["test_idx_top10"]
                         subsets["test_bg"] = ray_indices["pixel"]["test_idx_bg"]
-                    gain_for_eval = None
-                    if hybrid_enabled and args.proj_target_source == "counts":
-                        gain_for_eval = gain_val_used if gain_val_used is not None else gain_val
-                        if val_loader is None or len(val_loader.dataset) == 0:
-                            skip_reason = "val_loader missing or empty"
-                            print("[eval][warn] val_loader missing or empty; skipping evaluation.", flush=True)
-                            if _should_log_val_skip(skip_reason):
-                                print(
-                                    f"[val][skip] reason={skip_reason} val_interval={val_interval} step={step} "
-                                    f"no_val={args.no_val} proj_loss_active={proj_loss_active}",
-                                    flush=True,
-                                )
-                                if debug_eval_flow:
-                                    print(
-                                        f"[val][done] step={step} metrics_keys=None (reason: {skip_reason})",
-                                        flush=True,
-                                    )
-                        else:
-                            n_val_batches = len(val_loader) if hasattr(val_loader, "__len__") else "?"
-                            if debug_eval_flow:
-                                print(
-                                    f"[val][enter] step={step} val_interval={val_interval}",
-                                    flush=True,
-                                )
-                                print(
-                                    f"[val][call] n_val_batches={n_val_batches}",
-                                    flush=True,
-                                )
-                            val_stats = evaluate_val_loader(
-                                val_loader,
-                                generator,
-                                z_latent.detach(),
-                                rays_cache,
-                                subsets,
-                                device,
-                                args,
-                                loss_fn,
-                                proj_loss_active,
-                                rays_eval,
-                                args.bg_weight,
-                                args.weight_threshold,
-                                pa_xflip,
-                                W,
-                                gain_for_eval,
-                                log_proj_metrics_physical,
-                            )
-                            if debug_eval_flow:
-                                if val_stats is None:
-                                    print(
-                                        f"[val][done] step={step} metrics_keys=None (reason: evaluate_val_loader returned None)",
-                                        flush=True,
-                                    )
-                                else:
-                                    metrics_keys = _format_val_metrics_keys(sorted(val_stats.keys()))
-                                    print(
-                                        f"[val][done] step={step} metrics_keys={metrics_keys}",
-                                        flush=True,
-                                    )
-                else:
-                    reason_parts = []
-                    if val_interval <= 0:
-                        reason_parts.append(f"val_interval={val_interval}<=0")
-                    if args.no_val:
-                        reason_parts.append("no_val=True")
-                    if not proj_loss_active:
-                        reason_parts.append("proj_loss_active=False")
-                    if val_interval > 0 and (step % val_interval) != 0:
-                        reason_parts.append(f"step%val_interval={step % val_interval}")
-                    if not reason_parts:
-                        reason_parts.append("unknown")
-                    reason_str = "; ".join(reason_parts)
-                    if _should_log_val_skip(reason_str):
-                        print(
-                            f"[val][skip] reason={reason_str} val_interval={val_interval} step={step} "
-                            f"no_val={args.no_val} proj_loss_active={proj_loss_active}",
-                            flush=True,
-                        )
-                        if debug_eval_flow:
-                            print(
-                                f"[val][done] step={step} metrics_keys=None (reason: {reason_str})",
-                                flush=True,
-                            )
+                    val_stats = evaluate_pixel_subsets(
+                        generator,
+                        z_latent.detach(),
+                        rays_cache,
+                        subsets=subsets,
+                        ap_flat_proc=ap_flat_proc,
+                        pa_flat_proc=pa_flat_proc,
+                        rays_per_eval=rays_eval,
+                        bg_weight=args.bg_weight,
+                        weight_threshold=args.weight_threshold,
+                        pa_xflip=pa_xflip,
+                        ct_context=ct_context,
+                        W=W,
+                        scale_ap=scale_ap_used if log_proj_metrics_physical else None,
+                        scale_pa=scale_pa_used if log_proj_metrics_physical else None,
+                        loss_fn=loss_fn,
+                        poisson_rate_mode=args.poisson_rate_mode,
+                        poisson_rate_floor=args.poisson_rate_floor,
+                        poisson_rate_floor_mode=args.poisson_rate_floor_mode,
+                        proj_loss_active=proj_loss_active,
+                        pred_scale=pred_to_counts_scale if (hybrid_enabled and args.proj_target_source == "counts") else 1.0,
+                        gain=(
+                            (gain_val_used if gain_val_used is not None else gain_val)
+                            if (hybrid_enabled and args.proj_target_source == "counts")
+                            else None
+                        ),
+                    )
             val_all = val_stats.get("test_all") if isinstance(val_stats, dict) else None
             val_fg = val_stats.get("test_fg") if isinstance(val_stats, dict) else None
             val_top10 = val_stats.get("test_top10") if isinstance(val_stats, dict) else None
@@ -6077,7 +5505,7 @@ def train():
                 f"| gain_reg={loss_gain.item():.6f} | ct={loss_ct.item():.6f} "
                 f"| ray_tv={loss_ray_tv.item():.6f} | ray_tv_w={loss_ray_tv_w.item():.6f} "
                 f"| bg_depth_mass={bg_depth_mass.item():.6f} | bg_depth_mass_w={bg_depth_mass_w.item():.6f} | bg_depth_frac={bg_depth_frac:.4f} "
-                f"| tv={loss_tv.item():.6f} "
+                f"| tv={loss_tv.item():.6f} | zreg={loss_reg.item():.6f} "
             )
             if proj_metrics_enabled:
                 msg += (
@@ -6105,36 +5533,36 @@ def train():
                     )
             if val_all is not None:
                 msg += (
-                    f" | val_all_loss={val_loss:.6f} | val_all_psnr={val_psnr:.2f} | val_all_mae={val_mae:.6f}"
+                    f" | test_all_loss={val_loss:.6f} | test_all_psnr={val_psnr:.2f} | test_all_mae={val_mae:.6f}"
                 )
             if val_fg is not None:
                 msg += (
-                    f" | val_fg_loss={val_loss_fg:.6f} | val_fg_psnr={val_psnr_fg:.2f} | val_fg_mae={val_mae_fg:.6f}"
+                    f" | test_fg_loss={val_loss_fg:.6f} | test_fg_psnr={val_psnr_fg:.2f} | test_fg_mae={val_mae_fg:.6f}"
                 )
             if val_top10 is not None:
                 msg += (
-                    f" | val_top10_loss={val_loss_top10:.6f} | val_top10_psnr={val_psnr_top10:.2f} "
-                    f"| val_top10_mae={val_mae_top10:.6f}"
+                    f" | test_top10_loss={val_loss_top10:.6f} | test_top10_psnr={val_psnr_top10:.2f} "
+                    f"| test_top10_mae={val_mae_top10:.6f}"
                 )
             if val_bg is not None:
                 msg += (
-                    f" | val_bg_loss={val_loss_bg:.6f} | val_bg_psnr={val_psnr_bg:.2f} | val_bg_mae={val_mae_bg:.6f}"
+                    f" | test_bg_loss={val_loss_bg:.6f} | test_bg_psnr={val_psnr_bg:.2f} | test_bg_mae={val_mae_bg:.6f}"
                 )
             if log_proj_metrics_physical and val_phys_all is not None:
                 msg += (
-                    f" | val_all_psnr_phys={val_phys_all['psnr']:.2f} | val_all_mae_phys={val_phys_all['mae']:.6f}"
+                    f" | test_all_psnr_phys={val_phys_all['psnr']:.2f} | test_all_mae_phys={val_phys_all['mae']:.6f}"
                 )
             if log_proj_metrics_physical and val_phys_fg is not None:
                 msg += (
-                    f" | val_fg_psnr_phys={val_phys_fg['psnr']:.2f} | val_fg_mae_phys={val_phys_fg['mae']:.6f}"
+                    f" | test_fg_psnr_phys={val_phys_fg['psnr']:.2f} | test_fg_mae_phys={val_phys_fg['mae']:.6f}"
                 )
             if log_proj_metrics_physical and val_phys_top10 is not None:
                 msg += (
-                    f" | val_top10_psnr_phys={val_phys_top10['psnr']:.2f} | val_top10_mae_phys={val_phys_top10['mae']:.6f}"
+                    f" | test_top10_psnr_phys={val_phys_top10['psnr']:.2f} | test_top10_mae_phys={val_phys_top10['mae']:.6f}"
                 )
             if log_proj_metrics_physical and val_phys_bg is not None:
                 msg += (
-                    f" | val_bg_psnr_phys={val_phys_bg['psnr']:.2f} | val_bg_mae_phys={val_phys_bg['mae']:.6f}"
+                    f" | test_bg_psnr_phys={val_phys_bg['psnr']:.2f} | test_bg_mae_phys={val_phys_bg['mae']:.6f}"
                 )
             if val_pred_mean_bg is not None and val_target_mean_bg is not None:
                 print(
@@ -6196,6 +5624,7 @@ def train():
                     bg_depth_mass_w.item(),
                     bg_depth_frac,
                     loss_tv.item(),
+                    loss_reg.item(),
                     mae_ap,
                     mae_pa,
                     psnr_ap,
@@ -6229,6 +5658,7 @@ def train():
                 save_checkpoint(
                     step,
                     generator,
+                    z_train,
                     optimizer,
                     scaler,
                     ckpt_dir,
@@ -6273,9 +5703,7 @@ def train():
                             args.export_vol_res,
                             device,
                         )
-                    preview_dir = outdir / "preview"
-                    step_label = f"step{step:06d}"
-                    out_path = preview_dir / f"{step_label}_{safe_patient_id}_act_compare_axial.png"
+                    out_path = (outdir / "preview") / f"{step}_act_compare_axial.png"
                     save_final_act_compare_volume_slicing(
                         args,
                         act_vol,
@@ -6283,7 +5711,6 @@ def train():
                         pred_path_step,
                         pred_vol_step,
                         out_path_override=out_path,
-                        grid_radius=_radius_to_float(generator.radius),
                     )
     
         proj_metrics_enabled_final = proj_loss_active and not (
@@ -6427,95 +5854,17 @@ def train():
             args.export_vol_res,
             device,
         )
-        final_label = f"final_step{last_step:06d}_{last_safe_patient_id}"
-        final_preview_dir = outdir / "preview"
-        final_out_path = final_preview_dir / f"{final_label}_act_compare_axial.png"
         save_final_act_compare_volume_slicing(
             args,
             act_vol,
             outdir,
             pred_path_final,
             pred_vol_final,
-            out_path_override=final_out_path,
-            grid_radius=_radius_to_float(generator.radius),
         )
-        final_test_stats = None
-        n_test_batches = 0
-        test_metadata = None
-        if run_final_test and test_loader is not None and len(test_loader.dataset) > 0:
-            try:
-                n_test_batches = len(test_loader)
-            except Exception:
-                n_test_batches = -1
-            test_subsets = {
-                "test_all": ray_indices["pixel"]["test_idx_all"],
-            }
-            if ray_split_enabled:
-                test_subsets["test_fg"] = ray_indices["pixel"]["test_idx_fg"]
-                test_subsets["test_top10"] = ray_indices["pixel"]["test_idx_top10"]
-                test_subsets["test_bg"] = ray_indices["pixel"]["test_idx_bg"]
-            rays_eval_test = None if ray_split_enabled else rays_per_proj
-            prev_use_test_kwargs = generator.use_test_kwargs
-            generator.eval()
-            with torch.no_grad():
-                final_test_stats = evaluate_val_loader(
-                    test_loader,
-                    generator,
-                    last_z_latent.detach(),
-                    rays_cache,
-                    test_subsets,
-                    device,
-                    args,
-                    loss_fn,
-                    True,
-                    rays_eval_test,
-                    args.bg_weight,
-                    args.weight_threshold,
-                    pa_xflip,
-                    W,
-                    None,
-                    log_proj_metrics_physical,
-                )
-            if prev_use_test_kwargs:
-                generator.eval()
-            else:
-                generator.train()
-            metrics_keys = sorted(final_test_stats.keys()) if final_test_stats else []
-            print(
-                f"[test][final] n_batches={n_test_batches} metrics_keys={metrics_keys}",
-                flush=True,
-            )
-            if final_test_stats is not None and final_test_stats.get("test_all") is not None:
-                test_all = final_test_stats.get("test_all")
-                print(
-                    f"[test][final][summary] test_all_loss={test_all['loss']:.6f} "
-                    f"test_all_psnr={test_all['psnr']:.2f} test_all_mae={test_all['mae']:.6f}",
-                    flush=True,
-                )
-            patient_ids = (
-                dataset_split_stats.get("patient_ids_test") if dataset_split_stats is not None else None
-            )
-            test_metadata = {
-                "n_test_batches": n_test_batches,
-                "metrics": final_test_stats,
-                "patient_ids": patient_ids,
-            }
-            test_metrics_path = outdir / "test_metrics.json"
-            test_metrics_path.write_text(json.dumps(test_metadata, indent=2))
-            save_test_volume_slices(
-                args,
-                generator,
-                last_z_latent.detach(),
-                test_loader,
-                outdir,
-                device,
-            )
-        else:
-            reason = "run_final_test disabled or no test_loader"
-            print(f"[test][final] skipped reason={reason}", flush=True)
         save_checkpoint(
             max_steps,
             generator,
+            z_train,
             optimizer,
             scaler,
             ckpt_dir,
@@ -6535,125 +5884,5 @@ def train():
         raise
     finally:
         print(f"[end] reached step={last_step} max_steps={max_steps} exit_reason={exit_reason}", flush=True)
-def split_by_patient_id(
-    dataset,
-    seed: int,
-    split_mode: str,
-    train_ratio: float,
-    val_ratio: float,
-    test_ratio: float,
-    train_count: int,
-    val_count: int,
-    test_count: int,
-):
-    """
-    Teilt dataset deterministic nach patient_id auf train/val/test auf.
-    Returns: (Subset, Subset, Subset, stats_dict)
-    """
-    if dataset is None:
-        raise ValueError("dataset darf nicht None sein.")
-    total_ratio = train_ratio + val_ratio + test_ratio
-    if total_ratio <= 0:
-        raise ValueError("Ratios müssen >0 sein.")
-    train_ratio = train_ratio / total_ratio
-    val_ratio = val_ratio / total_ratio
-    test_ratio = test_ratio / total_ratio
-
-    n_samples = len(dataset)
-    patient_ids = []
-    pid_to_indices = {}
-    for idx in range(n_samples):
-        pid = dataset.get_patient_id(idx) if hasattr(dataset, "get_patient_id") else None
-        if pid is None:
-            continue
-        patient_ids.append(pid)
-        pid_to_indices.setdefault(pid, []).append(idx)
-    patient_ids = sorted(set(patient_ids))
-    rng = np.random.default_rng(seed)
-    rng.shuffle(patient_ids)
-
-    split_mode = str(split_mode or "ratios").lower()
-
-    train_pids = []
-    val_pids = []
-    test_pids = []
-    if split_mode == "counts":
-        for count in (train_count, val_count, test_count):
-            if count is None or count < 0:
-                raise ValueError("Bei split_mode='counts' müssen alle split_*_count >= 0 gesetzt sein.")
-        total_counts = train_count + val_count + test_count
-        if total_counts != len(patient_ids):
-            raise ValueError(
-                f"split_mode='counts' erwartet sum(split_*_count)==#patienten ({len(patient_ids)}), "
-                f"bekommen {total_counts}."
-            )
-        offset = 0
-        train_pids = patient_ids[offset : offset + train_count]
-        offset += train_count
-        val_pids = patient_ids[offset : offset + val_count]
-        offset += val_count
-        test_pids = patient_ids[offset : offset + test_count]
-    else:
-        n_patients = len(patient_ids)
-        if n_patients == 0:
-            train_pids = val_pids = test_pids = []
-        else:
-            if train_ratio < 0 or val_ratio < 0 or test_ratio < 0:
-                raise ValueError("split ratios müssen >= 0 sein.")
-            total_ratio = train_ratio + val_ratio + test_ratio
-            if total_ratio == 0:
-                raise ValueError("split ratios dürfen nicht alle 0 sein.")
-            train_ratio_norm = train_ratio / total_ratio
-            val_ratio_norm = val_ratio / total_ratio
-            n_train = int(math.floor(train_ratio_norm * n_patients))
-            n_val = int(math.floor(val_ratio_norm * n_patients))
-            n_test = max(n_patients - n_train - n_val, 0)
-            train_pids = patient_ids[:n_train]
-            val_pids = patient_ids[n_train : n_train + n_val]
-            test_pids = patient_ids[n_train + n_val : n_train + n_val + n_test]
-
-    def _collect(indices_pids):
-        idxs = []
-        for pid in indices_pids:
-            idxs.extend(pid_to_indices.get(pid, []))
-        return idxs
-
-    train_indices = _collect(train_pids)
-    val_indices = _collect(val_pids)
-    test_indices = _collect(test_pids)
-
-    def _summary(pid_list):
-        if not pid_list:
-            return (0, 0.0, 0)
-        counts = [len(pid_to_indices[pid]) for pid in pid_list]
-        return (int(np.min(counts)), float(np.median(counts)), int(np.max(counts)))
-
-    stats = {
-        "n_samples_train": len(train_indices),
-        "n_samples_val": len(val_indices),
-        "n_samples_test": len(test_indices),
-        "n_patients_train": len(train_pids),
-        "n_patients_val": len(val_pids),
-        "n_patients_test": len(test_pids),
-        "patient_ids_train": train_pids if len(train_pids) <= 30 else None,
-        "patient_ids_val": val_pids if len(val_pids) <= 30 else None,
-        "patient_ids_test": test_pids if len(test_pids) <= 30 else None,
-        "samples_per_patient_train": _summary(train_pids),
-        "samples_per_patient_val": _summary(val_pids),
-        "samples_per_patient_test": _summary(test_pids),
-        "patient_ids_train_full": list(train_pids),
-        "patient_ids_val_full": list(val_pids),
-        "patient_ids_test_full": list(test_pids),
-        "split_mode": split_mode,
-        "split_seed": int(seed),
-    }
-
-    train_subset = Subset(dataset, train_indices) if train_indices else Subset(dataset, [])
-    val_subset = Subset(dataset, val_indices) if val_indices else Subset(dataset, [])
-    test_subset = Subset(dataset, test_indices) if test_indices else Subset(dataset, [])
-
-    return train_subset, val_subset, test_subset, stats
-
-
 if __name__ == "__main__":
     train()

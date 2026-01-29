@@ -80,7 +80,7 @@ Funktionen/Konstanten:
 - `render_minibatch(generator, z_latent, rays_subset, need_raw, ct_context)`: Rendert Teilrays mit Train-/Test-Settings; gibt proj_map-Flat und Extras zurück.  
 - `maybe_render_preview(step, args, generator, z_eval, outdir, ct_volume, act_volume, ct_context)`: Rendert und speichert volle AP/PA-Previews und Depth-Profile in Eval-Mode in festen Intervallen.  
 - `init_log_file(path)` / `append_log(path, row)`: CSV-Header anlegen bzw. Zeile anhängen.  
-- `save_checkpoint(step, generator, optimizer, scaler, ckpt_dir, encoder=None, z_fuser=None, gain_head=None, gain_param=None)`: Speichert Step, Optimizer, AMP-Scaler, coarse/fine Netze und optionale Hybridmodule; ältere Checkpoints mit `z_train` werden nicht unterstützt.  
+- `save_checkpoint(step, generator, z_train, optimizer, scaler, ckpt_dir)`: Speichert Step, z, Optimizer, AMP-Scaler, coarse/fine Netze.  
 - `dump_debug_tensor(outpath, tensor)`: Speichert Tensor auf CPU.  
 - `compute_psnr(pred, target)`: PSNR-Berechnung.  
 - `sample_act_points(act, nsamples, radius)`: Zieht zufällige Voxel aus act-Volumen, gibt Koordinaten (Welt) + Werte zurück; erwartet `act` als [D,H,W] oder [1,D,H,W].  

@@ -84,29 +84,6 @@ class SpectDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.entries)                                                # Anzahl der Einträge = Anzahl Zeilen im Manifest = Anzahl Phantome/Patienten
 
-    def get_patient_id(self, idx):
-        """Liefert patient_id ohne Bild-/Volumen-Loading (nur Manifest-Metadaten)."""
-        if idx < 0 or idx >= len(self.entries):
-            raise IndexError(f"Index out of range: {idx}")
-        return self.entries[idx].get("patient_id")
-
-    def get_meta_light(self, idx):
-        """Leichtgewichtige Meta-Infos ohne Bild-/Volumen-Loading."""
-        if idx < 0 or idx >= len(self.entries):
-            raise IndexError(f"Index out of range: {idx}")
-        e = self.entries[idx]
-        return {
-            "patient_id": e.get("patient_id"),
-            "ap_path": str(e.get("ap_path")) if e.get("ap_path") is not None else "",
-            "pa_path": str(e.get("pa_path")) if e.get("pa_path") is not None else "",
-            "ct_path": str(e.get("ct_path")) if e.get("ct_path") is not None else "",
-            "act_path": str(e.get("act_path")) if e.get("act_path") is not None else "",
-            "ap_counts_path": str(e.get("ap_counts_path")) if e.get("ap_counts_path") is not None else "",
-            "pa_counts_path": str(e.get("pa_counts_path")) if e.get("pa_counts_path") is not None else "",
-            "proj_scale_joint_p99": float(e.get("proj_scale_joint_p99")) if e.get("proj_scale_joint_p99") is not None else float("nan"),
-            "proj_scale_joint_p99_missing": bool(e.get("proj_scale_joint_p99_missing")),
-        }
-
 
     @staticmethod
     def _tensor_stats(t: torch.Tensor):

@@ -42,23 +42,19 @@ def get_data(config):
     """Lädt das SPECT-Dataset (AP, PA, CT) basierend auf manifest.csv
     und leitet H, W direkt aus den echten AP-Bildern ab.
     """
-    data_cfg = config.setdefault("data", {})
-    dset_type = data_cfg.get("type")
+    dset_type = config["data"]["type"]
     if dset_type != "spect":
         raise ValueError(f"Dieser Build unterstützt nur 'spect', nicht '{dset_type}'.")
-    imsize = data_cfg.get("imsize")
-    imsize_repr = "None" if imsize is None else imsize
-    print(f"[cfg][data] imsize={imsize_repr} (native if None)")
 
     # 1) Dataset bauen (ohne Resize-Transforms)
     dset = SpectDataset(
-        manifest_path=data_cfg["manifest"],
-        imsize=imsize,                                                    # imsize ist hier nur noch „Meta“, nicht verbindlich
+        manifest_path=config["data"]["manifest"],
+        imsize=config["data"]["imsize"],                            # imsize ist hier nur noch „Meta“, nicht verbindlich
         transform_img=None,
         transform_ct=None,
-        debug_proj_stats=bool(data_cfg.get("debug_proj_stats", False)),
-        act_scale=float(data_cfg.get("act_scale", 1.0)),
-        ct_prefer_raw=bool(data_cfg.get("ct_prefer_raw", False)),
+        debug_proj_stats=bool(config["data"].get("debug_proj_stats", False)),
+        act_scale=float(config["data"].get("act_scale", 1.0)),
+        ct_prefer_raw=bool(config["data"].get("ct_prefer_raw", False)),
     )
 
     # 2) H und W aus einem Beispiel-AP-Bild ableiten
@@ -67,13 +63,13 @@ def get_data(config):
     _, H, W = ap0.shape                                             # H und W stammen aus echten Daten (nicht aus config)
 
     # 3) FOV aus Config nehmen und formale "focal" berechnen (wird für orthografisches Rendern nicht genutzt)
-    fov = data_cfg["fov"]
+    fov = config["data"]["fov"]
     dset.H = H
     dset.W = W
     dset.focal = W / 2 * 1 / np.tan(0.5 * fov * np.pi / 180.0)
 
     # 4) Radius wie gehabt aus Config (definiert den Bounding-Box-Radius in Weltkoordinaten)
-    radius = data_cfg["radius"]
+    radius = config["data"]["radius"]
     render_radius = radius
     if isinstance(radius, str):
         radius = tuple(float(r) for r in radius.split(","))
@@ -84,7 +80,7 @@ def get_data(config):
     render_poses = None
 
     # 6) Debug-Ausgabe
-    datainfo = data_cfg.get("manifest", "n/a")
+    datainfo = config["data"].get("manifest", "n/a")
     print(
         f"Loaded {dset_type}: H={H}, W={W}, samples={len(dset)}, "
         f"radius={dset.radius}, data={datainfo}"

@@ -248,19 +248,10 @@ This document audits the current pipeline and critical claims against the codeba
   - Verify by search: no references in training loop.
 
 ### Block 9: Backprop & Optimizer
-- [CONFIRMED] Optimizer is Adam over generator params (plus hybrid modules when enabled) with gradient clipping.
+- [CONFIRMED] Optimizer is Adam over generator params + `z_train` with gradient clipping.
   - File: `pieNeRF/train_emission.py`
   ```python
-  opt_params = list(generator.parameters())
-  if hybrid_enabled and encoder is not None:
-      opt_params += list(encoder.parameters())
-  if hybrid_enabled and z_fuser is not None:
-      opt_params += list(z_fuser.parameters())
-  if hybrid_enabled and gain_head is not None:
-      opt_params += list(gain_head.parameters())
-  if hybrid_enabled and gain_param is not None:
-      opt_params += [gain_param]
-  optimizer = torch.optim.Adam(opt_params, lr=config["training"]["lr_g"])
+  optimizer = torch.optim.Adam(list(generator.parameters()) + [z_train], lr=config["training"]["lr_g"])
   torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
   ```
 - [CONFIRMED] AMP is optional and controlled by `training.use_amp`.
@@ -284,25 +275,16 @@ This document audits the current pipeline and critical claims against the codeba
   proj_pa, _, _, _ = generator.render_from_pose(z_eval, generator.pose_pa, ct_context=ctx)
   save_img(ap_np, out_dir / f"step_{step:05d}_AP.png", title=f"AP @ step {step}")
   ```
-- [CONFIRMED] Checkpoints contain generator weights, optimizer, scaler, and optional hybrid modules; `z_train` is no longer stored.
+- [CONFIRMED] Checkpoints contain generator weights, optimizer, scaler, and `z_train`.
   - File: `pieNeRF/train_emission.py` (`save_checkpoint`)
   ```python
   state = {
       "step": step,
+      "z_train": z_train.detach().cpu(),
       "optimizer": optimizer.state_dict(),
       "scaler": scaler.state_dict(),
       "generator_coarse": generator.render_kwargs_train["network_fn"].state_dict(),
   }
-  if generator.render_kwargs_train["network_fine"] is not None:
-      state["generator_fine"] = generator.render_kwargs_train["network_fine"].state_dict()
-  if encoder is not None:
-      state["encoder"] = encoder.state_dict()
-  if z_fuser is not None:
-      state["z_fuser"] = z_fuser.state_dict()
-  if gain_head is not None:
-      state["gain_head"] = gain_head.state_dict()
-  if gain_param is not None:
-      state["gain_param"] = gain_param.detach().cpu()
   ```
 
 
