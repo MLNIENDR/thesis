@@ -35,6 +35,9 @@ __VERSION__ = "emission-train v0.3"
 DEBUG_PRINTS = False  # Nur Debug-Ausgaben, keine Änderung am Verhalten
 ATTEN_SCALE_DEFAULT = 25.0
 _POISSON_RATE_LEGACY_WARNED = False
+_DEPTH_PROFILE_LOGGED = False
+_SAMPLE_VOLUME_ALONG_PTS_LOGGED = False
+_PRED_ACT_STATS_LOGGED = False
 
 
 def str2bool(v):
@@ -80,13 +83,13 @@ def parse_args():
     parser.add_argument(
         "--log-every",
         type=int,
-        default=10,
+        default=50,
         help="How often to print running loss statistics.",
     )
     parser.add_argument(
         "--preview-every",
         type=int,
-        default=50,
+        default=100,
         help="If >0 renders and stores full AP/PA previews every N steps (slow, full-frame render).",
     )
     parser.add_argument(
@@ -301,6 +304,11 @@ def parse_args():
         help="Override fuer pred_to_counts_scale (>0 nutzt diesen Wert statt proj_scale_joint_p99).",
     )
     parser.add_argument(
+        "--use-gain",
+        action="store_true",
+        help="Aktiviert lernbaren Gain (multiplikativ auf Projektion). Default: False.",
+    )
+    parser.add_argument(
         "--proj-gain-source",
         type=str,
         default="z_enc",
@@ -402,6 +410,12 @@ def parse_args():
         help="Skalierung fuer z_enc im Hybrid-Conditioning (z_latent = alpha * z_enc_proj ohne trainables z).",
     )
     parser.add_argument(
+        "--encoder-lr-mult",
+        type=float,
+        default=0.1,
+        help="Multiplikator fuer Encoder-Lernrate relativ zu lr_g.",
+    )
+    parser.add_argument(
         "--smoke-test",
         action="store_true",
         help="Fuehrt einen Smoke-Test mit einem Batch (Forward+Backward) aus und beendet.",
@@ -434,6 +448,11 @@ def parse_args():
         "--act-only",
         action="store_true",
         help="Deaktiviert Projektionsteil (Forward + Loss); nur ACT + Regularizer.",
+    )
+    parser.add_argument(
+        "--debug-enc",
+        action="store_true",
+        help="Einmalige Debug-Logs für Encoder-Trainierbarkeit (Step 1).",
     )
     parser.add_argument(
         "--debug-act",
@@ -766,7 +785,14 @@ def log_projection_quantiles_scaled(
     )
 
 
-def export_activity_volume(generator, z_latent, out_path: Path, res: int, device: torch.device):
+def export_activity_volume(
+    generator,
+    z_latent,
+    out_path: Path,
+    res: int,
+    device: torch.device,
+    radius_xyz: Optional[Tuple[float, float, float]] = None,
+):
     radius = generator.radius
     if isinstance(radius, tuple):
         radius = radius[1]
@@ -775,8 +801,17 @@ def export_activity_volume(generator, z_latent, out_path: Path, res: int, device
     if res <= 0:
         raise ValueError("export-vol-res must be > 0")
 
-    x_coords = idx_to_coord(torch.arange(res, device=device), res, radius)
-    y_coords = idx_to_coord(torch.arange(res, device=device), res, radius)
+    def _resolve_radius_xyz():
+        if radius_xyz is not None:
+            return tuple(float(r) for r in radius_xyz)
+        if hasattr(generator, "radius_xyz"):
+            return tuple(float(r) for r in generator.radius_xyz)
+        scalar = radius
+        return (scalar, scalar, scalar)
+
+    rx, ry, rz = _resolve_radius_xyz()
+    x_coords = idx_to_coord(torch.arange(res, device=device), res, rx)
+    y_coords = idx_to_coord(torch.arange(res, device=device), res, ry)
     y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing="ij")
     x_flat = x_grid.reshape(-1)
     y_flat = y_grid.reshape(-1)
@@ -789,7 +824,7 @@ def export_activity_volume(generator, z_latent, out_path: Path, res: int, device
         for z_start in range(0, res, chunk_depth):
             z_end = min(res, z_start + chunk_depth)
             z_idx = torch.arange(z_start, z_end, device=device)
-            z_coords = idx_to_coord(z_idx, res, radius)
+            z_coords = idx_to_coord(z_idx, res, rz)
             z_rep = z_coords.repeat_interleave(x_flat.numel())
             x_rep = x_flat.repeat(z_coords.numel())
             y_rep = y_flat.repeat(z_coords.numel())
@@ -863,6 +898,7 @@ def save_test_volume_slices(
                 pred_vol_np=pred_vol,
                 out_path_override=final_filename,
                 grid_radius=_radius_to_float(generator.radius),
+                radius_xyz=tuple(float(r) for r in generator.radius_xyz),
             )
             saved_info.append(
                 {
@@ -1046,10 +1082,21 @@ def apply_proj_transform(
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """Skaliert proj mit s und wendet Transform an (log1p/sqrt/none)."""
+    if scale is None:
+        scale_t = None
+    else:
+        if torch.is_tensor(scale):
+            scale_t = scale.to(device=proj.device, dtype=proj.dtype)
+        else:
+            scale_t = torch.tensor(scale, device=proj.device, dtype=proj.dtype)
+
     transform = str(transform or "none")
-    while scale.dim() < proj.dim():
-        scale = scale.view(-1, *([1] * (proj.dim() - 1)))
-    scaled = proj / torch.clamp(scale, min=eps)
+    if scale_t is None:
+        scaled = proj
+    else:
+        while scale_t.dim() < proj.dim():
+            scale_t = scale_t.view(-1, *([1] * (proj.dim() - 1)))
+        scaled = proj / torch.clamp(scale_t, min=eps)
     scaled = torch.clamp(scaled, min=0.0)
     if transform == "log1p":
         return torch.log1p(scaled)
@@ -1127,6 +1174,8 @@ def fmt_stats(stats: Optional[dict]) -> str:
         f"{stats['min']:.3e}/{stats['mean']:.3e}/{stats['p95']:.3e}/{stats['max']:.3e}"
     )
 
+_ENCODER_INPUT_STATS_LOGGED = False
+
 
 def build_encoder_input(
     ap: torch.Tensor,
@@ -1160,7 +1209,24 @@ def build_encoder_input(
             ct_mu = ct_flat.mean(dim=1).view(-1, 1, 1, 1)
             ct_std = ct_flat.std(dim=1).view(-1, 1, 1, 1)
             ct_norm = (ct_mean - ct_mu) / (ct_std + 1e-6)
-            inputs.append(ct_norm)
+        inputs.append(ct_norm)
+    global _ENCODER_INPUT_STATS_LOGGED
+    if not _ENCODER_INPUT_STATS_LOGGED:
+        _ENCODER_INPUT_STATS_LOGGED = True
+        def _stats_min_mean_max(tensor: torch.Tensor) -> tuple[float, float, float]:
+            if tensor.numel() == 0:
+                return float("nan"), float("nan"), float("nan")
+            flat = tensor.reshape(-1)
+            return float(flat.min().item()), float(flat.mean().item()), float(flat.max().item())
+
+        ap_stats = _stats_min_mean_max(ap_enc)
+        pa_stats = _stats_min_mean_max(pa_enc)
+        print(
+            f"[DEBUG][encoder-input] transform={transform} "
+            f"ap(min/mean/max)={ap_stats[0]:.3e}/{ap_stats[1]:.3e}/{ap_stats[2]:.3e} "
+            f"| pa(min/mean/max)={pa_stats[0]:.3e}/{pa_stats[1]:.3e}/{pa_stats[2]:.3e}",
+            flush=True,
+        )
     return torch.cat(inputs, dim=1)
 
 
@@ -1478,7 +1544,9 @@ def log_effective_config(outdir: Path, config: dict, args):
     print(f"[cfg] git_rev={git_rev} | expname={config.get('expname', 'n/a')} | outdir={outdir}", flush=True)
     print(
         f"[cfg][data] act_scale={data_cfg.get('act_scale')} | near={data_cfg.get('near')} | far={data_cfg.get('far')} "
-        f"| orthographic={data_cfg.get('orthographic')}",
+        f"| orthographic={data_cfg.get('orthographic')} | radius={data_cfg.get('radius')} "
+        f"| use_anisotropic_radius={data_cfg.get('use_anisotropic_radius')} "
+        f"| radius_xyz_cm={data_cfg.get('radius_xyz_cm')}",
         flush=True,
     )
     print(
@@ -2414,26 +2482,39 @@ def save_depth_profile(
             return np.linspace(0.0, 1.0, z_np.size)
         return (z_np - z_min) / (z_max - z_min + 1e-8)
 
-    def _sample_volume_along_pts(vol_3d: torch.Tensor, pts: torch.Tensor) -> Optional[torch.Tensor]:
-        if vol_3d is None or vol_3d.dim() != 3:
-            return None
-        if radius <= 0:
-            return None
-        try:
-            vol = vol_3d.view(1, 1, *vol_3d.shape)
-            grid = (pts / radius).clamp(min=-1.0, max=1.0)
-            grid = grid.view(1, grid.shape[0], 1, 1, 3)
-            sampled = F.grid_sample(
-                vol,
-                grid,
-                mode="bilinear",
-                padding_mode="zeros",
-                align_corners=True,
+def _sample_volume_along_pts(vol_3d: torch.Tensor, pts: torch.Tensor, radius: float) -> Optional[torch.Tensor]:
+    if vol_3d is None or vol_3d.dim() != 3:
+        return None
+    if radius <= 0:
+        return None
+    try:
+        vol = vol_3d.view(1, 1, *vol_3d.shape)
+        pts_norm = pts / radius
+        global _SAMPLE_VOLUME_ALONG_PTS_LOGGED
+        if not _SAMPLE_VOLUME_ALONG_PTS_LOGGED:
+            _SAMPLE_VOLUME_ALONG_PTS_LOGGED = True
+            clip_mask = (pts_norm.abs() > 1.0).any(dim=-1)
+            clip_frac = float(clip_mask.float().mean().item())
+            before_min = pts_norm.amin(dim=0).cpu().tolist()
+            before_max = pts_norm.amax(dim=0).cpu().tolist()
+            print(
+                f"[sanity][_sample_volume_along_pts] radius={radius:.3e} pts_norm(min/max)={before_min}/{before_max} "
+                f"clipped_frac={clip_frac:.3f}",
+                flush=True,
             )
-            return sampled.view(-1)
-        except Exception as exc:
-            print(f"[depth-profile][WARN] grid_sample fehlgeschlagen: {exc}", flush=True)
-            return None
+        grid = pts_norm.clamp(min=-1.0, max=1.0)
+        grid = grid.view(1, grid.shape[0], 1, 1, 3)
+        sampled = F.grid_sample(
+            vol,
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        return sampled.view(-1)
+    except Exception as exc:
+        print(f"[depth-profile][WARN] grid_sample fehlgeschlagen: {exc}", flush=True)
+        return None
 
     rays_ap_full = build_pose_rays(generator, generator.pose_ap)
     prev_flag = bool(generator.use_test_kwargs)
@@ -2507,6 +2588,20 @@ def save_depth_profile(
 
                 pts = rays_o.view(1, 3) + rays_d.view(1, 3) * z_vals_ray.view(-1, 1)
                 depth_axis_ray = _depth_axis_from_z(z_vals_ray)
+                global _DEPTH_PROFILE_LOGGED
+                if not _DEPTH_PROFILE_LOGGED:
+                    _DEPTH_PROFILE_LOGGED = True
+                    z_head = z_vals_ray[:5].cpu().tolist()
+                    z_tail = z_vals_ray[-5:].cpu().tolist()
+                    z_min = float(z_vals_ray.min().item())
+                    z_max = float(z_vals_ray.max().item())
+                    depth_axis_head = depth_axis_ray[:5].tolist()
+                    depth_axis_tail = depth_axis_ray[-5:].tolist()
+                    print(
+                        f"[sanity][depth-profile] z_vals(min/max)={z_min:.3e}/{z_max:.3e} head={z_head} tail={z_tail} "
+                        f"depth_axis(head/tail)={depth_axis_head}/{depth_axis_tail} (plotted axis=depth_axis_ray)",
+                        flush=True,
+                    )
                 d_ray = int(depth_axis_ray.size)
 
                 curve_ct = extract_curve(ct_dhw, y_idx, x_idx, "ct") if ct_dhw is not None else (None, None)
@@ -2536,7 +2631,7 @@ def save_depth_profile(
                         print("[depth-profile][WARN] act_vol fehlt fuer Ray-Sampling; GT-Kurve wird ausgelassen.", flush=True)
                         warn_no_act = True
                 else:
-                    gt_curve_t = _sample_volume_along_pts(act_sample_vol, pts)
+                    gt_curve_t = _sample_volume_along_pts(act_sample_vol, pts, radius)
                     if gt_curve_t is None:
                         if not warn_sampling_fail:
                             print("[depth-profile][WARN] GT-Ray-Sampling fehlgeschlagen; GT-Kurve wird ausgelassen.", flush=True)
@@ -3086,6 +3181,7 @@ def save_final_act_compare_volume_slicing(
     pred_vol_np: Optional[np.ndarray] = None,
     out_path_override: Optional[Path] = None,
     grid_radius: Optional[float] = None,
+    radius_xyz: Optional[Tuple[float, float, float]] = None,
 ):
     """Finale GT-vs-Pred Activity-Compare PNG via reinem Volumen-Slicing (wie in test.py)."""
     if not bool(getattr(args, "final_act_compare", False)):
@@ -3139,6 +3235,13 @@ def save_final_act_compare_volume_slicing(
         return
     gt_raw_shape = tuple(int(x) for x in gt_np.shape)
     pred_shape = tuple(int(x) for x in pred_np.shape)
+    if radius_xyz is None:
+        if grid_radius is not None:
+            radius_xyz = (float(grid_radius), float(grid_radius), float(grid_radius))
+        else:
+            radius_xyz = (1.0, 1.0, 1.0)
+    else:
+        radius_xyz = tuple(float(r) for r in radius_xyz)
 
     def _volume_stats(arr: np.ndarray) -> Tuple[float, float, float]:
         finite = np.isfinite(arr)
@@ -3148,10 +3251,12 @@ def save_final_act_compare_volume_slicing(
                 return float(vals.min()), float(vals.mean()), float(vals.max())
         return float("nan"), float("nan"), float("nan")
 
-    def _spacing_for_dim(dim: int) -> float:
-        if grid_radius is None or dim <= 1:
+    rx, ry, rz = radius_xyz
+
+    def _spacing_for_axis(dim: int, radius_axis: float) -> float:
+        if dim <= 1 or radius_axis == 0.0:
             return float("nan")
-        return (2.0 * float(grid_radius)) / float(dim - 1)
+        return (2.0 * float(radius_axis)) / float(dim - 1)
 
     def _resample_gt_to_pred(gt_arr: np.ndarray, target_shape: Tuple[int, int, int]) -> np.ndarray:
         if gt_arr.shape == target_shape:
@@ -3163,9 +3268,10 @@ def save_final_act_compare_volume_slicing(
 
     gt_np = _resample_gt_to_pred(gt_np, pred_shape)
     gt_shape = tuple(int(x) for x in gt_np.shape)
-    gt_spacing_raw = tuple(_spacing_for_dim(dim) for dim in gt_raw_shape)
-    gt_spacing_resampled = tuple(_spacing_for_dim(dim) for dim in gt_shape)
-    pred_spacing = tuple(_spacing_for_dim(dim) for dim in pred_shape)
+    axis_radii = (rz, ry, rx)
+    gt_spacing_raw = tuple(_spacing_for_axis(dim, rad) for dim, rad in zip(gt_raw_shape, axis_radii))
+    gt_spacing_resampled = tuple(_spacing_for_axis(dim, rad) for dim, rad in zip(gt_shape, axis_radii))
+    pred_spacing = tuple(_spacing_for_axis(dim, rad) for dim, rad in zip(pred_shape, axis_radii))
 
     print(
         "[final-act-compare][debug] "
@@ -3173,18 +3279,12 @@ def save_final_act_compare_volume_slicing(
         "axis meaning: axial depth=axis2 (z-axis).",
         flush=True,
     )
-    if grid_radius is not None:
-        print(
-            "[final-act-compare][debug] "
-            f"World extent assumed [-{grid_radius:.3f},+{grid_radius:.3f}] along each axis; "
-            f"voxel spacings (GT raw/resampled/Pred)={gt_spacing_raw}/{gt_spacing_resampled}/{pred_spacing}.",
-            flush=True,
-        )
-    else:
-        print(
-            "[final-act-compare][debug] World extent unknown; assuming uniform voxels aligned via idx scaling.",
-            flush=True,
-        )
+    print(
+        "[final-act-compare][debug] World extents (cm): "
+        f"axis0(D/z)=[{-rz:.3f},{rz:.3f}] axis1(H/y)=[{-ry:.3f},{ry:.3f}] axis2(W/x)=[{-rx:.3f},{rx:.3f}]; "
+        f"voxel spacings raw/resampled/pred={gt_spacing_raw}/{gt_spacing_resampled}/{pred_spacing}.",
+        flush=True,
+    )
     print(
         "[final-act-compare][debug] Resampling direction: GT -> Pred grid (trilinear, align_corners=False); "
         f"Resampled stats: min/mean/max={_volume_stats(gt_np)}; Pred stats: min/mean/max={_volume_stats(pred_np)}.",
@@ -3227,19 +3327,25 @@ def save_final_act_compare_volume_slicing(
     _, _, C_gt_raw = gt_raw_shape
     z_list_raw = list(getattr(args, "final_act_compare_axis2_idx", [65, 260, 325]))
 
-    def _map_axis2_idx(z_gt: int, C_gt: int, R_pred: int) -> int:
-        z_gt = int(z_gt)
-        if C_gt <= 1 or R_pred <= 1:
-            return int(np.clip(z_gt, 0, max(R_pred - 1, 0)))
-        scale = float(R_pred - 1) / float(C_gt - 1)
-        z_pred = int(round(float(z_gt) * scale))
-        return int(np.clip(z_pred, 0, R_pred - 1))
+    def _idx_to_world(z_idx: int, size: int, radius_axis: float) -> float:
+        if size <= 1 or radius_axis == 0.0:
+            return 0.0
+        return ((float(z_idx) / float(size - 1)) - 0.5) * 2.0 * radius_axis
+
+    def _world_to_pred_idx(z_world: float, R_pred: int, radius_pred: float) -> int:
+        if R_pred <= 1 or radius_pred == 0.0:
+            return 0
+        normalized = np.clip((z_world / (2.0 * radius_pred)) + 0.5, 0.0, 1.0)
+        idx = int(round(normalized * (R_pred - 1)))
+        return int(np.clip(idx, 0, R_pred - 1))
 
     z_pairs: list[Tuple[int, int]] = []
     for z_gt in z_list_raw:
         z_i = int(z_gt)
         if 0 <= z_i < C_gt_raw:
-            z_pairs.append((z_i, _map_axis2_idx(z_i, C_gt_raw, R)))
+            world_z = _idx_to_world(z_i, C_gt_raw, rz)
+            z_pred = _world_to_pred_idx(world_z, R, rz)
+            z_pairs.append((z_i, z_pred))
         else:
             print(
                 f"[final-act-compare][WARN] axis2 idx_gt={z_i} out of bounds fuer C_gt={C_gt_raw}; ignoriere.",
@@ -3418,9 +3524,6 @@ def evaluate_pixel_subsets(
                 lambda_ap_used = pred_ap_raw
                 lambda_pa_used = pred_pa_raw
 
-            if proj_loss_active and pred_scale != 1.0:
-                lambda_ap_used = lambda_ap_used * float(pred_scale)
-                lambda_pa_used = lambda_pa_used * float(pred_scale)
             if proj_loss_active and gain is not None:
                 lambda_ap_used = lambda_ap_used * gain
                 lambda_pa_used = lambda_pa_used * gain
@@ -3939,6 +4042,38 @@ def train():
         else:
             raise
     config["data"]["hwfr"] = hwfr
+    data_cfg = config["data"]
+    radius_xyz_raw = data_cfg.get("radius_xyz_cm")
+    radius_xyz_cm = None if radius_xyz_raw is None else tuple(float(r) for r in radius_xyz_raw)
+    auto_near_far = bool(data_cfg.get("auto_near_far_from_radius", True))
+    if auto_near_far and (radius_xyz_cm is not None):
+        data_cfg["near"] = 0.0
+        data_cfg["far"] = 2.0 * radius_xyz_cm[2]
+        print(
+            "[cfg][data] auto_near_far_from_radius enabled → near/far set to "
+            f"{data_cfg['near']:.3f}cm / {data_cfg['far']:.3f}cm (rz={radius_xyz_cm[2]:.3f}cm)",
+            flush=True,
+        )
+    if radius_xyz_cm is not None:
+        print(
+            "[cfg][data] anisotropic radius_xyz_cm available: "
+            f"{radius_xyz_cm} (use_anisotropic_radius={data_cfg.get('use_anisotropic_radius')})",
+            flush=True,
+        )
+    path_length_cm = float(data_cfg.get("far", 0.0)) - float(data_cfg.get("near", 0.0))
+    atten_scale = float(config.get("nerf", {}).get("atten_scale", 25.0))
+    print(
+        "[cfg][attenuation] path_length_cm="
+        f"{path_length_cm:.3f}cm | atten_scale={atten_scale:.3f} | "
+        "units=cm",
+        flush=True,
+    )
+    if abs(atten_scale - 1.0) > 1e-3 and path_length_cm > 0.0:
+        print(
+            "[WARN][attenuation] atten_scale != 1.0; with cm-world and far-near representing physical length, "
+            "consider setting atten_scale=1.0 for direct ∫μ ds.",
+            flush=True,
+        )
 
     if debug_dataset_summary and dataset is not None:
         print_dataset_summary(dataset, max_print=20)
@@ -4316,20 +4451,42 @@ def train():
     if rays_per_proj <= 0:
         raise ValueError("rays-per-step must be > 0.")
     rays_per_proj = min(rays_per_proj, num_pixels)
+    
+    # --- Fix: Robuste Optimizer-Erstellung mit Parameter-Gruppen ---
+    lr_g = config["training"]["lr_g"]
+    param_groups = [{'params': generator.parameters(), 'lr': lr_g, 'name': 'generator'}]
+    if hybrid_enabled:
+        if encoder is not None:
+            lr_enc = lr_g * float(args.encoder_lr_mult)
+            param_groups.append({'params': encoder.parameters(), 'lr': lr_enc, 'name': 'encoder'})
+            print(f"[cfg][optim] Encoder added to optimizer with lr={lr_enc:.3e}", flush=True)
+        if z_fuser is not None:
+            param_groups.append({'params': z_fuser.parameters(), 'lr': lr_g, 'name': 'z_fuser'})
+        if gain_head is not None:
+            param_groups.append({'params': gain_head.parameters(), 'lr': lr_g, 'name': 'gain_head'})
+        if gain_param is not None:
+            param_groups.append({'params': [gain_param], 'lr': lr_g, 'name': 'gain_param'})
 
-    opt_params = list(generator.parameters())
-    if hybrid_enabled and encoder is not None:
-        opt_params += list(encoder.parameters())
-    if hybrid_enabled and z_fuser is not None:
-        opt_params += list(z_fuser.parameters())
-    if hybrid_enabled and gain_head is not None:
-        opt_params += list(gain_head.parameters())
-    if hybrid_enabled and gain_param is not None:
-        opt_params += [gain_param]
-    optimizer = torch.optim.Adam(
-        opt_params,
-        lr=config["training"]["lr_g"],
-    )
+    optimizer = torch.optim.Adam(param_groups)
+    opt_params = []
+    for group in optimizer.param_groups:
+        opt_params.extend(group['params'])
+
+    # (1) Instrumentierung: Optimizer-Check (einmalig)
+    if args.debug_enc:
+        print(f"[DEBUG][ENC_INIT] hybrid_enabled={hybrid_enabled}", flush=True)
+        if hybrid_enabled:
+            print(f"[DEBUG][ENC_INIT] encoder is None: {encoder is None}", flush=True)
+            if encoder is not None:
+                print(f"[DEBUG][ENC_INIT] encoder.training: {encoder.training}", flush=True)
+                print(f"[DEBUG][ENC_INIT] z_enc_alpha: {z_enc_alpha}", flush=True)
+                n_enc_params = sum(p.numel() for p in encoder.parameters())
+                enc_ids = {id(p) for p in encoder.parameters()}
+                opt_ids = {id(p) for g in optimizer.param_groups for p in g['params']}
+                intersection = len(enc_ids.intersection(opt_ids))
+                print(f"[DEBUG][ENC_INIT] Encoder params total: {n_enc_params}", flush=True)
+                print(f"[DEBUG][ENC_INIT] Encoder params in optimizer: {intersection}/{len(enc_ids)} (opt_total: {len(opt_ids)})", flush=True)
+ 
     # Projection-Loss
     proj_loss_type = args.proj_loss_type
     if hybrid_enabled:
@@ -4360,12 +4517,16 @@ def train():
             batch = build_synthetic_batch(generator.H, generator.W, device=device)
             ap = batch["ap"]
             pa = batch["pa"]
+            ap_enc_input = batch.get("proj_input_ap", ap)
+            pa_enc_input = batch.get("proj_input_pa", pa)
             meta = batch.get("meta")
             act_vol = batch.get("act")
             ct_vol = batch.get("ct")
         else:
             ap = batch["ap"].to(device, non_blocking=True).float()
             pa = batch["pa"].to(device, non_blocking=True).float()
+            ap_enc_input = batch.get("proj_input_ap", ap)
+            pa_enc_input = batch.get("proj_input_pa", pa)
             meta = batch.get("meta")
             act_vol = batch.get("act")
             if act_vol is not None and act_vol.numel() > 0:
@@ -4428,8 +4589,8 @@ def train():
             proj_scale_enc = compute_proj_scale(ap, pa, args.proj_scale_source, meta)
             proj_scale_enc = torch.clamp(proj_scale_enc, min=1e-6)
             enc_input = build_encoder_input(
-                ap,
-                pa,
+                ap_enc_input,
+                pa_enc_input,
                 ct_vol,
                 proj_scale_enc,
                 args.encoder_proj_transform,
@@ -4517,8 +4678,6 @@ def train():
                 pred_ap = pred_ap_raw
                 pred_pa = pred_pa_raw
             if use_counts:
-                pred_ap = pred_ap * float(pred_to_counts_scale)
-                pred_pa = pred_pa * float(pred_to_counts_scale)
                 if gain_head is not None and z_enc is not None:
                     gain_val = F.softplus(gain_head(z_enc))
                     pred_ap = pred_ap * gain_val
@@ -4646,6 +4805,25 @@ def train():
     
             ap = batch["ap"].to(device, non_blocking=True).float()
             pa = batch["pa"].to(device, non_blocking=True).float()
+            ap_enc_input = batch.get("proj_input_ap", ap)
+            if torch.is_tensor(ap_enc_input):
+                ap_enc_input = ap_enc_input.to(device, non_blocking=True).float()
+            pa_enc_input = batch.get("proj_input_pa", pa)
+            if torch.is_tensor(pa_enc_input):
+                pa_enc_input = pa_enc_input.to(device, non_blocking=True).float()
+
+            # --- Fix: Log1p transform for counts (stabilize encoder input) ---
+            if data_cfg.get("proj_input_source") == "counts":
+                if step == 1:
+                    def _tstat(t): return (float(t.min().item()), float(t.mean().item()), float(t.max().item()))
+                    print(f"[DEBUG][encoder-input] RAW counts AP={_tstat(ap_enc_input)} PA={_tstat(pa_enc_input)}", flush=True)
+                
+                ap_enc_input = torch.log1p(ap_enc_input.float().clamp_min(0.0))
+                pa_enc_input = torch.log1p(pa_enc_input.float().clamp_min(0.0))
+
+                if step == 1:
+                     print(f"[DEBUG][encoder-input] LOG1P transformed AP={_tstat(ap_enc_input)} PA={_tstat(pa_enc_input)}", flush=True)
+
             meta = batch.get("meta")
             meta_scale = None
             meta_missing = False
@@ -4806,8 +4984,8 @@ def train():
                 proj_scale_enc = compute_proj_scale(ap, pa, args.proj_scale_source, meta)
                 proj_scale_enc = torch.clamp(proj_scale_enc, min=1e-6)
                 enc_input = build_encoder_input(
-                    ap,
-                    pa,
+                    ap_enc_input,
+                    pa_enc_input,
                     ct_vol,
                     proj_scale_enc,
                     args.encoder_proj_transform,
@@ -4821,6 +4999,16 @@ def train():
                 else:
                     z_enc_proj = z_enc
                 z_latent = z_base + (z_enc_alpha * z_enc_proj)
+
+            # (2) Instrumentierung: z_enc/z_latent Graph-Check (step 1)
+            if args.debug_enc and step == 1:
+                print(f"[DEBUG][ENC_FWD] z_enc.requires_grad={z_enc.requires_grad}, grad_fn is not None: {z_enc.grad_fn is not None}", flush=True)
+                print(f"[DEBUG][ENC_FWD] z_latent.requires_grad={z_latent.requires_grad}, grad_fn is not None: {z_latent.grad_fn is not None}", flush=True)
+                s = (z_latent * torch.randn_like(z_latent)).sum()
+                g_z_enc = torch.autograd.grad(s, z_enc, retain_graph=True, allow_unused=True)[0]
+                print(f"[DEBUG][ENC_FWD] grad(z_latent, z_enc) is None: {g_z_enc is None}", flush=True)
+                if g_z_enc is not None:
+                    print(f"[DEBUG][ENC_FWD] grad(z_latent, z_enc) norm: {g_z_enc.norm().item():.6e}", flush=True)
             else:
                 z_latent = z_base
             last_z_latent = z_latent
@@ -4870,9 +5058,6 @@ def train():
                     if proj_loss_type == "poisson" and proj_loss_active:
                         pred_ap_full = compute_poisson_rate(pred_ap_full, args.poisson_rate_mode, eps=1e-6)
                         pred_pa_full = compute_poisson_rate(pred_pa_full, args.poisson_rate_mode, eps=1e-6)
-                    if use_counts and proj_loss_active:
-                        pred_ap_full = pred_ap_full * float(pred_to_counts_scale)
-                        pred_pa_full = pred_pa_full * float(pred_to_counts_scale)
                         gain_val_dbg = None
                         if gain_head is not None and z_enc is not None:
                             gain_val_dbg = F.softplus(gain_head(z_enc))
@@ -5042,33 +5227,68 @@ def train():
                     gain_val_raw = None
                     gain_val = None
                     gain_val_used = None
+                    
+                    # Always compute robust estimate for logging/fallback
+                    # Use full sum (no mask) to match loss inputs and debug logs
+                    sum_tgt = target_ap.sum() + target_pa.sum()
+                    sum_pred_no_gain = lambda_ap_used.sum() + lambda_pa_used.sum()
+                    
+                    if sum_pred_no_gain > 1e-6:
+                        gain_est = sum_tgt / (sum_pred_no_gain + 1e-8)
+                    else:
+                        gain_est = torch.tensor(1.0, device=device)
+
                     if use_counts:
-                        if gain_head is not None and z_enc is not None:
-                            gain_raw = gain_head(z_enc)
-                            gain_val_raw = F.softplus(gain_raw)
-                        elif gain_param is not None:
-                            gain_val_raw = F.softplus(gain_param)
-                        gain_val = gain_val_raw
-                        if proj_warmup_active and args.gain_warmup_mode != "none":
-                            fixed_gain = 1.0 if args.gain_warmup_mode == "one" else float(args.gain_prior_value)
-                            if gain_val_raw is not None:
-                                gain_val = gain_val_raw.new_full(gain_val_raw.shape, fixed_gain)
+                        if args.use_gain:
+                            # 1. Learnable Gain Calculation
+                            if gain_head is not None and z_enc is not None:
+                                gain_raw = gain_head(z_enc)
+                                gain_val_raw = F.softplus(gain_raw)
+                            elif gain_param is not None:
+                                gain_val_raw = F.softplus(gain_param)
+
+                            # 2. Fallback Logic
+                            is_finite_learnable = (gain_val_raw is not None) and torch.isfinite(gain_val_raw).all()
+                            
+                            if is_finite_learnable:
+                                gain_val_used = gain_val_raw
                             else:
-                                gain_val = torch.tensor(fixed_gain, device=device)
-                        if proj_loss_active:
-                            lambda_ap_used = lambda_ap_used * float(pred_to_counts_scale)
-                            lambda_pa_used = lambda_pa_used * float(pred_to_counts_scale)
-                            if gain_val is not None:
+                                gain_val_used = gain_est
+                            
+                            # Warmup override
+                            if proj_warmup_active and args.gain_warmup_mode != "none":
+                                fixed_gain = 1.0 if args.gain_warmup_mode == "one" else float(args.gain_prior_value)
+                                if gain_val_used is not None:
+                                    gain_val_used = gain_val_used.new_full(gain_val_used.shape, fixed_gain)
+                                else:
+                                    gain_val_used = torch.tensor(fixed_gain, device=device)
+                        else:
+                            # Gain disabled -> 1.0
+                            gain_val_used = torch.tensor(1.0, device=device)
+                            gain_val_raw = torch.tensor(1.0, device=device)
+                        
+                        gain_val = gain_val_used
+
+                        if proj_loss_active and args.use_gain:
+                            if gain_val_used is not None:
                                 g_min = float(args.gain_clamp_min) if args.gain_clamp_min is not None else None
                                 g_max = args.gain_clamp_max
                                 if g_min is not None or g_max is not None:
                                     gmin = g_min if g_min is not None else -float("inf")
                                     gmax = g_max if g_max is not None else float("inf")
-                                    gain_val_used = torch.clamp(gain_val, min=gmin, max=gmax)
-                                else:
-                                    gain_val_used = gain_val
+                                    gain_val_used = torch.clamp(gain_val_used, min=gmin, max=gmax)
                                 lambda_ap_used = lambda_ap_used * gain_val_used
                                 lambda_pa_used = lambda_pa_used * gain_val_used
+
+                        if step == 1:
+                            sum_pred_with_gain = lambda_ap_used.sum() + lambda_pa_used.sum()
+                            g_raw_v = gain_val_raw.mean().item() if (gain_val_raw is not None) else -1.0
+                            g_used_v = gain_val_used.mean().item() if (gain_val_used is not None) else 1.0
+                            print(f"[DEBUG][gain] use_gain={args.use_gain} sum_tgt={sum_tgt.item():.2f} "
+                                  f"sum_pred_no_gain={sum_pred_no_gain.item():.2f} "
+                                  f"sum_pred_with_gain={sum_pred_with_gain.item():.2f} "
+                                  f"gain_est={gain_est.item():.4f} gain_learnable_mean={g_raw_v:.4f} "
+                                  f"gain_used_final={g_used_v:.4f}", flush=True)
                     lambda_ap_eff = lambda_ap_used
                     lambda_pa_eff = lambda_pa_used
                     if proj_loss_type == "poisson" and proj_loss_active and float(args.poisson_rate_floor) > 0.0:
@@ -5099,7 +5319,7 @@ def train():
                                 p95_pa = float(torch.quantile(pred_pa, 0.95).item()) if pred_pa.numel() > 0 else float("nan")
                                 if p95_ap < 5 or p95_ap > 1e6 or p95_pa < 5 or p95_pa > 1e6:
                                     print("[WARN] Lambda p95 outside expected count scale (5..1e6).", flush=True)
-                        if step % 50 == 0:
+                        if step % 100 == 0:
                             pred_std = float(pred_ap.std().item())
                             target_std = float(target_ap.std().item())
                             if pred_std < 1e-6 and target_std > 1e-3:
@@ -5190,11 +5410,11 @@ def train():
                                 gain_stats = tensor_stats(gain_val)
                             scale_gain_stats = None
                             if proj_loss_active and gain_val_used is not None:
-                                scale_gain_stats = tensor_stats(gain_val_used * float(pred_to_counts_scale))
+                                scale_gain_stats = tensor_stats(gain_val_used)
                             print(
                                 f"[sanity][step {step}] pred_to_counts_scale={pred_to_counts_scale:.3e} "
                                 f"| gain(min/mean/p95/max)={fmt_stats(gain_stats)} "
-                                f"| scale*gain(min/mean/p95/max)={fmt_stats(scale_gain_stats)}",
+                                f"| gain_used(min/mean/p95/max)={fmt_stats(scale_gain_stats)}",
                                 flush=True,
                             )
                             gain_raw_mean = float(gain_val_raw.mean().item()) if gain_val_raw is not None else float("nan")
@@ -5337,13 +5557,12 @@ def train():
                     pred_act_raw = None
                     pred_act = None
                     pred_act_log = None
-                    if debug_act_step:
-                        pred_act, pred_act_raw = query_emission_at_points(
-                            generator, z_latent, coords, return_raw=True
-                        )
-                    else:
-                        pred_act, pred_act_raw = query_emission_at_points(
-                            generator, z_latent, coords, return_raw=True
+                    pred_act, pred_act_raw = query_emission_at_points(
+                        generator, z_latent, coords, return_raw=True
+                    )
+                    if debug_act_step and pred_act_raw is not None:
+                        print(
+                            f"[DEBUG][ACT][pred_act_raw] requires_grad={pred_act_raw.requires_grad}, is_leaf={pred_act_raw.is_leaf}, grad_fn={pred_act_raw.grad_fn is not None}", flush=True
                         )
                     if pred_act.numel() > 0:
                         act_norm_factor, act_norm_global = compute_act_norm_factor(
@@ -5361,7 +5580,20 @@ def train():
                         )
                         diff = F.smooth_l1_loss(pred_act_log, act_log, reduction="none")
                         loss_act = torch.mean(weights_act * diff)
-                        loss = loss + args.act_loss_weight * loss_act
+                        act_loss_weighted = args.act_loss_weight * loss_act
+                        loss = loss + act_loss_weighted
+                        global _PRED_ACT_STATS_LOGGED
+                        if not _PRED_ACT_STATS_LOGGED:
+                            _PRED_ACT_STATS_LOGGED = True
+                            pred_stats_dbg = tensor_stats(pred_act)
+                            eps = 1e-6
+                            positive_frac = float((pred_act > eps).float().mean().item())
+                            pred_sum = float(pred_act.sum().item())
+                            print(
+                                f"[sanity][pred_act] stats(min/mean/p95/max)={fmt_stats(pred_stats_dbg)} "
+                                f"| sum={pred_sum:.3e} | frac>{eps:.1e}={positive_frac:.3f} | sparsity<eps={(1.0-positive_frac):.3f}",
+                                flush=True,
+                            )
                         if debug_act_step:
                             act_vol_stats = tensor_stats(act_vol)
                             pos_vol_frac = float((act_vol > 1e-8).float().mean().item()) if act_vol is not None else float("nan")
@@ -5369,6 +5601,11 @@ def train():
                             act_stats_norm = tensor_stats(act_pos)
                             pred_stats = tensor_stats(pred_act)
                             pred_raw_stats = tensor_stats(pred_act_raw)
+                            print(
+                                f"[DEBUG][ACT][loss] loss_act={loss_act.item():.6f} (req_grad={loss_act.requires_grad}), weight={args.act_loss_weight}, "
+                                f"total_contribution={act_loss_weighted.item():.6f}, total_loss_before={loss.item()-act_loss_weighted.item():.6f}",
+                                flush=True
+                            )
                             zero_frac = float((act_samples == 0).float().mean().item())
                             tiny_frac = float((act_samples < 1e-6).float().mean().item())
                             pos_frac = float(pos_flags.float().mean().item()) if pos_flags.numel() > 0 else float("nan")
@@ -5739,24 +5976,103 @@ def train():
                     f"| ||g_act||={grad_stats['act']:.3e} | ||g_ct||={grad_stats['ct']:.3e}",
                     flush=True,
                 )
-    
+
+            if debug_act_step and pred_act_raw is not None:
+                # Hook für den Gradienten des rohen Netz-Outputs
+                pred_act_raw.retain_grad()
+
             scaler.scale(loss).backward()
+
+            # (3) Instrumentierung: Gradienten-Check (step 1)
+            if args.debug_enc and step == 1:
+                if hybrid_enabled and encoder is not None:
+                    found_enc_grad = False
+                    for p in encoder.parameters():
+                        if p.grad is not None:
+                            print(f"[DEBUG][ENC_BWD] Encoder grad norm: {p.grad.norm().item():.6e}, absmax: {p.grad.abs().max().item():.6e}", flush=True)
+                            found_enc_grad = True
+                            break
+                    if not found_enc_grad:
+                        print("[DEBUG][ENC_BWD] WARN: No gradient found for any encoder parameter.", flush=True)
+                
+                found_gen_grad = False
+                for p in generator.parameters():
+                    if p.grad is not None:
+                        print(f"[DEBUG][ENC_BWD] Generator grad norm: {p.grad.norm().item():.6e}, absmax: {p.grad.abs().max().item():.6e}", flush=True)
+                        found_gen_grad = True
+                        break
+                if not found_gen_grad:
+                    print("[DEBUG][ENC_BWD] WARN: No gradient found for any generator parameter.", flush=True)
+
             if debug_act_step:
                 net_module = generator.render_kwargs_train.get("network_fn")
-                gain_param_grad = 0.0
-                if gain_param is not None and gain_param.grad is not None:
-                    gain_param_grad = float(gain_param.grad.detach().abs().mean().item())
-                print(
-                    f"[DEBUG][ACT][grads][step {step}] net={module_grad_mean_abs(net_module):.3e} "
-                    f"encoder={module_grad_mean_abs(encoder):.3e} z_fuser={module_grad_mean_abs(z_fuser):.3e} "
-                    f"gain_head={module_grad_mean_abs(gain_head):.3e} gain_param={gain_param_grad:.3e}",
-                    flush=True,
-                )
+                if pred_act_raw is not None and pred_act_raw.grad is not None:
+                    grad_stats = tensor_stats(pred_act_raw.grad)
+                    print(f"[DEBUG][ACT][grad][pred_act_raw] {fmt_stats(grad_stats)}", flush=True)
+                else:
+                    print(f"[DEBUG][ACT][grad][pred_act_raw] grad is None", flush=True)
+
+                # Gradienten-Normen von ausgewählten Layern
+                first_layer_weight = net_module.pts_linears[0].weight
+                last_layer_weight = net_module.output_linear.weight
+                if first_layer_weight.grad is not None:
+                    print(f"[DEBUG][ACT][grad][net_early] {fmt_stats(tensor_stats(first_layer_weight.grad))}", flush=True)
+                else:
+                    print(f"[DEBUG][ACT][grad][net_early] grad is None", flush=True)
+                if last_layer_weight.grad is not None:
+                    print(f"[DEBUG][ACT][grad][net_final] {fmt_stats(tensor_stats(last_layer_weight.grad))}", flush=True)
+                else:
+                    print(f"[DEBUG][ACT][grad][net_final] grad is None", flush=True)
+
+                grad_norm_gen_val = torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
+                print(f"[DEBUG][ACT][grad] clip_grad_norm_(generator) returned: {float(grad_norm_gen_val):.6f}", flush=True)
+
+            # --- Instrumentierung: Parameter Update Check (Pre-Step) ---
+            do_param_debug = args.debug_enc and step in (1, 2)
+            enc_p0, enc_p0_before, enc_p0_norm = None, None, 0.0
+            gen_p0, gen_p0_before, gen_p0_norm = None, None, 0.0
+
+            if do_param_debug:
+                if hybrid_enabled and encoder is not None:
+                    for p in encoder.parameters():
+                        if p.requires_grad:
+                            enc_p0 = p
+                            enc_p0_before = p.detach().clone()
+                            enc_p0_norm = p.detach().norm().item()
+                            break
+                for p in generator.parameters():
+                    if p.requires_grad:
+                        gen_p0 = p
+                        gen_p0_before = p.detach().clone()
+                        gen_p0_norm = p.detach().norm().item()
+                        break
+
             grad_norm_global = global_grad_norm(opt_params) if hybrid_enabled else 0.0
             grad_norm_gen = torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
             clip_event = float(grad_norm_gen) > 1.0
             scaler.step(optimizer)
             scaler.update()
+
+            # --- Instrumentierung: Parameter Update Check (Post-Step) ---
+            if do_param_debug:
+                if enc_p0 is not None:
+                    dp = (enc_p0.detach() - enc_p0_before)
+                    dp_norm = dp.norm().item()
+                    dp_ratio = dp_norm / (enc_p0_norm + 1e-12)
+                    print(f"[DEBUG][ENC_UPD] step={step} dp_norm={dp_norm:.3e} dp_ratio={dp_ratio:.3e} p_norm={enc_p0_norm:.3e}", flush=True)
+                
+                if gen_p0 is not None:
+                    dq = (gen_p0.detach() - gen_p0_before)
+                    dq_norm = dq.norm().item()
+                    dq_ratio = dq_norm / (gen_p0_norm + 1e-12)
+                    print(f"[DEBUG][GEN_UPD] step={step} dq_norm={dq_norm:.3e} dq_ratio={dq_ratio:.3e} q_norm={gen_p0_norm:.3e}", flush=True)
+                
+                if step == 1:
+                     print("[DEBUG][OPTIM] Param groups LRs:", flush=True)
+                     for i, pg in enumerate(optimizer.param_groups):
+                         name = pg.get('name', f'group_{i}')
+                         lr_val = pg.get('lr', -1.0)
+                         print(f"  - {name}: lr={lr_val:.3e}", flush=True)
     
             torch.cuda.synchronize()
             iter_ms = (time.perf_counter() - t0) * 1000.0
@@ -6284,6 +6600,7 @@ def train():
                         pred_vol_step,
                         out_path_override=out_path,
                         grid_radius=_radius_to_float(generator.radius),
+                        radius_xyz=tuple(float(r) for r in generator.radius_xyz),
                     )
     
         proj_metrics_enabled_final = proj_loss_active and not (
@@ -6316,8 +6633,6 @@ def train():
                 lambda_ap_used = proj_ap
                 lambda_pa_used = proj_pa
             if use_counts_final and proj_loss_active:
-                lambda_ap_used = lambda_ap_used * float(pred_to_counts_scale)
-                lambda_pa_used = lambda_pa_used * float(pred_to_counts_scale)
                 gain_val_final = None
                 if gain_param is not None:
                     gain_val_final = F.softplus(gain_param)
@@ -6326,8 +6641,8 @@ def train():
                     proj_scale_enc = compute_proj_scale(ap, pa, args.proj_scale_source, meta)
                     proj_scale_enc = torch.clamp(proj_scale_enc, min=1e-6)
                     enc_input = build_encoder_input(
-                        ap,
-                        pa,
+                        ap_enc_input,
+                        pa_enc_input,
                         ct_vol,
                         proj_scale_enc,
                         args.encoder_proj_transform,
@@ -6438,6 +6753,7 @@ def train():
             pred_vol_final,
             out_path_override=final_out_path,
             grid_radius=_radius_to_float(generator.radius),
+            radius_xyz=tuple(float(r) for r in generator.radius_xyz),
         )
         final_test_stats = None
         n_test_batches = 0

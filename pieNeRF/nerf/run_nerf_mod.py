@@ -9,6 +9,8 @@ from .run_nerf_helpers_mod import *
 
 np.random.seed(0)                   # fixiere Zufallszahlen (Reproduzierbarkeit)
 _ATTENUATION_WARNED = False         # Flag um eine Warnung nur einmal auszugeben
+_RENDER_COORDS_LOGGED = False       # einmaliger Run-Log für pts/z_vals/near/far
+_SAMPLE_CT_VOLUME_LOGGED = False    # einmalige Info zu coords-clamp/clip
 
 
 # ---------------------------
@@ -133,14 +135,35 @@ def sample_ct_volume(pts, context):
         return None
     if volume.dim() != 5:
         raise ValueError(f"ct_volume must be [1,1,D,H,W], got {tuple(volume.shape)}")
-    radius = float(context.get("grid_radius", 1.0))
-    if radius <= 0:
-        raise ValueError("grid_radius must be > 0 for CT sampling.")
+    radius_xyz = context.get("grid_radius_xyz")
+    if radius_xyz is None:
+        radius = float(context.get("grid_radius", 1.0))
+        radius_xyz = (radius, radius, radius)
+    if any(r <= 0 for r in radius_xyz):
+        raise ValueError("grid_radius_xyz components must be > 0 for CT sampling.")
 
     if volume.device != pts.device:
         raise ValueError("ct_volume must live on the same device as ray samples for interpolation.")
 
-    coords = pts / radius                               # Weltkoordinaten normalisieren in [-1,1]
+    radius_tensor = torch.tensor(radius_xyz, device=pts.device, dtype=pts.dtype).view(1, 1, 3)
+    coords = pts / radius_tensor                         # Weltkoordinaten normalisieren in [-1,1]
+    coords_before_clamp = coords
+    global _SAMPLE_CT_VOLUME_LOGGED
+    if not _SAMPLE_CT_VOLUME_LOGGED:
+        _SAMPLE_CT_VOLUME_LOGGED = True
+        clip_mask = (coords_before_clamp.abs() > 1.0).any(dim=-1)
+        clip_frac = float(clip_mask.float().mean().item())
+        before_min = coords_before_clamp.amin(dim=(0, 1)).cpu().tolist()
+        before_max = coords_before_clamp.amax(dim=(0, 1)).cpu().tolist()
+        after_min = coords_before_clamp.clamp(-1.0, 1.0).amin(dim=(0, 1)).cpu().tolist()
+        after_max = coords_before_clamp.clamp(-1.0, 1.0).amax(dim=(0, 1)).cpu().tolist()
+        volume_name = context.get("volume_name", "ct")
+        print(
+            f"[sanity][sample_ct_volume] volume={volume_name} grid_radius_xyz={radius_xyz} grid_radius={context.get('grid_radius', radius_xyz[0])} "
+            f"coords_before(min/max)={before_min}/{before_max} "
+            f"coords_after(min/max)={after_min}/{after_max} clipped_frac={clip_frac:.3f}",
+            flush=True,
+        )
     coords = torch.clamp(coords, -1.0, 1.0)
     N_rays, N_samples = coords.shape[0], coords.shape[1]
     grid = coords.view(1, 1, N_rays, N_samples, 3)      # grid_sample erwartet 5D: [N, C, D, H, W]
@@ -417,6 +440,25 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
 
     # 3D-Samplepunkte entlang der Rays: p(s) = o + d * s
     pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]   # [N_rays, N_samples, 3]
+
+    global _RENDER_COORDS_LOGGED
+    if not _RENDER_COORDS_LOGGED:
+        _RENDER_COORDS_LOGGED = True
+        pts_min = pts.amin(dim=(0, 1)).cpu().tolist()
+        pts_max = pts.amax(dim=(0, 1)).cpu().tolist()
+        z_min = float(z_vals.min().item())
+        z_max = float(z_vals.max().item())
+        near_val = float(near.mean().item())
+        far_val = float(far.mean().item())
+        rays_d_mean = rays_d.mean(dim=0).cpu().tolist()
+        unique_dirs = rays_d.unique(dim=0)
+        unique_dir_count = unique_dirs.shape[0]
+        print(
+            f"[sanity][render_rays] pts_min={pts_min} pts_max={pts_max} "
+            f"z_vals(min/max)={z_min:.3e}/{z_max:.3e} | near={near_val:.3e} far={far_val:.3e} "
+            f"N_samples={N_samples} | rays_d.mean={rays_d_mean} unique_dirs={unique_dir_count}",
+            flush=True,
+        )
 
     # Netzabfrage: MLP-Forward auf allen Samplepunkten
     raw = network_query_fn(pts, viewdirs, network_fn, features)

@@ -35,8 +35,11 @@ echo "🏋️ Running train_emission.py..."
 exit_code=0
 srun ${PYTHON_BIN} -u train_emission.py \
   --config configs/spect.yaml \
-  --final-act-compare \
-  --max-steps 1 || exit_code=$?
+  --hybrid \
+  --debug-enc \
+  --encoder-lr-mult 1.0 \
+  --z-enc-alpha 1.0 \
+  --max-steps 10 || exit_code=$?
 echo "python_exit=$exit_code"
 if [ $exit_code -ne 0 ]; then
   echo "[ERROR] Training failed with exit_code=$exit_code"

@@ -45,6 +45,33 @@ def save_npy(path: str, arr: np.ndarray):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     np.save(path, arr)
 
+def save_activity_summary_txt(
+    path: str,
+    organs: List[str],
+    x_true: np.ndarray,
+    x_est: np.ndarray,
+    phantom_name: str,
+):
+    """Write GT vs estimated activities per organ group to a readable TXT file."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# Organ activity summary\n")
+        f.write(f"# Phantom: {phantom_name}\n")
+        f.write("# Units: model units (proportional to activity; absolute scaling depends on calibration)\n\n")
+
+        f.write(f"{'Organ':<18s}{'GT':>14s}{'EST':>14s}{'RelErr[%]':>14s}\n")
+        f.write("-" * 60 + "\n")
+
+        for name, gt, est in zip(organs, x_true, x_est):
+            if gt > 0:
+                rel_err = 100.0 * (est - gt) / gt
+                rel_str = f"{rel_err:14.2f}"
+            else:
+                rel_str = f"{'n/a':>14s}"
+
+            f.write(f"{name:<18s}{gt:14.6f}{est:14.6f}{rel_str}\n")
+
 # -----------------------------------------------------------------------------
 # organ_ids.txt mapping (Activity-ID namespace, matches mask values)
 # -----------------------------------------------------------------------------
@@ -270,6 +297,10 @@ def run_lgs_and_nnls(
     atn  = load_raw_volume(fnameATN,  (nx,ny,nz), dtype=np.float32)
     mask_ids = load_raw_volume(fnameMASK, (nx,ny,nz), dtype=np.float32).astype(np.uint32)
     kernel_mat = loadmat(os.path.join(base_dir, "LEAP_Kernel.mat"))["kernel_mat"].astype(np.float32)
+    # Physikalisch korrekte Normierung
+    kernel_sum = kernel_mat.sum(axis=(0,1), keepdims=True)
+    kernel_sum[kernel_sum == 0] = 1.0
+    kernel_mat /= kernel_sum
 
     # Default groups (tokens to match names in organ_ids.txt like '*_activity')
     if organ_groups is None:
@@ -408,6 +439,15 @@ def run_lgs_and_nnls(
     _save_quad_figure(
         proj_AP_gt, proj_PA_gt, proj_AP_rec, proj_PA_rec,
         os.path.join(out_dir, f"{phantom_name}_GT_vs_REC_quadrant.png")
+    )
+
+    # --- Save per-organ activity summary (GT vs EST) ---
+    save_activity_summary_txt(
+        os.path.join(out_dir, f"{phantom_name}_activity_summary.txt"),
+        organs,
+        true_x,
+        x_est,
+        phantom_name,
     )
 
     return {

@@ -11,6 +11,110 @@ from torchvision.datasets.vision import VisionDataset
 
 
 
+_CT_ACT_STATS_LOGGED = False
+
+def _quantile_sample(flat: torch.Tensor, max_samples: int = 200_000) -> torch.Tensor:
+    sample_size = min(flat.numel(), max_samples)
+    if sample_size < flat.numel():
+        indices = torch.randint(flat.numel(), (sample_size,), device=flat.device)
+        flat = flat[indices]
+    if flat.device.type == "cuda":
+        flat = flat.cpu()
+    return flat
+
+def _safe_quantile(tensor: torch.Tensor, quantile: float) -> float:
+    sample = _quantile_sample(tensor.reshape(-1))
+    return float(torch.quantile(sample, quantile).item())
+
+def _tensor_stats_tuple(tensor: torch.Tensor):
+    if tensor.numel() == 0:
+        return float("nan"), float("nan"), float("nan"), float("nan"), float("nan"), float("nan")
+    flat = tensor.reshape(-1)
+    return (
+        float(flat.min().item()),
+        float(flat.max().item()),
+        float(flat.mean().item()),
+        _safe_quantile(flat, 0.01),
+        _safe_quantile(flat, 0.5),
+        _safe_quantile(flat, 0.99),
+    )
+
+def _axis_sums(vol: torch.Tensor):
+    sum_over_x = vol.sum(dim=(0, 2))
+    sum_over_y = vol.sum(dim=(0, 1))
+    sum_over_z = vol.sum(dim=(1, 2))
+    return sum_over_x, sum_over_y, sum_over_z
+
+def _center_of_mass(vol: torch.Tensor, mask: torch.Tensor):
+    mask_float = mask.to(vol.dtype)
+    masked = vol * mask_float
+    mass = masked.sum()
+    if mass <= 0:
+        return torch.tensor([float("nan"), float("nan"), float("nan")], device=vol.device)
+    D, H, W = vol.shape
+    z_coords = torch.arange(D, device=vol.device, dtype=vol.dtype)
+    y_coords = torch.arange(H, device=vol.device, dtype=vol.dtype)
+    x_coords = torch.arange(W, device=vol.device, dtype=vol.dtype)
+    com_z = (masked.sum(dim=(1, 2)) * z_coords).sum() / mass
+    com_y = (masked.sum(dim=(0, 2)) * y_coords).sum() / mass
+    com_x = (masked.sum(dim=(0, 1)) * x_coords).sum() / mass
+    return torch.stack([com_z, com_y, com_x])
+
+def _log_ct_act_once(ct: torch.Tensor, act: torch.Tensor):
+    global _CT_ACT_STATS_LOGGED
+    if _CT_ACT_STATS_LOGGED:
+        return
+    _CT_ACT_STATS_LOGGED = True
+    def describe(name: str, vol: torch.Tensor):
+        shape = tuple(vol.shape)
+        stats = _tensor_stats_tuple(vol)
+        sum_x, sum_y, sum_z = _axis_sums(vol)
+        sum_stats = (
+            float(sum_x.min().item()),
+            float(sum_x.max().item()),
+            float(sum_y.min().item()),
+            float(sum_y.max().item()),
+            float(sum_z.min().item()),
+            float(sum_z.max().item()),
+        )
+        return shape, stats, sum_stats
+
+    def compute_com(vol: torch.Tensor, thresh: float, name: str):
+        if vol.numel() == 0:
+            return torch.tensor([float("nan")] * 3)
+        active = vol > thresh
+        if not active.any():
+            active = vol > 0.0
+        if not active.any():
+            active = vol >= 0.0
+        return _center_of_mass(vol, active)
+
+    if ct.numel() > 0:
+        shape, stats, sum_stats = describe("CT", ct)
+        print(
+            f"[debug][ct] shape={shape} stats(min/max/mean/p1/p50/p99)=({stats[0]:.3e},{stats[1]:.3e},"
+            f"{stats[2]:.3e},{stats[3]:.3e},{stats[4]:.3e},{stats[5]:.3e}) "
+            f"axis_sums(min/max)=({sum_stats[0]:.3e}/{sum_stats[1]:.3e}->{sum_stats[2]:.3e}/{sum_stats[3]:.3e}->"
+            f"{sum_stats[4]:.3e}/{sum_stats[5]:.3e})",
+            flush=True,
+        )
+        thresh_ct = max(_safe_quantile(ct, 0.8), 0.1)
+        ct_com = compute_com(ct, thresh_ct, "CT").cpu().tolist()
+        print(f"[debug][ct] CoM(z,y,x) above thresh {thresh_ct:.3e}: {ct_com}", flush=True)
+    if act.numel() > 0:
+        shape, stats, sum_stats = describe("ACT", act)
+        print(
+            f"[debug][act] shape={shape} stats(min/max/mean/p1/p50/p99)=({stats[0]:.3e},{stats[1]:.3e},"
+            f"{stats[2]:.3e},{stats[3]:.3e},{stats[4]:.3e},{stats[5]:.3e}) "
+            f"axis_sums(min/max)=({sum_stats[0]:.3e}/{sum_stats[1]:.3e}->{sum_stats[2]:.3e}/{sum_stats[3]:.3e}->"
+            f"{sum_stats[4]:.3e}/{sum_stats[5]:.3e})",
+            flush=True,
+        )
+        thresh_act = max(_safe_quantile(act, 0.5), 1e-6)
+        act_com = compute_com(act, thresh_act, "ACT").cpu().tolist()
+        print(f"[debug][act] CoM(z,y,x) above thresh {thresh_act:.3e}: {act_com}", flush=True)
+
+
 class SpectDataset(torch.utils.data.Dataset):
     """
     Dataset für SPECT-ähnliche Rekonstruktion:
@@ -25,6 +129,7 @@ class SpectDataset(torch.utils.data.Dataset):
         debug_proj_stats: bool = False,
         act_scale: float = 1.0,
         ct_prefer_raw: bool = False,
+        proj_input_source: str = "counts",
     ):  
         super().__init__()
         self.manifest_path = Path(manifest_path)                                # manifest_path = Pfad zur csv mit Spalten phantom_id, ap_path, pa_path, ct_path
@@ -34,10 +139,14 @@ class SpectDataset(torch.utils.data.Dataset):
         self.transform_ct = transform_ct                                        # "
         self.act_scale = float(act_scale)                                       # globaler Faktor für ACT/λ (keine Normierung)
         self.ct_prefer_raw = bool(ct_prefer_raw)
+        self.proj_input_source = str(proj_input_source or "counts").lower()
+        if self.proj_input_source not in {"counts", "normalized"}:
+            raise ValueError(f"Unknown proj_input_source: {proj_input_source}")
         self._logged_debug = False                                               # sorgt dafür, dass Debug-Ausgabe nur einmal erfolgt
         self._debug_proj_stats = bool(debug_proj_stats)
         self._logged_debug_proj_stats = False
         self._warned_scale_mismatch = False
+        self._logged_proj_input_stats = False
 
         self.entries = []                                                       # Liste in der für jeden Fall ein kleines Dict mit Pfaden & ID steht
         with open(self.manifest_path, newline="") as f:                         # CSV öffnen
@@ -178,6 +287,7 @@ class SpectDataset(torch.utils.data.Dataset):
         ct_path_used = self._resolve_ct_path(e["ct_path"])
         ct = self._load_npy_ct(e["ct_path"])                                    # lädt CT Volumen (gescaled)  
         act = self._load_npy_act(e["act_path"])                                 # lädt ACT Volumen (ohne Normierung, nur globaler Faktor)
+        _log_ct_act_once(ct, act)
         ap_counts = self._load_npy_counts(e.get("ap_counts_path"))
         pa_counts = self._load_npy_counts(e.get("pa_counts_path"))
 
@@ -229,6 +339,34 @@ class SpectDataset(torch.utils.data.Dataset):
             )
             self._warned_scale_mismatch = True
 
+        counts_available = (ap_counts.numel() > 0) and (pa_counts.numel() > 0)
+        use_counts_for_input = self.proj_input_source == "counts" and counts_available
+        proj_input_source_used = "counts" if use_counts_for_input else "normalized"
+        proj_input_ap = ap_counts if use_counts_for_input else ap
+        proj_input_pa = pa_counts if use_counts_for_input else pa
+
+        if not self._logged_proj_input_stats:
+            self._logged_proj_input_stats = True
+            def _min_max_mean(tensor: torch.Tensor) -> tuple[float, float, float]:
+                if tensor.numel() == 0:
+                    return float("nan"), float("nan"), float("nan")
+                flat = tensor.reshape(-1)
+                return float(flat.min().item()), float(flat.mean().item()), float(flat.max().item())
+
+            ap_counts_stats = _min_max_mean(ap_counts)
+            pa_counts_stats = _min_max_mean(pa_counts)
+            proj_ap_stats = _min_max_mean(proj_input_ap)
+            proj_pa_stats = _min_max_mean(proj_input_pa)
+            counts_status = "available" if counts_available else "missing"
+            print(
+                f"[DEBUG][proj-input] source_requested={self.proj_input_source} counts={counts_status} | "
+                f"ap_counts(min/mean/max)={ap_counts_stats[0]:.3e}/{ap_counts_stats[1]:.3e}/{ap_counts_stats[2]:.3e} | "
+                f"pa_counts(min/mean/max)={pa_counts_stats[0]:.3e}/{pa_counts_stats[1]:.3e}/{pa_counts_stats[2]:.3e} | "
+                f"encoder_input(min/mean/max) AP={proj_ap_stats[0]:.3e}/{proj_ap_stats[1]:.3e}/{proj_ap_stats[2]:.3e} "
+                f"PA={proj_pa_stats[0]:.3e}/{proj_pa_stats[1]:.3e}/{proj_pa_stats[2]:.3e}",
+                flush=True,
+            )
+
         return {                                                                # Rückgabe ist ein Dictionary   
             "ap": ap,
             "pa": pa,
@@ -248,9 +386,13 @@ class SpectDataset(torch.utils.data.Dataset):
                 "proj_scale_joint_p99": float(e["proj_scale_joint_p99"]) if e.get("proj_scale_joint_p99") is not None else float("nan"),
                 "proj_scale_joint_p99_missing": bool(e.get("proj_scale_joint_p99_missing")),
             },
+            "proj_input_ap": proj_input_ap,
+            "proj_input_pa": proj_input_pa,
+            "proj_input_source_used": proj_input_source_used,
             "ap_counts": ap_counts,
             "pa_counts": pa_counts,
         }
+
     def _resolve_path(self, raw_path: str) -> Path:
         path = Path(raw_path)
         if path.is_absolute():

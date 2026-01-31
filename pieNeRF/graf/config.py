@@ -59,12 +59,15 @@ def get_data(config):
         debug_proj_stats=bool(data_cfg.get("debug_proj_stats", False)),
         act_scale=float(data_cfg.get("act_scale", 1.0)),
         ct_prefer_raw=bool(data_cfg.get("ct_prefer_raw", False)),
+        proj_input_source=data_cfg.get("proj_input_source", "counts"),
     )
 
     # 2) H und W aus einem Beispiel-AP-Bild ableiten
     sample0 = dset[0]
     ap0 = sample0["ap"]                                             # Shape: [1, H, W]
     _, H, W = ap0.shape                                             # H und W stammen aus echten Daten (nicht aus config)
+    ct0 = sample0["ct"]
+    depth_dim = int(ct0.shape[0]) if (ct0 is not None and ct0.numel() > 0) else None
 
     # 3) FOV aus Config nehmen und formale "focal" berechnen (wird für orthografisches Rendern nicht genutzt)
     fov = data_cfg["fov"]
@@ -79,6 +82,21 @@ def get_data(config):
         radius = tuple(float(r) for r in radius.split(","))
         render_radius = max(radius)
     dset.radius = radius
+
+    use_aniso = bool(data_cfg.get("use_anisotropic_radius", False))
+    radius_xyz_cm = data_cfg.get("radius_xyz_cm")
+    if radius_xyz_cm is not None:
+        radius_xyz_cm = tuple(float(r) for r in radius_xyz_cm)
+    if use_aniso and radius_xyz_cm is None and depth_dim is not None:
+        voxel_mm = float(data_cfg.get("voxel_mm", 1.5))
+        mm_to_cm = 0.1
+        radius_xyz_cm = (
+            (W * voxel_mm * mm_to_cm) / 2.0,
+            (H * voxel_mm * mm_to_cm) / 2.0,
+            (depth_dim * voxel_mm * mm_to_cm) / 2.0,
+        )
+    if radius_xyz_cm is not None:
+        data_cfg["radius_xyz_cm"] = [float(r) for r in radius_xyz_cm]
 
     # 5) Keine Render-Posen (AP/PA sind fix), also None
     render_poses = None
@@ -153,6 +171,7 @@ def build_models(config):
         range_u=(float(config["data"]["umin"]), float(config["data"]["umax"])),                             # normalisierte Koordinatenbereiche im Bild (für Auswahl von Pixelbereichen)
         range_v=(float(config["data"]["vmin"]), float(config["data"]["vmax"])),
         orthographic=config["data"]["orthographic"],
+        radius_xyz_cm=tuple(config["data"]["radius_xyz_cm"]) if config["data"].get("radius_xyz_cm") is not None else None,
     )
     generator = generator.to("cuda")                                                                        # verschiebt alle Modelle auf die GPU
 

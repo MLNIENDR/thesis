@@ -6,6 +6,13 @@
 # - Projection-Loss (AP/PA) ist immer aktiv (Training + Val/Test).
 # - ACT-Loss soll NUR im Training wirken (Supervision), Val/Test bleiben projektionsbasiert.
 # - imsize: null => native Auflösung, keine Resize-Pipeline.
+#
+# ANISOTROP / PHYSIK:
+# - Wir benutzen eine anisotrope Weltbox (rx, ry, rz) in cm, abgeleitet aus voxel_mm und (W,H,D).
+# - Wenn auto_near_far_from_radius=true, wird near/far (im Code) auf physikalische cm gesetzt:
+#   near=0, far=2*rz.
+# - In dem Fall sollte atten_scale NICHT nochmal die Pfadlänge "reinmultiplizieren".
+#   => Für physikalisch plausibles Attenuation-Integral: atten_scale = 1.0.
 # ============================================================
 
 expname: spect_emission
@@ -20,6 +27,7 @@ data:
 
   # -------- Projektionsgeometrie ----------
   orthographic: true           # Parallelbeam / planare Szintigraphie
+  # near/far werden bei auto_near_far_from_radius im Code überschrieben (cm-world):
   near: 0.0
   far: 1.0
 
@@ -31,6 +39,8 @@ data:
   # -------- ACT scaling ----------
   # globaler Skalenfaktor für ACT, falls du z.B. Einheit/Skalierung anpassen willst.
   act_scale: 1.0
+  # Datenquelle für den Encoder-Input: counts (roh) oder normalized (p99.9-normalisiert)
+  proj_input_source: counts
 
   # -------- Phantom-Split (patient_id disjunkt) ----------
   split_by_patient_id: true
@@ -43,12 +53,22 @@ data:
   split_test_count: 2
 
   # -------- NeRF Raum-Parameter ----------
-  # Bei orthographic weniger kritisch, aber sinnvoll als grobe Normalisierung.
+  # radius/fov bleiben als Legacy/Default drin; bei anisotropem Setup ist radius_xyz_cm maßgeblich.
   radius: 0.5
   fov: 60.0
 
+  # -------- Anisotrope Weltbox / physikalische Größe ----------
+  voxel_mm: 1.5                  # Voxelkante in Millimetern (physikalisch isotrop)
+  use_anisotropic_radius: true
+  # aus (W,H,D)=(651,256,256) und 1.5mm → halbe Extents in cm:
+  # x (W): 651*1.5mm = 976.5mm = 97.65cm => rx=48.825
+  # y (H): 256*1.5mm = 384mm   = 38.4cm  => ry=19.2
+  # z (D): 256*1.5mm = 384mm   = 38.4cm  => rz=19.2
+  radius_xyz_cm: [48.825, 19.2, 19.2]
+  auto_near_far_from_radius: true
+
   # -------- Augmentation ----------
-  augmentation: false          # medizinisch: erstmal aus
+  augmentation: false            # medizinisch: erstmal aus
 
   # -------- Platzhalter / unbenutzt bei fixed poses ----------
   umin: 0.0
@@ -64,16 +84,18 @@ nerf:
   multires_views: 0
 
   # -------- Viewdirs ----------
-  use_viewdirs: false          # Emission idealisiert isotrop
+  use_viewdirs: false            # Emission idealisiert isotrop
 
   # -------- Attenuation via CT ----------
   use_attenuation: true
   attenuation_debug: false
-  atten_scale: 38.4            # globaler Längenskalenfaktor für ∫ μ ds
+  # WICHTIG: bei physikalischer cm-world (near/far=0..2*rz) atten_scale auf 1.0 setzen,
+  # sonst skaliert ihr die Schwächung (Pfadlänge) doppelt.
+  atten_scale: 1.0
 
   # -------- Sampling entlang Strahl ----------
   N_samples: 96
-  N_importance: 0              # 0 => kein Fine-Sampling
+  N_importance: 0                # 0 => kein Fine-Sampling
 
   # -------- MLP Größe ----------
   netdepth: 8
@@ -82,7 +104,7 @@ nerf:
   netwidth_fine: 256
 
   # -------- Stratified sampling ----------
-  perturb: 1                   # 1 => jitter (default), 0 => deterministisch
+  perturb: 1                     # 1 => jitter (default), 0 => deterministisch
 
   # -------- Noise ----------
   raw_noise_std: 0.0
@@ -121,7 +143,7 @@ training:
 
   # -------- DataLoader ----------
   nworkers: 4
-  batch_size: 1                # pro Patient / Phantom ein Batch
+  batch_size: 1                  # pro Patient / Phantom ein Batch
 
   # -------- Memory/Speed ----------
   chunk: 8192
@@ -143,18 +165,15 @@ training:
   tv3d_grid_size: 32
 
   # -------- Projection loss (AP/PA) ----------
-  # Diese Parameter sitzen i.d.R. im Code/CLI, nicht immer im YAML sichtbar.
-  # Falls euer YAML diese keys unterstützt, könnt ihr sie hier setzen:
+  # Projection-Loss ist (per Code/CLI) aktiv (Training + Val/Test).
+  # Falls eure YAML diese keys unterstützt, könnt ihr sie hier setzen (optional):
   # proj_loss_type: poisson
   # proj_target_source: counts
   # proj_loss_weight: 0.1
   # proj_warmup_steps: 0
 
   # -------- ACT supervision (TRAIN ONLY) ----------
-  # Ziel: ACT soll tatsächlich Einfluss haben.
-  # 0.01 war bei dir viel zu klein (act Beitrag <<1%).
-  # Starte mit 0.1, prüfe Verhältnis act vs (ap+pa) nach 200-500 steps.
-  act_loss_weight: 0.1         # TRAIN-only ACT supervision (val/test bleiben projektionsbasiert)
+  act_loss_weight: 0.1           # TRAIN-only ACT supervision (val/test bleiben projektionsbasiert)
   act_samples: 16384
   act_pos_weight: 2.0
   act_pos_fraction: 0.5
@@ -172,7 +191,9 @@ training:
   lr_anneal_every: []
 
   # -------- Validation / Test ----------
-  val_interval: 1
+  # Für "echte" Läufe würde ich val_interval wieder auf 200 setzen.
+  # val_interval=1 ist ok für Debug/Smoke-Tests, aber kostet Zeit/IO.
+  val_interval: 200
   debug_eval_flow: false
   run_final_test: true
 

@@ -42,12 +42,14 @@ class Generator(object):
         chunk=None,
         device="cuda",
         orthographic=False,
+        radius_xyz_cm=None,
     ):                                                                                          # Basis-Parameter
         self.device = device        
         self.H = int(H)
         self.W = int(W)
         self.focal = focal
         self.radius = radius
+        self._radius_xyz_cm = tuple(float(r) for r in radius_xyz_cm) if radius_xyz_cm is not None else None
         self.range_u = range_u
         self.range_v = range_v
         self.chunk = chunk
@@ -95,6 +97,13 @@ class Generator(object):
 
         # render-Funktion mit festen H, W, focal, chunk
         self.render = partial(render, H=self.H, W=self.W, focal=self.focal, chunk=self.chunk)
+
+    @property
+    def radius_xyz(self):
+        if self._radius_xyz_cm is not None:
+            return self._radius_xyz_cm
+        scalar = self.radius if not isinstance(self.radius, tuple) else self.radius[1]
+        return (float(scalar), float(scalar), float(scalar))
 
     def __call__(self, z, y=None, rays=None):
         """
@@ -225,12 +234,19 @@ class Generator(object):
         - PA: Kamera auf -Z, blickt zum Ursprung
         `radius`: nutzt self.radius, wenn None. `up` ist die Welt-„oben“-Richtung.
         """
-        if radius is None:
-            radius = self.radius if not isinstance(self.radius, tuple) else self.radius[1]
+        # Wenn eine anisotrope Weltbox definiert ist, dann hat diese Vorrang vor jeglichen globalen Radius-Angaben
+        if self._radius_xyz_cm is not None:
+            rx, ry, rz = self.radius_xyz
+        elif radius is None:
+            rx, ry, rz = self.radius_xyz
+        else:
+            scalar = radius if not isinstance(radius, tuple) else radius[1]
+            scalar = float(scalar)
+            rx = ry = rz = scalar
 
         # AP = +z, PA = -z
-        loc_ap = np.array([0.0, 0.0, +float(radius)], dtype=np.float32)
-        loc_pa = np.array([0.0, 0.0, -float(radius)], dtype=np.float32)
+        loc_ap = np.array([0.0, 0.0, +float(rz)], dtype=np.float32)
+        loc_pa = np.array([0.0, 0.0, -float(rz)], dtype=np.float32)
 
         self.pose_ap = _pose_from_loc(loc_ap, up=up)
         self.pose_pa = _pose_from_loc(loc_pa, up=up)
@@ -241,10 +257,9 @@ class Generator(object):
         self.fixed_poses_enabled = True
         self._fixed_pose_toggle = 0                         # starte mit AP
 
-        # Orthographische Größe an den CT-Würfel anpassen: Breite/Höhe = 2*radius
+        # Orthographische Größe an den CT-Würfel anpassen: Größe in cm entlang der echten x/y-Extents
         if self.orthographic:
-            size = 2.0 * float(radius)
-            self.ortho_size = (size, size)
+            self.ortho_size = (2.0 * float(ry), 2.0 * float(rx))
 
     def render_from_pose(self, z, pose, ct_context=None):
         """
@@ -367,10 +382,8 @@ class Generator(object):
         if vol.dim() != 5:
             raise ValueError(f"Expected CT data with D/H/W axes, got shape {tuple(ct_volume.shape)}")
 
-        radius = self.radius
-        if isinstance(radius, tuple):
-            radius = radius[1]
-        radius = float(radius)
+        radius_xyz = self.radius_xyz
+        radius = max(radius_xyz)
         if radius <= 0:
             raise ValueError("Generator radius must be > 0 to map world coords to CT grid.")
 
@@ -382,6 +395,7 @@ class Generator(object):
         return {
             "volume": vol,
             "grid_radius": radius,
+            "grid_radius_xyz": radius_xyz,
             "value_range": (vmin, vmax),
             "padding_mode": padding_mode,
         }

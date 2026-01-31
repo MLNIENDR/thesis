@@ -7,6 +7,8 @@ import torch.nn.functional as F
 import numpy as np
 from functools import partial
 
+_ORTHO_RAYS_DEBUGGED = False
+
 # Positional Encoding (Fourier Features) - wichtig für NeRF
 class Embedder:
     """Baut mehrere Frequenz-Basisfunktionen sin(kx), cos(kx)
@@ -162,11 +164,41 @@ def get_rays_ortho(H, W, c2w, size_h, size_w):
         grid_y, grid_x = torch.meshgrid(ys, xs)
     # Invertiere die Detektor-x-Achse, damit Bildkoordinaten (links→rechts) mit Weltkoordinaten übereinstimmen.
     grid_x = -grid_x
-    zeros = torch.zeros_like(grid_x)
-    rays_o_cam = torch.stack([grid_x, grid_y, zeros], dim=-1)
 
-    # Drehe in den Welt-Raum und addiere Kameraposition
-    rays_o = torch.sum(rays_o_cam[..., None, :] * c2w[:3, :3], dim=-1)
-    rays_o = rays_o + c2w[:3, -1].view(1, 1, 3)
+    # Kamerarotationsachsen: Spalten 0/1 entsprechen Kamera-x/y im Welt-Raum.
+    x_axis = c2w[:3, 0].view(1, 1, 3)
+    y_axis = c2w[:3, 1].view(1, 1, 3)
+    origin = c2w[:3, -1].view(1, 1, 3)
+
+    # Setze die Ursprungsebene der Rays anhand der Rasterkoordinaten zusammen.
+    rays_o = grid_x.unsqueeze(-1) * x_axis + grid_y.unsqueeze(-1) * y_axis
+    rays_o = rays_o + origin
+
+    global _ORTHO_RAYS_DEBUGGED
+    if not _ORTHO_RAYS_DEBUGGED:
+        _ORTHO_RAYS_DEBUGGED = True
+        xs_range = (float(xs.min().item()), float(xs.max().item()))
+        ys_range = (float(ys.min().item()), float(ys.max().item()))
+        rays_min = torch.stack([rays_o[..., 0].amin(), rays_o[..., 1].amin(), rays_o[..., 2].amin()])
+        rays_max = torch.stack([rays_o[..., 0].amax(), rays_o[..., 1].amax(), rays_o[..., 2].amax()])
+        print(
+            "[debug][get_rays_ortho] size_h={:.3f}cm size_w={:.3f}cm "
+            "xs_range={:.3f}/{:.3f}cm ys_range={:.3f}/{:.3f}cm "
+            "rays_o_x={:.3f}/{:.3f}cm rays_o_y={:.3f}/{:.3f}cm rays_o_z={:.3f}/{:.3f}cm".format(
+                size_h,
+                size_w,
+                xs_range[0],
+                xs_range[1],
+                ys_range[0],
+                ys_range[1],
+                rays_min[0].item(),
+                rays_max[0].item(),
+                rays_min[1].item(),
+                rays_max[1].item(),
+                rays_min[2].item(),
+                rays_max[2].item(),
+            ),
+            flush=True,
+        )
 
     return rays_o, rays_d
