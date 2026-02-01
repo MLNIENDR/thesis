@@ -229,6 +229,18 @@ def parse_args():
         help="Gewicht für einen optionalen Volumen-Loss gegen act.npy (0 = deaktiviert).",
     )
     parser.add_argument(
+        "--act-sparsity-weight",
+        type=float,
+        default=0.0,
+        help="Gewicht für L1-Sparsity auf der vorhergesagten Aktivität (pred_pos.mean()).",
+    )
+    parser.add_argument(
+        "--act-tv-weight",
+        type=float,
+        default=0.0,
+        help="Gewicht für isotrope 3D Total Variation auf pred_pos (ACT Phase A Regularisierung).",
+    )
+    parser.add_argument(
         "--hybrid",
         action="store_true",
         help="Aktiviert den Hybrid-Ansatz: AP/PA -> Encoder -> z_enc Conditioning + Projection-Loss als Nebenloss.",
@@ -1751,6 +1763,8 @@ def init_log_file(path: Path) -> Path:
         "loss_ap",
         "loss_pa",
         "loss_act",
+        "loss_sparsity",
+        "loss_act_tv",
         "loss_ct",
         "ray_tv",
         "ray_tv_w",
@@ -3182,9 +3196,10 @@ def save_final_act_compare_volume_slicing(
     out_path_override: Optional[Path] = None,
     grid_radius: Optional[float] = None,
     radius_xyz: Optional[Tuple[float, float, float]] = None,
+    force_save: bool = False,
 ):
     """Finale GT-vs-Pred Activity-Compare PNG via reinem Volumen-Slicing (wie in test.py)."""
-    if not bool(getattr(args, "final_act_compare", False)):
+    if not (bool(getattr(args, "final_act_compare", False)) or force_save):
         return
 
     if act_vol is None or act_vol.numel() == 0:
@@ -5013,7 +5028,17 @@ def train():
                 z_latent = z_base
             last_z_latent = z_latent
 
-            skip_proj = bool(args.act_only)
+            # Phase A: ACT-only training.
+            # Wenn args.act_loss_weight > 0 und alle projektionsrelevanten Gewichte effektiv 0 sind
+            # (proj_loss_weight == 0, ray_tv_weight == 0, bg_depth_mass_weight == 0)
+            # dann: Kein Projektions-Forward.
+            phase_a_active = (
+                args.act_loss_weight > 0.0
+                and args.proj_loss_weight == 0.0
+                and args.ray_tv_weight == 0.0
+                and args.bg_depth_mass_weight == 0.0
+            )
+            skip_proj = bool(args.act_only) or phase_a_active
             debug_act_step = bool(args.debug_act and step == 1)
             proj_warmup_active = bool(args.proj_warmup_steps > 0 and step <= args.proj_warmup_steps)
             proj_weight = 0.0
@@ -5541,6 +5566,8 @@ def train():
                             loss = loss + bg_depth_mass_w
     
                 loss_act = torch.tensor(0.0, device=device)
+                loss_sparsity = torch.tensor(0.0, device=device)
+                loss_act_tv = torch.tensor(0.0, device=device)
                 act_norm_factor = 1.0
                 if args.act_loss_weight > 0.0 and act_vol is not None:
                     radius = generator.radius
@@ -5565,12 +5592,51 @@ def train():
                             f"[DEBUG][ACT][pred_act_raw] requires_grad={pred_act_raw.requires_grad}, is_leaf={pred_act_raw.is_leaf}, grad_fn={pred_act_raw.grad_fn is not None}", flush=True
                         )
                     if pred_act.numel() > 0:
-                        act_norm_factor, act_norm_global = compute_act_norm_factor(
-                            act_vol, args.act_norm_source, args.act_norm_value, act_norm_global
-                        )
-                        act_norm_factor = float(act_norm_factor)
-                        pred_pos = pred_act_raw.clamp_min(0.0) / max(act_norm_factor, 1e-8)
-                        act_pos = act_samples.clamp_min(0.0) / max(act_norm_factor, 1e-8)
+                        # --- ACT norm factor ---
+                        if args.act_norm_source == "none":
+                            act_norm_factor = 1.0
+                            act_norm_t = torch.tensor(1.0, device=device, dtype=pred_act_raw.dtype)
+                        else:
+                            act_norm_factor, act_norm_global = compute_act_norm_factor(
+                                act_vol, args.act_norm_source, args.act_norm_value, act_norm_global
+                            )
+                            act_norm_t = torch.tensor(float(act_norm_factor), device=device, dtype=pred_act_raw.dtype)
+
+                        # Parametrisierung: Shifted Softplus (f(0)=0) + Clamp für strikte Positivität
+                        # raw ~ 0 -> softplus(0) = ln(2) -> minus ln(2) = 0.
+                        pred_act_debiased = F.softplus(pred_act_raw) - 0.6931472
+                        pred_pos = pred_act_debiased.clamp(min=0.0) / torch.clamp(act_norm_t, min=1e-8)
+
+                        # [DEBUG][ACT-BIAS] Analyse des 0.693-Bias (softplus(0))
+                        if step == 1:
+                            with torch.no_grad():
+                                def _s(name, t):
+                                    if t is None: return
+                                    t_f = t.detach().float()
+                                    print(f"[DEBUG][ACT-BIAS][step 1] {name}: "
+                                          f"min={t_f.min():.3e} mean={t_f.mean():.3e} "
+                                          f"max={t_f.max():.3e} dtype={t_f.dtype} device={t_f.device}",
+                                          flush=True)
+
+                                _s("pred_act_raw (net out)", pred_act_raw)
+                                _s("pred_act (softplus(raw))", pred_act)
+                                _s("pred_act_debiased (shifted)", pred_act_debiased)
+                                _s("pred_pos (for loss, normalized)", pred_pos)
+                                print(f"[DEBUG][ACT-BIAS][step 1] act_norm_factor={act_norm_factor:.6e}", flush=True)
+                                act_pos_debug = act_samples.clamp_min(0.0) / torch.clamp(act_norm_t, min=1e-8)
+                                _s("act_log (for loss)", torch.log1p(act_pos_debug))
+                                _s("pred_act_log (for loss)", torch.log1p(pred_pos))
+                                
+                                # Gradient check hook
+                                if pred_act_raw.requires_grad:
+                                    def _hook(grad):
+                                        g_norm = grad.norm().item()
+                                        g_mean = grad.abs().mean().item()
+                                        print(f"[DEBUG][ACT][GRAD] pred_act_raw grad: norm={g_norm:.3e} mean_abs={g_mean:.3e}", flush=True)
+                                    pred_act_raw.register_hook(_hook)
+
+                        # GT normalization
+                        act_pos = act_samples.clamp_min(0.0) / torch.clamp(act_norm_t, min=1e-8)
                         pred_act_log = torch.log1p(pred_pos)
                         act_log = torch.log1p(act_pos)
                         weights_act = torch.where(
@@ -5579,9 +5645,125 @@ def train():
                             torch.ones_like(pred_act_log),
                         )
                         diff = F.smooth_l1_loss(pred_act_log, act_log, reduction="none")
+
+                        # [DEBUG][ACT] Phase A Instrumentation
+                        if (step == 1) or (step == max_steps):
+                            with torch.no_grad():
+                                assert weights_act.numel() == diff.numel(), f"weights_act.numel={weights_act.numel()} != diff.numel={diff.numel()}"
+                                assert pos_flags.numel() == diff.numel(), f"pos_flags.numel={pos_flags.numel()} != diff.numel={diff.numel()}"
+
+                                # flatten everything so masks/indexing are guaranteed correct
+                                pred_f = pred_act_log.detach().float().reshape(-1)
+                                gt_f   = act_log.detach().float().reshape(-1)
+                                diff_f = diff.detach().float().reshape(-1)
+                                w_f    = weights_act.detach().float().reshape(-1)
+                                pos_f  = pos_flags.detach().reshape(-1).bool()
+
+                                n_total = int(pos_f.numel())
+                                n_pos = int(pos_f.sum().item())
+                                n_neg = int((~pos_f).sum().item())
+
+                                def _stats(name, t):
+                                    t = t.float()
+                                    p95 = torch.quantile(t, 0.95).item()
+                                    nz = (t > 1e-6).float().mean().item()
+                                    print(f"[DEBUG][ACT][step {step}] {name}: "
+                                          f"min={t.min().item():.3e} mean={t.mean().item():.3e} "
+                                          f"p95={p95:.3e} max={t.max().item():.3e} nz_frac={nz:.3f}",
+                                          flush=True)
+
+                                print(f"[DEBUG][ACT][step {step}] n_total={n_total} n_pos={n_pos} n_neg={n_neg} pos_frac={n_pos/max(n_total,1):.4f}", flush=True)
+
+                                # show what the loss actually sees
+                                _stats("GT_log1p", gt_f)
+                                _stats("Pred_log1p", pred_f)
+                                _stats("diff", diff_f)
+                                _stats("weights", w_f)
+
+                                # weighted diff per class
+                                if n_pos > 0:
+                                    loss_pos = (w_f[pos_f] * diff_f[pos_f]).mean().item()
+                                    w_pos = w_f[pos_f].mean().item()
+                                else:
+                                    loss_pos, w_pos = 0.0, 0.0
+                                if n_neg > 0:
+                                    loss_neg = (w_f[~pos_f] * diff_f[~pos_f]).mean().item()
+                                    w_neg = w_f[~pos_f].mean().item()
+                                else:
+                                    loss_neg, w_neg = 0.0, 0.0
+
+                                print(f"[DEBUG][ACT][step {step}] loss_pos={loss_pos:.6f} loss_neg={loss_neg:.6f} (weighted)", flush=True)
+                                print(f"[DEBUG][ACT][step {step}] mean_w_pos={w_pos:.6f} mean_w_neg={w_neg:.6f}", flush=True)
+                                print(f"[DEBUG][ACT][step {step}] act_norm_source={args.act_norm_source} act_norm_factor={float(act_norm_factor):.6e}", flush=True)
+
+                                # Optional: Linear space stats if available
+                                try:
+                                    _stats("GT_lin_norm", act_pos.detach().float().reshape(-1))
+                                    _stats("Pred_lin_norm", pred_pos.detach().float().reshape(-1))
+                                except NameError:
+                                    pass
+
+                        # Sparsity Loss (L1 auf normierter Aktivität)
+                        if args.act_sparsity_weight > 0.0:
+                            loss_sparsity = pred_pos.mean()
+                        
+                        # 3D TV Regularisierung (auf zufälligem Patch, da pred_pos unstrukturiert ist)
+                        ACT_TV_EVERY = 10
+                        DO_TV = (args.act_tv_weight > 0.0) and (step % ACT_TV_EVERY == 0)
+                        loss_act_tv = torch.zeros((), device=device)
+
+                        if args.act_tv_weight > 0.0:
+                            if step == 1:
+                                print(f"[DEBUG][ACT_TV] act_vol.shape={act_vol.shape}", flush=True)
+                                print(f"[DEBUG][ACT_TV] ACT coords min/max: {coords.min(0).values.cpu().tolist()} {coords.max(0).values.cpu().tolist()}", flush=True)
+                            
+                            if DO_TV:
+                                # Patch-Größe fix 16
+                                S = 16
+                                # act_vol shape handling: [D,H,W] or [1,D,H,W]
+                                shape_src = act_vol.shape
+                                D_vol, H_vol, W_vol = shape_src[-3:]
+                                
+                                # Zufälliger Startpunkt für Patch (Off-by-one safe range [0, Dim-S])
+                                d0 = torch.randint(0, max(1, D_vol - S + 1), (1,), device=device).item()
+                                h0 = torch.randint(0, max(1, H_vol - S + 1), (1,), device=device).item()
+                                w0 = torch.randint(0, max(1, W_vol - S + 1), (1,), device=device).item()
+                                
+                                z_i = torch.arange(d0, min(d0 + S, D_vol), device=device)
+                                y_i = torch.arange(h0, min(h0 + S, H_vol), device=device)
+                                x_i = torch.arange(w0, min(w0 + S, W_vol), device=device)
+                                
+                                grid_z, grid_y, grid_x = torch.meshgrid(z_i, y_i, x_i, indexing='ij')
+                                coords_tv = torch.stack([
+                                    idx_to_coord(grid_x.flatten(), W_vol, radius),
+                                    idx_to_coord(grid_y.flatten(), H_vol, radius),
+                                    idx_to_coord(grid_z.flatten(), D_vol, radius)
+                                ], dim=1)
+
+                                if step == 1:
+                                    print(f"[DEBUG][ACT_TV] TV  coords min/max: {coords_tv.min(0).values.cpu().tolist()} {coords_tv.max(0).values.cpu().tolist()}", flush=True)
+
+                                _, pred_tv_raw = query_emission_at_points(generator, z_latent, coords_tv, return_raw=True)
+                                
+                                # Konsistente Aktivierung/Normierung wie im Supervised-Pfad
+                                pred_tv_debiased = F.softplus(pred_tv_raw) - 0.6931472
+                                pred_tv_pos = pred_tv_debiased.clamp(min=0.0) / torch.clamp(act_norm_t, min=1e-8)
+                                pred_tv_vol = pred_tv_pos.view(len(z_i), len(y_i), len(x_i))
+                                
+                                dx = torch.abs(pred_tv_vol[:, :, 1:] - pred_tv_vol[:, :, :-1]).mean()
+                                dy = torch.abs(pred_tv_vol[:, 1:, :] - pred_tv_vol[:, :-1, :]).mean()
+                                dz = torch.abs(pred_tv_vol[1:, :, :] - pred_tv_vol[:-1, :, :]).mean()
+                                loss_act_tv = dx + dy + dz
+
+                        with torch.no_grad():
+                            pred_pos_mean = float(pred_pos.mean().item())
+                            pred_nz_frac = float((pred_pos > 1e-6).float().mean().item())
+
                         loss_act = torch.mean(weights_act * diff)
                         act_loss_weighted = args.act_loss_weight * loss_act
                         loss = loss + act_loss_weighted
+                        loss = loss + args.act_sparsity_weight * loss_sparsity
+                        loss = loss + args.act_tv_weight * loss_act_tv
                         global _PRED_ACT_STATS_LOGGED
                         if not _PRED_ACT_STATS_LOGGED:
                             _PRED_ACT_STATS_LOGGED = True
@@ -6390,7 +6572,7 @@ def train():
     
             msg = (
                 f"[step {step:05d}] loss={loss.item():.6f} | act={loss_act.item():.6f} "
-                f"| gain_reg={loss_gain.item():.6f} | ct={loss_ct.item():.6f} "
+                f"| gain_reg={loss_gain.item():.6f} | ct={loss_ct.item():.6f} | sparsity={loss_sparsity.item():.6f} | act_tv={loss_act_tv.item():.6f} "
                 f"| ray_tv={loss_ray_tv.item():.6f} | ray_tv_w={loss_ray_tv_w.item():.6f} "
                 f"| bg_depth_mass={bg_depth_mass.item():.6f} | bg_depth_mass_w={bg_depth_mass_w.item():.6f} | bg_depth_frac={bg_depth_frac:.4f} "
                 f"| tv={loss_tv.item():.6f} "
@@ -6499,6 +6681,8 @@ def train():
                     loss_ap.item(),
                     loss_pa.item(),
                     loss_act.item(),
+                    loss_sparsity.item(),
+                    loss_act_tv.item(),
                     loss_ct.item(),
                     loss_ray_tv.item(),
                     loss_ray_tv_w.item(),
@@ -6754,6 +6938,7 @@ def train():
             out_path_override=final_out_path,
             grid_radius=_radius_to_float(generator.radius),
             radius_xyz=tuple(float(r) for r in generator.radius_xyz),
+            force_save=True,
         )
         final_test_stats = None
         n_test_batches = 0

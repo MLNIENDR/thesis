@@ -35,11 +35,22 @@ echo "🏋️ Running train_emission.py..."
 exit_code=0
 srun ${PYTHON_BIN} -u train_emission.py \
   --config configs/spect.yaml \
-  --hybrid \
-  --debug-enc \
-  --encoder-lr-mult 1.0 \
-  --z-enc-alpha 1.0 \
-  --max-steps 10 || exit_code=$?
+  --max-steps 4000 \
+  --save-every 2000 \
+  --seed 0 \
+  --act-loss-weight 1.0 \
+  --act-norm-source none \
+  --act-pos-fraction 0.05 \
+  --act-pos-weight 10.0 \
+  --act-sparsity-weight 5e-4 \
+  --act-tv-weight 1e-6 \
+  --act-samples 16384 \
+  --proj-loss-weight 0.0 \
+  --ct-loss-weight 0.0 \
+  --tv-weight 0.0 \
+  --ray-tv-weight 0.0 \
+  --bg-depth-mass-weight 0.0 \
+  --debug-act|| exit_code=$?
 echo "python_exit=$exit_code"
 if [ $exit_code -ne 0 ]; then
   echo "[ERROR] Training failed with exit_code=$exit_code"
