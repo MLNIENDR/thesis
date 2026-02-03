@@ -4,6 +4,7 @@ import csv
 import json
 import math
 import logging
+import os
 import re
 import signal
 import subprocess
@@ -11,7 +12,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List, Mapping, Any
 from collections import Counter
 
 import numpy as np
@@ -37,8 +38,320 @@ ATTEN_SCALE_DEFAULT = 25.0
 _POISSON_RATE_LEGACY_WARNED = False
 _DEPTH_PROFILE_LOGGED = False
 _SAMPLE_VOLUME_ALONG_PTS_LOGGED = False
+
 _PRED_ACT_STATS_LOGGED = False
 
+SOFTPLUS_DEBIAS = 0.6931471805599453
+
+
+def activity_from_raw(raw: torch.Tensor, debias: bool = True) -> torch.Tensor:
+    """Convert raw network output into non-negative activity (optional ln2 debias)."""
+    act = F.softplus(raw)
+    if debias:
+        act = act - SOFTPLUS_DEBIAS
+    return act.clamp_min(0.0)
+
+
+ACT_DEBUG_WORLD_COORDS: List[tuple[tuple[float, float, float], tuple[int, int, int]]] = []
+ACT_DEBUG_WORLD_STEP: Optional[int] = None
+ACT_DEBUG_WORLD_REPORTED = False
+ACT_ACT_RADIUS_CACHE: Dict[str, tuple[tuple[float, float, float], str]] = {}
+ACT_RADIUS_LOGGED_KEYS: set[str] = set()
+
+
+def _get_git_short_hash(cwd: str) -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return proc.stdout.strip()
+    except Exception:
+        return "NA"
+
+
+def _log_runtime_provenance() -> None:
+    cwd = os.getcwd()
+    script_path = Path(__file__).resolve()
+    git_rev = _get_git_short_hash(cwd)
+    python_exec = sys.executable
+    print(
+        f"[runtime] cwd={cwd} git_rev={git_rev} train_emission_py={script_path} python={python_exec}",
+        flush=True,
+    )
+
+
+def _resolve_activity_radius_xyz(generator, radius_xyz_override=None) -> tuple[float, float, float]:
+    if radius_xyz_override is not None:
+        return tuple(float(r) for r in radius_xyz_override)
+    radius_xyz = getattr(generator, "radius_xyz", None)
+    if radius_xyz is not None:
+        return tuple(float(r) for r in radius_xyz)
+    radius = generator.radius
+    if isinstance(radius, (tuple, list)):
+        radius = radius[-1]
+    scalar = float(radius)
+    return (scalar, scalar, scalar)
+
+
+def _normalize_act_path(act_path: Any) -> Optional[str]:
+    if act_path is None:
+        return None
+    if isinstance(act_path, (list, tuple)):
+        for candidate in act_path:
+            norm = _normalize_act_path(candidate)
+            if norm is not None:
+                return norm
+        return None
+    if isinstance(act_path, Path):
+        return str(act_path)
+    if isinstance(act_path, str):
+        stripped = act_path.strip()
+        return stripped if stripped else None
+    return str(act_path)
+
+
+def _act_spacing_from_meta(act_meta: Mapping[str, Any]) -> tuple[tuple[float, float, float], str, float] | None:
+    normalized_path = _normalize_act_path(act_meta.get("act_path"))
+    if normalized_path is None:
+        return None
+    act_path = Path(normalized_path)
+    meta_file = act_path.parent / "meta_simple.json"
+    if not meta_file.exists():
+        return None
+    try:
+        with meta_file.open("r") as reader:
+            meta_json = json.load(reader)
+    except Exception:
+        return None
+    sd_mm = meta_json.get("sd_mm")
+    if sd_mm is None:
+        return None
+    try:
+        sd_mm_val = float(sd_mm)
+    except Exception:
+        return None
+    sd_cm = sd_mm_val / 10.0
+    spacing = (sd_cm, sd_cm, sd_cm)
+    return spacing, str(meta_file), sd_mm_val
+
+
+def _maybe_log_act_radius(
+    key: str,
+    *,
+    step: Optional[int],
+    act_path: Optional[str],
+    meta_file: Optional[str],
+    sd_mm: Optional[float],
+    sd_cm: tuple[float, float, float] | None,
+    act_shape: tuple[int, int, int],
+    radius_xyz: tuple[float, float, float],
+    generator_radius_xyz: tuple[float, float, float],
+    source: str,
+) -> None:
+    if key in ACT_RADIUS_LOGGED_KEYS:
+        return
+    ACT_RADIUS_LOGGED_KEYS.add(key)
+    step_str = str(step) if step is not None else "n/a"
+    act_path_desc = act_path if act_path is not None else "n/a"
+    meta_desc = meta_file if meta_file is not None else "n/a"
+    sd_mm_desc = f"{sd_mm:.4f}" if sd_mm is not None else "n/a"
+    sd_cm_desc = (
+        f"{sd_cm[0]:.3f}/{sd_cm[1]:.3f}/{sd_cm[2]:.3f} cm" if sd_cm is not None else "n/a"
+    )
+    act_shape_desc = f"({act_shape[0]},{act_shape[1]},{act_shape[2]})"
+    radius_desc = f"({radius_xyz[0]:.3f},{radius_xyz[1]:.3f},{radius_xyz[2]:.3f})"
+    gen_radius_desc = f"({generator_radius_xyz[0]:.3f},{generator_radius_xyz[1]:.3f},{generator_radius_xyz[2]:.3f})"
+    print(
+        f"[ACT-RADIUS] step={step_str} source={source} act_path={act_path_desc} meta_file={meta_desc} "
+        f"sd_mm={sd_mm_desc} sd_cm={sd_cm_desc} act_shape={act_shape_desc} "
+        f"radius_xyz={radius_desc} gen_radius_xyz={gen_radius_desc}",
+        flush=True,
+    )
+
+
+def _resolve_act_radius_xyz_from_act(
+    generator,
+    act: torch.Tensor,
+    act_meta: Optional[Mapping[str, Any]],
+    step: Optional[int] = None,
+) -> tuple[float, float, float]:
+    D, H, W = act.shape[-3:]
+    cache_key = None
+    spacing_info = None
+    act_path_str = None
+    if isinstance(act_meta, Mapping):
+        act_path_raw = act_meta.get("act_path")
+        normalized_path = _normalize_act_path(act_path_raw)
+        if normalized_path:
+            act_path_str = normalized_path
+            cache_key = normalized_path
+            cached = ACT_ACT_RADIUS_CACHE.get(normalized_path)
+            if cached is not None:
+                radius_xyz, _ = cached
+                generator_radius_xyz = _resolve_activity_radius_xyz(generator)
+                _maybe_log_act_radius(
+                    cache_key,
+                    step=step,
+                    act_path=act_path_str,
+                    meta_file=None,
+                    sd_mm=None,
+                    sd_cm=None,
+                    act_shape=(D, H, W),
+                    radius_xyz=radius_xyz,
+                    generator_radius_xyz=generator_radius_xyz,
+                    source="cached",
+                )
+                return radius_xyz
+            spacing_info = _act_spacing_from_meta(act_meta)
+    if spacing_info is not None:
+        spacing_cm, meta_file, sd_mm_val = spacing_info
+        sx, sy, sz = spacing_cm
+        radius_xyz = (
+            0.5 * W * sx,
+            0.5 * H * sy,
+            0.5 * D * sz,
+        )
+        if cache_key is not None:
+            ACT_ACT_RADIUS_CACHE[cache_key] = (radius_xyz, "meta")
+        generator_radius_xyz = _resolve_activity_radius_xyz(generator)
+        _maybe_log_act_radius(
+            cache_key or "meta/full_extent",
+            step=step,
+            act_path=act_path_str,
+            meta_file=meta_file,
+            sd_mm=sd_mm_val,
+            sd_cm=spacing_cm,
+            act_shape=(D, H, W),
+            radius_xyz=radius_xyz,
+            generator_radius_xyz=generator_radius_xyz,
+            source="meta/full_extent",
+        )
+        return radius_xyz
+    radius_xyz = _resolve_activity_radius_xyz(generator)
+    source = "fallback"
+    if cache_key is not None:
+        ACT_ACT_RADIUS_CACHE[cache_key] = (radius_xyz, source)
+    generator_radius_xyz = radius_xyz
+    _maybe_log_act_radius(
+        cache_key or "fallback",
+        step=step,
+        act_path=act_path_str,
+        meta_file=None,
+        sd_mm=None,
+        sd_cm=None,
+        act_shape=(D, H, W),
+        radius_xyz=radius_xyz,
+        generator_radius_xyz=generator_radius_xyz,
+        source=source,
+    )
+    return radius_xyz
+
+
+def _world_stats_from_weights(
+    weights: torch.Tensor, radius_xyz: tuple[float, float, float]
+) -> tuple[
+    Optional[tuple[float, float, float]],
+    Optional[tuple[float, float, float]],
+    Optional[tuple[float, float, float]],
+]:
+    if weights.numel() == 0:
+        return (None, None, None)
+    D, H, W = weights.shape[-3:]
+    device = weights.device
+    dtype = weights.dtype
+    rx, ry, rz = radius_xyz
+    x_coords = idx_to_coord(torch.arange(W, device=device), W, rx).to(dtype)
+    y_coords = idx_to_coord(torch.arange(H, device=device), H, ry).to(dtype)
+    z_coords = idx_to_coord(torch.arange(D, device=device), D, rz).to(dtype)
+
+    total = weights.sum()
+    total_val = float(total.item())
+    if total_val <= 0.0:
+        return (None, None, None)
+
+    x_weight = weights.sum(dim=(0, 1))
+    y_weight = weights.sum(dim=(0, 2))
+    z_weight = weights.sum(dim=(1, 2))
+
+    x_com = float(((x_coords * x_weight).sum() / total).item())
+    y_com = float(((y_coords * y_weight).sum() / total).item())
+    z_com = float(((z_coords * z_weight).sum() / total).item())
+
+    mask = weights > 0
+    if mask.any():
+        z_idx, y_idx, x_idx = mask.nonzero(as_tuple=True)
+        x_min = float(x_coords[x_idx].min().item())
+        x_max = float(x_coords[x_idx].max().item())
+        y_min = float(y_coords[y_idx].min().item())
+        y_max = float(y_coords[y_idx].max().item())
+        z_min = float(z_coords[z_idx].min().item())
+        z_max = float(z_coords[z_idx].max().item())
+        min_tuple = (x_min, y_min, z_min)
+        max_tuple = (x_max, y_max, z_max)
+    else:
+        min_tuple = None
+        max_tuple = None
+
+    return (x_com, y_com, z_com), min_tuple, max_tuple
+
+
+def _coord_tuple_str(coord: Optional[tuple[float, float, float]]) -> str:
+    if coord is None:
+        return "n/a"
+    return f"({coord[0]:.3f},{coord[1]:.3f},{coord[2]:.3f})"
+
+
+def _print_align_check(
+    act_stats: tuple[
+        Optional[tuple[float, float, float]],
+        Optional[tuple[float, float, float]],
+        Optional[tuple[float, float, float]],
+    ],
+    ct_stats: tuple[
+        Optional[tuple[float, float, float]],
+        Optional[tuple[float, float, float]],
+        Optional[tuple[float, float, float]],
+    ],
+    mask_frac: Optional[float] = None,
+) -> None:
+    act_com, act_min, act_max = act_stats
+    ct_com, ct_min, ct_max = ct_stats
+    delta_value = None
+    if act_com is not None and ct_com is not None:
+        delta_value = math.sqrt(sum((a - b) ** 2 for a, b in zip(act_com, ct_com)))
+    delta_str = f"{delta_value:.4f}" if delta_value is not None else "n/a"
+    mask_desc = f"{mask_frac:.4f}" if mask_frac is not None else "n/a"
+    print(
+        "[ALIGN-CHECK] "
+        f"act_com={_coord_tuple_str(act_com)} act_range_min={_coord_tuple_str(act_min)} act_range_max={_coord_tuple_str(act_max)} "
+        f"ct_com={_coord_tuple_str(ct_com)} ct_range_min={_coord_tuple_str(ct_min)} ct_range_max={_coord_tuple_str(ct_max)} "
+        f"delta={delta_str} mask_frac={mask_desc}",
+        flush=True,
+    )
+
+
+def _world_coord_to_grid_idx(value: float, grid_size: int, radius_axis: float) -> int:
+    if grid_size <= 1 or radius_axis == 0.0:
+        return 0
+    normalized = (value / (2.0 * radius_axis)) + 0.5
+    normalized = max(0.0, min(1.0, normalized))
+    idx = normalized * (grid_size - 1)
+    return int(round(idx))
+
+
+def _world_coords_to_grid_indices(
+    coord: torch.Tensor, res: int, radius_xyz: tuple[float, float, float]
+) -> tuple[int, int, int]:
+    x, y, z = coord.tolist()
+    rx, ry, rz = radius_xyz
+    ix = _world_coord_to_grid_idx(x, res, rx)
+    iy = _world_coord_to_grid_idx(y, res, ry)
+    iz = _world_coord_to_grid_idx(z, res, rz)
+    return iz, iy, ix
 
 def str2bool(v):
     if isinstance(v, bool):
@@ -804,26 +1117,17 @@ def export_activity_volume(
     res: int,
     device: torch.device,
     radius_xyz: Optional[Tuple[float, float, float]] = None,
+    log_world_range: bool = False,
 ):
-    radius = generator.radius
-    if isinstance(radius, tuple):
-        radius = radius[1]
-    radius = float(radius)
     res = int(res)
     if res <= 0:
         raise ValueError("export-vol-res must be > 0")
 
-    def _resolve_radius_xyz():
-        if radius_xyz is not None:
-            return tuple(float(r) for r in radius_xyz)
-        if hasattr(generator, "radius_xyz"):
-            return tuple(float(r) for r in generator.radius_xyz)
-        scalar = radius
-        return (scalar, scalar, scalar)
-
-    rx, ry, rz = _resolve_radius_xyz()
+    global ACT_DEBUG_WORLD_COORDS, ACT_DEBUG_WORLD_STEP, ACT_DEBUG_WORLD_REPORTED
+    rx, ry, rz = _resolve_activity_radius_xyz(generator, radius_xyz)
     x_coords = idx_to_coord(torch.arange(res, device=device), res, rx)
     y_coords = idx_to_coord(torch.arange(res, device=device), res, ry)
+    z_coords_all = idx_to_coord(torch.arange(res, device=device), res, rz)
     y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing="ij")
     x_flat = x_grid.reshape(-1)
     y_flat = y_grid.reshape(-1)
@@ -832,6 +1136,18 @@ def export_activity_volume(
     chunk_depth = max(1, min(res, target_points // (res * res) if res * res > 0 else 1))
 
     vol = np.empty((res, res, res), dtype=np.float32)
+    if log_world_range:
+        x_min = float(x_coords.min().item())
+        x_max = float(x_coords.max().item())
+        y_min = float(y_coords.min().item())
+        y_max = float(y_coords.max().item())
+        z_min = float(z_coords_all.min().item())
+        z_max = float(z_coords_all.max().item())
+        print(
+            f"[ACT-CHECK][export][world-range] "
+            f"x=[{x_min:.6f},{x_max:.6f}] y=[{y_min:.6f},{y_max:.6f}] z=[{z_min:.6f},{z_max:.6f}]",
+            flush=True,
+        )
     with torch.no_grad():
         for z_start in range(0, res, chunk_depth):
             z_end = min(res, z_start + chunk_depth)
@@ -841,12 +1157,33 @@ def export_activity_volume(
             x_rep = x_flat.repeat(z_coords.numel())
             y_rep = y_flat.repeat(z_coords.numel())
             coords = torch.stack((x_rep, y_rep, z_rep), dim=1)
-            pred = query_emission_at_points(generator, z_latent, coords)
+            _, pred_raw = query_emission_at_points(generator, z_latent, coords, return_raw=True)
+            pred = activity_from_raw(pred_raw)
             pred = pred.view(z_coords.numel(), res, res).detach().cpu().numpy().astype(np.float32)
             vol[z_start:z_end, :, :] = pred
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(out_path, vol)
+    if ACT_DEBUG_WORLD_COORDS and not ACT_DEBUG_WORLD_REPORTED:
+        coords_list = [
+            torch.tensor(world, device=device, dtype=torch.float32) for world, _ in ACT_DEBUG_WORLD_COORDS
+        ]
+        if coords_list:
+            with torch.no_grad():
+                coords_tensor = torch.stack(coords_list, dim=0)
+                query_vals = query_emission_at_points(generator, z_latent, coords_tensor)
+            for idx, ((world_x, world_y, world_z), (iz, iy, ix)) in enumerate(ACT_DEBUG_WORLD_COORDS):
+                export_val = float(vol[iz, iy, ix])
+                query_val = float(query_vals[idx].item())
+                abs_diff = abs(export_val - query_val)
+                rel_diff = abs_diff / (abs(query_val) + 1e-8)
+                print(
+                    f"[ACT-CHECK][export] step={ACT_DEBUG_WORLD_STEP} coord=({world_x:.6f},{world_y:.6f},{world_z:.6f}) "
+                    f"grid=(iz={iz},iy={iy},ix={ix}) export={export_val:.6e} query={query_val:.6e} "
+                    f"abs_diff={abs_diff:.6e} rel_diff={rel_diff:.6e}",
+                    flush=True,
+                )
+        ACT_DEBUG_WORLD_REPORTED = True
     return vol
 
 
@@ -889,7 +1226,14 @@ def save_test_volume_slices(
             patient_dir = slice_root / patient_id
             patient_dir.mkdir(parents=True, exist_ok=True)
             pred_path = patient_dir / "activity_pred.npy"
-            pred_vol = export_activity_volume(generator, z_latent, pred_path, args.export_vol_res, device)
+            pred_vol = export_activity_volume(
+                generator,
+                z_latent,
+                pred_path,
+                args.export_vol_res,
+                device,
+                log_world_range=args.debug_sanity_checks,
+            )
             pred_vol = np.asarray(pred_vol, dtype=np.float32)
             act_tensor = batch.get("act")
             gt_vol = None
@@ -3220,7 +3564,11 @@ def save_final_act_compare_volume_slicing(
     # Axial ist der Default; das Flag wird aus Kompatibilitaetsgruenden gelesen.
     _ = bool(getattr(args, "final_act_compare_axial", True))
     # Finale Compare-PNG ist axial und kollidiert nicht mit final_sagittal.
-    out_path = out_path_override if out_path_override is not None else (preview_dir / "final_act_compare_axial.png")
+    base_out_path = out_path_override if out_path_override is not None else (preview_dir / "final_act_compare_axial.png")
+    base_dir = base_out_path.parent
+    base_name = base_out_path.stem
+    abs_shared_path = base_dir / f"{base_name}_abs_shared.png"
+    loss_shared_path = base_dir / f"{base_name}_loss_shared.png"
 
     act_t = act_vol.detach()
     if act_t.dim() == 4:
@@ -3232,6 +3580,10 @@ def save_final_act_compare_volume_slicing(
         )
         return
 
+    act_norm_factor, _ = compute_act_norm_factor(
+        act_t, args.act_norm_source, args.act_norm_value, None
+    )
+    act_norm_factor = max(float(act_norm_factor), 1e-8)
     gt_np = act_t.float().cpu().numpy()
     if pred_vol_np is not None:
         pred_np = np.asarray(pred_vol_np, dtype=np.float32)
@@ -3287,6 +3639,9 @@ def save_final_act_compare_volume_slicing(
     gt_spacing_raw = tuple(_spacing_for_axis(dim, rad) for dim, rad in zip(gt_raw_shape, axis_radii))
     gt_spacing_resampled = tuple(_spacing_for_axis(dim, rad) for dim, rad in zip(gt_shape, axis_radii))
     pred_spacing = tuple(_spacing_for_axis(dim, rad) for dim, rad in zip(pred_shape, axis_radii))
+
+    gt_abs = np.clip(gt_np.astype(np.float32, copy=False), 0.0, None)
+    pred_abs = np.clip(pred_np.astype(np.float32, copy=False), 0.0, None)
 
     print(
         "[final-act-compare][debug] "
@@ -3380,39 +3735,14 @@ def save_final_act_compare_volume_slicing(
     x_ticks_pr = np.arange(0, R, x_step_pr)
     y_ticks_pr = np.arange(0, R, y_step_pr)
 
-    scale_mode = str(getattr(args, "final_act_compare_scale", "shared"))
-    shared_vmin = shared_vmax = None
-    if scale_mode == "shared":
-        vals_list = []
-        for z_gt, z_pred in z_pairs:
-            gt_img = gt_np[:, :, z_pred]
-            pr_img = pred_np[:, :, z_pred]
-            gt_vals = gt_img[np.isfinite(gt_img)].ravel()
-            pr_vals = pr_img[np.isfinite(pr_img)].ravel()
-            if gt_vals.size:
-                vals_list.append(gt_vals)
-            if pr_vals.size:
-                vals_list.append(pr_vals)
-        if vals_list:
-            shared_vals = np.concatenate(vals_list, axis=0)
-            shared_vmin, shared_vmax = _robust_limits(shared_vals)
-        else:
-            shared_vmin, shared_vmax = 0.0, 1.0
-
     rows = len(z_pairs)
-    fig, axs = plt.subplots(rows, 2, figsize=(12, 4 * rows), constrained_layout=True)
-    axs = np.asarray(axs)
-    if axs.ndim == 1:
-        axs = axs.reshape(1, 2)
-
-    im_gt_first = None
-    im_pr_first = None
+    gt_slices: list[np.ndarray] = []
+    pred_slices: list[np.ndarray] = []
     for row, (z_gt, z_pred) in enumerate(z_pairs):
-        ax_gt = axs[row, 0]
-        ax_pr = axs[row, 1]
-
-        gt_img = gt_np[:, :, z_pred].astype(np.float32, copy=False)
-        pr_img = pred_np[:, :, z_pred].astype(np.float32, copy=False)
+        gt_img = gt_abs[:, :, z_pred].astype(np.float32, copy=False)
+        pr_img = pred_abs[:, :, z_pred].astype(np.float32, copy=False)
+        gt_slices.append(gt_img)
+        pred_slices.append(pr_img)
 
         gt_min, gt_mean, gt_max, gt_nz, gt_std = _slice_stats(gt_img)
         pr_min, pr_mean, pr_max, pr_nz, pr_std = _slice_stats(pr_img)
@@ -3428,65 +3758,87 @@ def save_final_act_compare_volume_slicing(
                 flush=True,
             )
 
-        if scale_mode == "shared":
-            gt_vmin, gt_vmax = float(shared_vmin), float(shared_vmax)
-            pr_vmin, pr_vmax = float(shared_vmin), float(shared_vmax)
-        else:
-            gt_vmin, gt_vmax = _robust_limits(gt_img)
-            pr_vmin, pr_vmax = _robust_limits(pr_img)
+    finite_gt = gt_abs[np.isfinite(gt_abs)]
+    if finite_gt.size > 0:
+        vmax_abs = float(np.quantile(finite_gt, 0.995))
+        if not np.isfinite(vmax_abs):
+            vmax_abs = float(np.nanmax(finite_gt))
+    else:
+        try:
+            vmax_abs = float(np.nanmax(gt_abs))
+        except ValueError:
+            vmax_abs = 1.0
+    vmax_abs = max(vmax_abs, 1e-6)
+    vmin_abs = 0.0
+    gt_loss_all = np.log1p(gt_abs / act_norm_factor)
+    pred_loss_all = np.log1p(pred_abs / act_norm_factor)
+    loss_vals = np.concatenate([gt_loss_all.ravel(), pred_loss_all.ravel()])
+    if loss_vals.size == 0:
+        loss_vals = np.array([0.0], dtype=np.float32)
+    vmin_loss, vmax_loss = _robust_limits(loss_vals)
+    gt_loss_slices = [gt_loss_all[:, :, z_pred] for (_, z_pred) in z_pairs]
+    pred_loss_slices = [pred_loss_all[:, :, z_pred] for (_, z_pred) in z_pairs]
 
-        im_gt = ax_gt.imshow(
-            gt_img,
-            origin="upper",
-            extent=[0, B - 1, A - 1, 0],
-            aspect="equal",
-            cmap="viridis",
-            vmin=gt_vmin,
-            vmax=gt_vmax,
-        )
-        im_pr = ax_pr.imshow(
-            pr_img,
-            origin="upper",
-            extent=[0, R - 1, R - 1, 0],
-            aspect="equal",
-            cmap="viridis",
-            vmin=pr_vmin,
-            vmax=pr_vmax,
-        )
-
-        if im_gt_first is None:
-            im_gt_first = im_gt
-        if im_pr_first is None:
-            im_pr_first = im_pr
-
-        ax_gt.set_title(f"GT axial (act) @ axis2={z_gt}")
-        ax_pr.set_title(f"Pred axial (act_pred) @ axis2_pred={z_pred} (from {z_gt})")
-
-        ax_gt.set_xlabel("axis1 (x-like)")
-        ax_pr.set_xlabel("axis1 (x-like)")
-        ax_gt.set_ylabel("axis0 (y-like)")
-        ax_pr.set_ylabel("axis0 (y-like)")
-
-        ax_gt.set_xticks(x_ticks_gt)
-        ax_gt.set_yticks(y_ticks_gt)
-        ax_pr.set_xticks(x_ticks_pr)
-        ax_pr.set_yticks(y_ticks_pr)
-
-    if scale_mode == "shared":
+    def _render_shared_plot(
+        gt_imgs: list[np.ndarray],
+        pr_imgs: list[np.ndarray],
+        file_path: Path,
+        cbar_label: str,
+        vmin: float,
+        vmax: float,
+        title_suffix: str,
+    ):
+        if not gt_imgs:
+            return
+        fig, axs = plt.subplots(rows, 2, figsize=(12, 4 * rows), constrained_layout=True)
+        axs = np.asarray(axs)
+        if axs.ndim == 1:
+            axs = axs.reshape(1, 2)
+        im_gt_first = None
+        for row, (z_gt, z_pred) in enumerate(z_pairs):
+            ax_gt = axs[row, 0]
+            ax_pr = axs[row, 1]
+            gt_img = gt_imgs[row]
+            pr_img = pr_imgs[row]
+            im_gt = ax_gt.imshow(
+                gt_img,
+                origin="upper",
+                extent=[0, B - 1, A - 1, 0],
+                aspect="equal",
+                cmap="viridis",
+                vmin=vmin,
+                vmax=vmax,
+            )
+            im_pr = ax_pr.imshow(
+                pr_img,
+                origin="upper",
+                extent=[0, R - 1, R - 1, 0],
+                aspect="equal",
+                cmap="viridis",
+                vmin=vmin,
+                vmax=vmax,
+            )
+            if im_gt_first is None:
+                im_gt_first = im_gt
+            ax_gt.set_title(f"GT axial (act) @ axis2={z_gt}{title_suffix}")
+            ax_pr.set_title(f"Pred axial (act_pred) @ axis2_pred={z_pred} (from {z_gt}){title_suffix}")
+            ax_gt.set_xlabel("axis1 (x-like)")
+            ax_pr.set_xlabel("axis1 (x-like)")
+            ax_gt.set_ylabel("axis0 (y-like)")
+            ax_pr.set_ylabel("axis0 (y-like)")
+            ax_gt.set_xticks(x_ticks_gt)
+            ax_gt.set_yticks(y_ticks_gt)
+            ax_pr.set_xticks(x_ticks_pr)
+            ax_pr.set_yticks(y_ticks_pr)
         if im_gt_first is not None:
             cbar = fig.colorbar(im_gt_first, ax=axs.ravel().tolist(), shrink=0.92)
-            cbar.set_label("Activity (shared robust scale)")
-    else:
-        if im_gt_first is not None:
-            cbar_gt = fig.colorbar(im_gt_first, ax=axs[:, 0].ravel().tolist(), shrink=0.92)
-            cbar_gt.set_label("GT activity (robust scale)")
-        if im_pr_first is not None:
-            cbar_pr = fig.colorbar(im_pr_first, ax=axs[:, 1].ravel().tolist(), shrink=0.92)
-            cbar_pr.set_label("Pred activity (robust scale)")
+            cbar.set_label(cbar_label)
+        fig.savefig(file_path, dpi=200)
+        plt.close(fig)
+        print(f"[final-act-compare] Saved {file_path.resolve()}", flush=True)
 
-    fig.savefig(out_path, dpi=200)
-    plt.close(fig)
-    print(f"[final-act-compare] Saved {out_path.resolve()}", flush=True)
+    _render_shared_plot(gt_slices, pred_slices, abs_shared_path, "Activity (absolute shared)", vmin_abs, vmax_abs, " [abs]")
+    _render_shared_plot(gt_loss_slices, pred_loss_slices, loss_shared_path, "Activity (log1p shared)", vmin_loss, vmax_loss, " [loss]")
 
 
 def evaluate_pixel_subsets(
@@ -3811,7 +4163,12 @@ def evaluate_val_loader(
 
 
 def sample_act_points(
-    act: torch.Tensor, nsamples: int, radius: float, pos_fraction: float = 0.5, pos_threshold: float = 1e-8
+    act: torch.Tensor,
+    nsamples: int,
+    radius_xyz: tuple[float, float, float],
+    pos_fraction: float = 0.5,
+    pos_threshold: float = 1e-8,
+    return_indices: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Ziehe zufällige Voxel (coords, values) aus act.npy, halb aus aktiven Voxeln (ACT>0), halb global.
@@ -3863,14 +4220,18 @@ def sample_act_points(
     y_idx = (idx % hw) // W
     x_idx = idx % W
 
+    rx, ry, rz = radius_xyz
     coords = torch.stack(
         (
-            idx_to_coord(x_idx, W, radius),
-            idx_to_coord(y_idx, H, radius),
-            idx_to_coord(z_idx, D, radius),
+            idx_to_coord(x_idx, W, rx),
+            idx_to_coord(y_idx, H, ry),
+            idx_to_coord(z_idx, D, rz),
         ),
         dim=1,
     )
+    if return_indices:
+        coord_indices = torch.stack((z_idx, y_idx, x_idx), dim=1)
+        return coords, values, pos_flags, coord_indices
     return coords, values, pos_flags
 
 
@@ -3887,9 +4248,10 @@ def query_emission_at_points(
     pts = coords.unsqueeze(0)
     raw = network_query_fn(pts, None, network_fn, features=z_latent)
     raw = raw.view(-1, raw.shape[-1])
-    pred = F.softplus(raw[:, 0])
+    signal = raw[:, 0]
+    pred = activity_from_raw(signal)
     if return_raw:
-        return pred, raw[:, 0]
+        return pred, signal
     return pred
 
 
@@ -3945,6 +4307,7 @@ def sample_ct_pairs(ct: torch.Tensor, nsamples: int, thresh: float, radius: floa
 
 
 def train():
+    global ACT_DEBUG_WORLD_COORDS, ACT_DEBUG_WORLD_STEP, ACT_DEBUG_WORLD_REPORTED
     print(f"▶ {__VERSION__} – starte Training", flush=True)
     args = parse_args()
     global DEBUG_PRINTS
@@ -4035,6 +4398,7 @@ def train():
 
     print(f"📂 CWD: {Path.cwd().resolve()}", flush=True)
     outdir = Path(config.get("training", {}).get("outdir", "./results_spect")).expanduser().resolve()
+    _log_runtime_provenance()
     (outdir / "preview").mkdir(parents=True, exist_ok=True)
     print(f"🗂️ Output-Ordner: {outdir}", flush=True)
     log_effective_config(outdir, config, args)
@@ -4713,13 +5077,38 @@ def train():
                 loss = loss_proj
             loss_act = torch.tensor(0.0, device=device)
             if args.act_loss_weight > 0.0 and act_vol is not None:
-                radius = generator.radius
-                if isinstance(radius, tuple):
-                    radius = radius[1]
+                act_radius_xyz = _resolve_act_radius_xyz_from_act(
+                    generator, act_vol, batch.get("meta"), step=step
+                )
+                if args.debug_sanity_checks:
+                    act_weights = act_vol.clamp_min(0.0)
+                    act_stats = _world_stats_from_weights(act_weights, act_radius_xyz)
+                    mask_frac = None
+                    ct_stats: tuple[
+                        Optional[tuple[float, float, float]],
+                        Optional[tuple[float, float, float]],
+                        Optional[tuple[float, float, float]],
+                    ] = (None, None, None)
+                    if ct_vol is not None and ct_vol.numel() > 0:
+                        ct_threshold = float(args.ct_threshold) if args.ct_threshold is not None else 0.0
+                        if ct_threshold > 0.0:
+                            ct_mask = ct_vol > ct_threshold
+                        else:
+                            ct_mask = ct_vol > 0
+                        has_mask = bool(ct_mask.any().item())
+                        if not has_mask:
+                            ct_mask = ct_vol > 0
+                            has_mask = bool(ct_mask.any().item())
+                        if has_mask:
+                            mask_frac = float(ct_mask.float().mean().item())
+                            ct_radius_xyz = _resolve_activity_radius_xyz(generator)
+                            ct_stats = _world_stats_from_weights(ct_mask.float(), ct_radius_xyz)
+                    if mask_frac is not None:
+                        _print_align_check(act_stats, ct_stats, mask_frac=mask_frac)
                 coords, act_samples, pos_flags = sample_act_points(
                     act_vol,
                     args.act_samples,
-                    radius=radius,
+                    radius_xyz=act_radius_xyz,
                     pos_fraction=args.act_pos_fraction,
                     pos_threshold=args.act_pos_threshold,
                 )
@@ -4793,6 +5182,7 @@ def train():
     scale_missing_warned = False
     counts_missing_warned = False
     act_norm_global = None
+    last_act_tv_value = 0.0
     last_z_latent = z_latent_base
     last_gain_val = None
     gain_prior_ema = None
@@ -5569,17 +5959,29 @@ def train():
                 loss_sparsity = torch.tensor(0.0, device=device)
                 loss_act_tv = torch.tensor(0.0, device=device)
                 act_norm_factor = 1.0
+                need_act_supervision = act_vol is not None and (
+                    args.act_loss_weight > 0.0 or args.act_tv_weight > 0.0
+                )
+                if need_act_supervision:
+                    act_norm_factor, act_norm_global = compute_act_norm_factor(
+                        act_vol, args.act_norm_source, args.act_norm_value, act_norm_global
+                    )
+                    act_norm_factor = float(act_norm_factor)
+
+                act_norm_t = None
+                loss_act_tv_updated = False
                 if args.act_loss_weight > 0.0 and act_vol is not None:
-                    radius = generator.radius
-                    if isinstance(radius, tuple):
-                        radius = radius[1]
+                    act_radius_xyz = _resolve_act_radius_xyz_from_act(
+                        generator, act_vol, batch.get("meta"), step=step
+                    )
                     # Stichprobe aus act.npy und direkte Dichteabfrage im NeRF
-                    coords, act_samples, pos_flags = sample_act_points(
+                    coords, act_samples, pos_flags, act_indices = sample_act_points(
                         act_vol,
                         args.act_samples,
-                        radius=radius,
+                        radius_xyz=act_radius_xyz,
                         pos_fraction=args.act_pos_fraction,
                         pos_threshold=args.act_pos_threshold,
+                        return_indices=True,
                     )
                     pred_act_raw = None
                     pred_act = None
@@ -5587,25 +5989,97 @@ def train():
                     pred_act, pred_act_raw = query_emission_at_points(
                         generator, z_latent, coords, return_raw=True
                     )
+                    if pred_act_raw is not None:
+                        act_norm_t = torch.tensor(float(act_norm_factor), device=device, dtype=pred_act_raw.dtype)
                     if debug_act_step and pred_act_raw is not None:
                         print(
                             f"[DEBUG][ACT][pred_act_raw] requires_grad={pred_act_raw.requires_grad}, is_leaf={pred_act_raw.is_leaf}, grad_fn={pred_act_raw.grad_fn is not None}", flush=True
                         )
                     if pred_act.numel() > 0:
-                        # --- ACT norm factor ---
-                        if args.act_norm_source == "none":
-                            act_norm_factor = 1.0
-                            act_norm_t = torch.tensor(1.0, device=device, dtype=pred_act_raw.dtype)
-                        else:
-                            act_norm_factor, act_norm_global = compute_act_norm_factor(
-                                act_vol, args.act_norm_source, args.act_norm_value, act_norm_global
-                            )
-                            act_norm_t = torch.tensor(float(act_norm_factor), device=device, dtype=pred_act_raw.dtype)
+                        pred_pos = pred_act / torch.clamp(act_norm_t, min=1e-8)
 
-                        # Parametrisierung: Shifted Softplus (f(0)=0) + Clamp für strikte Positivität
-                        # raw ~ 0 -> softplus(0) = ln(2) -> minus ln(2) = 0.
-                        pred_act_debiased = F.softplus(pred_act_raw) - 0.6931472
-                        pred_pos = pred_act_debiased.clamp(min=0.0) / torch.clamp(act_norm_t, min=1e-8)
+                        should_log_act_box = (step == 1) or args.debug_sanity_checks
+                        if should_log_act_box:
+                            res_val = getattr(args, "export_vol_res", 0)
+                            try:
+                                res_grid = max(1, int(res_val))
+                            except Exception:
+                                res_grid = 1
+                            radius_xyz = act_radius_xyz
+                            rx, ry, rz = radius_xyz
+                            D, H, W = act_vol.shape[-3:]
+                            coord_device = act_vol.device
+                            x_coords_all = idx_to_coord(torch.arange(W, device=coord_device), W, rx)
+                            y_coords_all = idx_to_coord(torch.arange(H, device=coord_device), H, ry)
+                            z_coords_all = idx_to_coord(torch.arange(D, device=coord_device), D, rz)
+                            x_min = float(x_coords_all.min().item())
+                            x_max = float(x_coords_all.max().item())
+                            y_min = float(y_coords_all.min().item())
+                            y_max = float(y_coords_all.max().item())
+                            z_min = float(z_coords_all.min().item())
+                            z_max = float(z_coords_all.max().item())
+                            print(
+                                f"[ACT-CHECK][step {step}][box-range] "
+                                f"x=[{x_min:.6f},{x_max:.6f}] "
+                                f"y=[{y_min:.6f},{y_max:.6f}] "
+                                f"z=[{z_min:.6f},{z_max:.6f}] "
+                                f"box_radius_xyz=({rx:.3f},{ry:.3f},{rz:.3f}) "
+                                f"act_shape=({D},{H},{W})",
+                                flush=True,
+                            )
+                            pos_has_flags = bool(pos_flags.any().item())
+                            if not pos_has_flags:
+                                print(
+                                    f"[ACT-CHECK][step {step}] pos_flags.any()=False -> skipping per-sample dump",
+                                    flush=True,
+                                )
+                            else:
+                                positive_idx = pos_flags.nonzero(as_tuple=False).reshape(-1)
+                                debug_samples = positive_idx[:10]
+                                print(
+                                    f"[ACT-CHECK][step {step}] logging {len(debug_samples)} positive samples "
+                                    f"from act_vol (D,H,W).",
+                                    flush=True,
+                                )
+                                world_subset = coords[debug_samples]
+                                for sample_rank, sample_idx in enumerate(debug_samples.tolist(), start=1):
+                                    idx_triplet = tuple(int(v) for v in act_indices[sample_idx].tolist())
+                                    world_coord = coords[sample_idx]
+                                    iz, iy, ix = _world_coords_to_grid_indices(world_coord, res_grid, radius_xyz)
+                                    act_gt_val = float(act_samples[sample_idx].clamp_min(0.0).item())
+                                    act_pred_val = float(pred_act[sample_idx].item())
+                                    print(
+                                        f"[ACT-CHECK][step {step}] #{sample_rank} idx_act={idx_triplet} "
+                                        f"world=({world_coord[0].item():.6f},{world_coord[1].item():.6f},{world_coord[2].item():.6f}) "
+                                        f"gt={act_gt_val:.6e} pred={act_pred_val:.6e} grid=(iz={iz},iy={iy},ix={ix})",
+                                        flush=True,
+                                    )
+                                    if len(ACT_DEBUG_WORLD_COORDS) < 2 and ACT_DEBUG_WORLD_STEP != step:
+                                        ACT_DEBUG_WORLD_COORDS.append(
+                                            (
+                                                (
+                                                    float(world_coord[0].item()),
+                                                    float(world_coord[1].item()),
+                                                    float(world_coord[2].item()),
+                                                ),
+                                                (iz, iy, ix),
+                                            )
+                                        )
+                                        ACT_DEBUG_WORLD_STEP = step
+                                        ACT_DEBUG_WORLD_REPORTED = False
+                                if world_subset.numel() > 0:
+                                    x_vals = world_subset[:, 0]
+                                    y_vals = world_subset[:, 1]
+                                    z_vals = world_subset[:, 2]
+                                    n_logged = int(debug_samples.numel())
+                                    print(
+                                        f"[ACT-CHECK][step {step}][sample-range] "
+                                        f"x=[{float(x_vals.min().item()):.6f},{float(x_vals.max().item()):.6f}] "
+                                        f"y=[{float(y_vals.min().item()):.6f},{float(y_vals.max().item()):.6f}] "
+                                        f"z=[{float(z_vals.min().item()):.6f},{float(z_vals.max().item()):.6f}] "
+                                        f"n_logged={n_logged}",
+                                        flush=True,
+                                    )
 
                         # [DEBUG][ACT-BIAS] Analyse des 0.693-Bias (softplus(0))
                         if step == 1:
@@ -5619,8 +6093,7 @@ def train():
                                           flush=True)
 
                                 _s("pred_act_raw (net out)", pred_act_raw)
-                                _s("pred_act (softplus(raw))", pred_act)
-                                _s("pred_act_debiased (shifted)", pred_act_debiased)
+                                _s("pred_act (debiased)", pred_act)
                                 _s("pred_pos (for loss, normalized)", pred_pos)
                                 print(f"[DEBUG][ACT-BIAS][step 1] act_norm_factor={act_norm_factor:.6e}", flush=True)
                                 act_pos_debug = act_samples.clamp_min(0.0) / torch.clamp(act_norm_t, min=1e-8)
@@ -5746,14 +6219,17 @@ def train():
                                 _, pred_tv_raw = query_emission_at_points(generator, z_latent, coords_tv, return_raw=True)
                                 
                                 # Konsistente Aktivierung/Normierung wie im Supervised-Pfad
-                                pred_tv_debiased = F.softplus(pred_tv_raw) - 0.6931472
-                                pred_tv_pos = pred_tv_debiased.clamp(min=0.0) / torch.clamp(act_norm_t, min=1e-8)
+                                pred_tv_pos = activity_from_raw(pred_tv_raw, debias=True) / torch.clamp(
+                                    torch.tensor(float(act_norm_factor), device=device, dtype=pred_tv_raw.dtype),
+                                    min=1e-8,
+                                )
                                 pred_tv_vol = pred_tv_pos.view(len(z_i), len(y_i), len(x_i))
                                 
                                 dx = torch.abs(pred_tv_vol[:, :, 1:] - pred_tv_vol[:, :, :-1]).mean()
                                 dy = torch.abs(pred_tv_vol[:, 1:, :] - pred_tv_vol[:, :-1, :]).mean()
                                 dz = torch.abs(pred_tv_vol[1:, :, :] - pred_tv_vol[:-1, :, :]).mean()
                                 loss_act_tv = dx + dy + dz
+                                loss_act_tv_updated = True
 
                         with torch.no_grad():
                             pred_pos_mean = float(pred_pos.mean().item())
@@ -5764,6 +6240,8 @@ def train():
                         loss = loss + act_loss_weighted
                         loss = loss + args.act_sparsity_weight * loss_sparsity
                         loss = loss + args.act_tv_weight * loss_act_tv
+                        if loss_act_tv_updated:
+                            last_act_tv_value = float(loss_act_tv.item())
                         global _PRED_ACT_STATS_LOGGED
                         if not _PRED_ACT_STATS_LOGGED:
                             _PRED_ACT_STATS_LOGGED = True
@@ -6570,9 +7048,14 @@ def train():
             val_psnr_top10 = val_top10["psnr"] if val_top10 is not None else None
             val_mae_top10 = val_top10["mae"] if val_top10 is not None else None
     
+            act_tv_loss_value = float(loss_act_tv.item())
+            act_tv_contrib = float(args.act_tv_weight) * act_tv_loss_value
+            act_tv_log_value = float(last_act_tv_value)
             msg = (
                 f"[step {step:05d}] loss={loss.item():.6f} | act={loss_act.item():.6f} "
-                f"| gain_reg={loss_gain.item():.6f} | ct={loss_ct.item():.6f} | sparsity={loss_sparsity.item():.6f} | act_tv={loss_act_tv.item():.6f} "
+                f"| gain_reg={loss_gain.item():.6f} | ct={loss_ct.item():.6f} "
+                f"| sparsity={loss_sparsity.item():.6f} | act_tv_loss={act_tv_loss_value:.6f} "
+                f"|                 act_tv_last={act_tv_log_value:.6f} | act_tv_contrib={act_tv_contrib:.6f} "
                 f"| ray_tv={loss_ray_tv.item():.6f} | ray_tv_w={loss_ray_tv_w.item():.6f} "
                 f"| bg_depth_mass={bg_depth_mass.item():.6f} | bg_depth_mass_w={bg_depth_mass_w.item():.6f} | bg_depth_frac={bg_depth_frac:.4f} "
                 f"| tv={loss_tv.item():.6f} "
@@ -6761,6 +7244,7 @@ def train():
                     pred_path_step,
                     args.export_vol_res,
                     device,
+                    log_world_range=args.debug_sanity_checks,
                 )
             if bool(getattr(args, "final_act_compare", False)) and step >= 200 and (step % 200 == 0):
                 if act_vol is not None and act_vol.numel() > 0:
@@ -6772,6 +7256,7 @@ def train():
                             pred_path_step,
                             args.export_vol_res,
                             device,
+                            log_world_range=args.debug_sanity_checks,
                         )
                     preview_dir = outdir / "preview"
                     step_label = f"step{step:06d}"
@@ -6925,6 +7410,7 @@ def train():
             pred_path_final,
             args.export_vol_res,
             device,
+            log_world_range=args.debug_sanity_checks,
         )
         final_label = f"final_step{last_step:06d}_{last_safe_patient_id}"
         final_preview_dir = outdir / "preview"
