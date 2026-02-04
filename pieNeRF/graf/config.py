@@ -64,6 +64,7 @@ def get_data(config):
 
     # 2) H und W aus einem Beispiel-AP-Bild ableiten
     sample0 = dset[0]
+    dset.capture_orientation_summary(sample0)
     ap0 = sample0["ap"]                                             # Shape: [1, H, W]
     _, H, W = ap0.shape                                             # H und W stammen aus echten Daten (nicht aus config)
     ct0 = sample0["ct"]

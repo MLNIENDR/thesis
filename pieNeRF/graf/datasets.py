@@ -216,6 +216,35 @@ class SpectDataset(torch.utils.data.Dataset):
             "proj_scale_joint_p99_missing": bool(e.get("proj_scale_joint_p99_missing")),
         }
 
+    def capture_orientation_summary(self, sample):
+        """Loggt einfache Orientierungs- und Shape-Infos eines Samples (AP/PA/CT/ACT)."""
+        if not isinstance(sample, dict):
+            print("[datasets][orientation] sample missing; skipping orientation summary", flush=True)
+            return
+        patient_id = None
+        meta = sample.get("meta")
+        if isinstance(meta, dict):
+            patient_id = meta.get("patient_id")
+            if torch.is_tensor(patient_id):
+                patient_id = patient_id.view(-1)[0].item() if patient_id.numel() > 0 else None
+        ap = sample.get("ap")
+        pa = sample.get("pa")
+        ct = sample.get("ct")
+        act = sample.get("act")
+        def _shape(tensor):
+            if tensor is None:
+                return "None"
+            try:
+                return tuple(int(x) for x in tensor.shape)
+            except Exception:
+                return "?"
+        print(
+            "[datasets][orientation] "
+            f"patient={patient_id or 'unknown'} "
+            f"ap_shape={_shape(ap)} pa_shape={_shape(pa)} ct_shape={_shape(ct)} act_shape={_shape(act)}",
+            flush=True,
+        )
+
 
     @staticmethod
     def _tensor_stats(t: torch.Tensor):

@@ -1,5 +1,8 @@
 """Helper utilities for the modified NeRF (positional encoding, MLP core, ray helpers)."""
 
+DEBUG_ORIENTATION_CHECKS = False
+_ORIENTATION_CHECKS_LOGGED = False
+
 import torch
 # torch.autograd.set_detect_anomaly(True)
 import torch.nn as nn
@@ -145,6 +148,13 @@ def get_rays(H, W, focal, c2w):
     return rays_o, rays_d
 
 
+def set_debug_orientation_checks(enabled: bool) -> None:
+    """Erlaubt zusätzliche Orientierungsausgaben für orthografische Rays."""
+    global DEBUG_ORIENTATION_CHECKS, _ORIENTATION_CHECKS_LOGGED
+    DEBUG_ORIENTATION_CHECKS = bool(enabled)
+    _ORIENTATION_CHECKS_LOGGED = False
+
+
 def get_rays_ortho(H, W, c2w, size_h, size_w):
     """Erzeugt orthografische Rays: parallele Richtungen, Ursprünge liegen auf einer Ebene 
     mit physikalischer Größe size_w x size_h in Weltkoordinaten.
@@ -174,7 +184,7 @@ def get_rays_ortho(H, W, c2w, size_h, size_w):
     rays_o = grid_x.unsqueeze(-1) * x_axis + grid_y.unsqueeze(-1) * y_axis
     rays_o = rays_o + origin
 
-    global _ORTHO_RAYS_DEBUGGED
+    global _ORTHO_RAYS_DEBUGGED, _ORIENTATION_CHECKS_LOGGED
     if not _ORTHO_RAYS_DEBUGGED:
         _ORTHO_RAYS_DEBUGGED = True
         xs_range = (float(xs.min().item()), float(xs.max().item()))
@@ -198,6 +208,21 @@ def get_rays_ortho(H, W, c2w, size_h, size_w):
                 rays_min[2].item(),
                 rays_max[2].item(),
             ),
+            flush=True,
+        )
+    if DEBUG_ORIENTATION_CHECKS and not _ORIENTATION_CHECKS_LOGGED:
+        _ORIENTATION_CHECKS_LOGGED = True
+        grid_x_range = (float(grid_x.amin().item()), float(grid_x.amax().item()))
+        grid_y_range = (float(grid_y.amin().item()), float(grid_y.amax().item()))
+        rays_min = torch.stack([rays_o[..., 0].amin(), rays_o[..., 1].amin(), rays_o[..., 2].amin()])
+        rays_max = torch.stack([rays_o[..., 0].amax(), rays_o[..., 1].amax(), rays_o[..., 2].amax()])
+        print(
+            "[orientation-check][get_rays_ortho] size_h={:.3f}cm (image axis0 -> world Y) "
+            "size_w={:.3f}cm (image axis1 -> world X); "
+            "xs_range(before invert)={:.3f}/{:.3f}cm ys_range={:.3f}/{:.3f}cm; "
+            "grid_x_range(after invert)={:.3f}/{:.3f}cm grid_y_range={:.3f}/{:.3f}cm; "
+            "world rays_o_x={:.3f}/{:.3f}cm rays_o_y={:.3f}/{:.3f}cm rays_o_z={:.3f}/{:.3f}cm; "
+            "grid_x is flipped to keep image left->right aligned with world X.",
             flush=True,
         )
 

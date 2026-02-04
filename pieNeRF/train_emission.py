@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict, List, Mapping, Any
 from collections import Counter
 
+import hashlib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -137,6 +138,40 @@ def _act_spacing_from_meta(act_meta: Mapping[str, Any]) -> tuple[tuple[float, fl
     sd_cm = sd_mm_val / 10.0
     spacing = (sd_cm, sd_cm, sd_cm)
     return spacing, str(meta_file), sd_mm_val
+
+
+def _describe_active_axis_range(
+    volume: np.ndarray | torch.Tensor, thr: float = 1e-8
+) -> Optional[dict]:
+    """Return the most active axis range (min, max, count) for the given volume."""
+    arr = np.asarray(volume)
+    if arr.ndim == 4 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim != 3:
+        return None
+    mask = arr > thr
+    if not mask.any():
+        return None
+    best_axis = None
+    best_count = -1
+    best_mask = None
+    for axis in range(3):
+        axes = tuple(i for i in range(3) if i != axis)
+        axis_mask = np.any(mask, axis=axes)
+        count = int(np.count_nonzero(axis_mask))
+        if count > best_count:
+            best_count = count
+            best_axis = axis
+            best_mask = axis_mask
+    if best_mask is None or best_mask.sum() == 0:
+        return None
+    indices = np.nonzero(best_mask)[0]
+    return {
+        "axis": best_axis,
+        "min": int(indices[0]),
+        "max": int(indices[-1]),
+        "n_slices": int(best_mask.sum()),
+    }
 
 
 def _maybe_log_act_radius(
@@ -1200,12 +1235,15 @@ def _radius_to_float(radius):
 def save_test_volume_slices(
     args,
     generator,
-    z_latent,
+    z_latent_base: torch.Tensor,
     test_loader,
     outdir: Path,
     device: torch.device,
     max_patients: int = 2,
     slice_percents=(0.1, 0.5, 0.9),
+    encoder: Optional[nn.Module] = None,
+    z_fuser: Optional[nn.Module] = None,
+    z_enc_alpha: float = 0.0,
 ):
     if test_loader is None or len(test_loader.dataset) == 0:
         return
@@ -1214,7 +1252,58 @@ def save_test_volume_slices(
     seen_ids: set[str] = set()
     saved_info: list[dict] = []
     prev_use_test = generator.use_test_kwargs
+    prev_encoder_training = encoder.training if encoder is not None else None
     generator.eval()
+    if encoder is not None:
+        encoder.eval()
+
+    hybrid_enabled = bool(getattr(args, "hybrid", False))
+
+    def _tensor_stats_and_sig(tensor):
+        if tensor is None or not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+            return None, None
+        flat = tensor.detach().reshape(-1).float()
+        arr = flat.cpu().numpy().astype(np.float32)
+        stats = (float(arr.min()), float(arr.mean()), float(arr.max()))
+        sig = hashlib.sha1(arr.tobytes()).hexdigest()
+        return stats, sig
+
+    def _build_test_latent(batch: dict) -> torch.Tensor:
+        if not (hybrid_enabled and encoder is not None):
+            raise RuntimeError("Hybrid encoder required for test slices.")
+        ap = batch.get("ap")
+        pa = batch.get("pa")
+        if ap is None or pa is None:
+            raise RuntimeError("Test batch missing AP/PA to build latent.")
+        ap = ap.to(device, non_blocking=True).float()
+        pa = pa.to(device, non_blocking=True).float()
+        ap_enc_input = batch.get("proj_input_ap", ap)
+        pa_enc_input = batch.get("proj_input_pa", pa)
+        if ap_enc_input is not ap:
+            ap_enc_input = ap_enc_input.to(device, non_blocking=True).float()
+        if pa_enc_input is not pa:
+            pa_enc_input = pa_enc_input.to(device, non_blocking=True).float()
+        with torch.no_grad():
+            proj_scale_enc = compute_proj_scale(ap, pa, args.proj_scale_source, batch.get("meta"))
+            proj_scale_enc = torch.clamp(proj_scale_enc, min=1e-6)
+            ct_vol = batch.get("ct")
+            if ct_vol is not None and ct_vol.numel() > 0:
+                ct_vol = ct_vol.to(device, non_blocking=True).float()
+            else:
+                ct_vol = None
+            enc_input = build_encoder_input(
+                ap_enc_input,
+                pa_enc_input,
+                ct_vol,
+                proj_scale_enc,
+                args.encoder_proj_transform,
+                args.encoder_use_ct,
+            )
+            z_enc = encoder(enc_input)
+            z_enc_proj = z_fuser(z_enc) if z_fuser is not None else z_enc
+            latent = z_enc_proj
+        return latent.detach()
+
     patient_iter = iter(test_loader)
     try:
         while len(seen_ids) < max_patients:
@@ -1225,16 +1314,71 @@ def save_test_volume_slices(
             seen_ids.add(patient_id)
             patient_dir = slice_root / patient_id
             patient_dir.mkdir(parents=True, exist_ok=True)
+
+            meta = batch.get("meta")
+            dataset_index = None
+            ap_path = None
+            pa_path = None
+            ct_path = None
+            if isinstance(meta, dict):
+                dataset_index = meta.get("dataset_index")
+                ap_path = meta.get("ap_path")
+                pa_path = meta.get("pa_path")
+                ct_path = meta.get("ct_path")
+            ap_counts = batch.get("ap_counts")
+            pa_counts = batch.get("pa_counts")
+            ct_vol = batch.get("ct")
+            ap_counts_stats, ap_counts_sig = _tensor_stats_and_sig(ap_counts)
+            pa_counts_stats, pa_counts_sig = _tensor_stats_and_sig(pa_counts)
+            ct_stats, ct_sig = _tensor_stats_and_sig(ct_vol)
+            print(
+                f"[test][slices][inputs] patient={patient_id} idx={dataset_index} "
+                f"ap_path={ap_path} pa_path={pa_path} ct_path={ct_path} "
+                f"ap_counts_stats={ap_counts_stats} sig={ap_counts_sig[:8] if ap_counts_sig else None} "
+                f"pa_counts_stats={pa_counts_stats} sig={pa_counts_sig[:8] if pa_counts_sig else None} "
+                f"ct_stats={ct_stats} sig={ct_sig[:8] if ct_sig else None}",
+                flush=True,
+            )
+            if hybrid_enabled and encoder is not None:
+                z_latent_batch = _build_test_latent(batch)
+            else:
+                z_latent_batch = z_latent_base.detach()
+            z_arr = z_latent_batch.detach().cpu().numpy().astype(np.float32)
+            z_stats = (
+                (float(z_arr.min()), float(z_arr.mean()), float(z_arr.max()))
+                if z_arr.size > 0
+                else (float("nan"), float("nan"), float("nan"))
+            )
+            z_sig = hashlib.sha1(z_arr.ravel().tobytes()).hexdigest()
+            latent_sig = hashlib.sha1(z_latent_batch.cpu().numpy().ravel().astype(np.float32).tobytes()).hexdigest()
+            print(
+                f"[test][slices][latent] patient={patient_id} z_latent_sig={latent_sig[:8]} "
+                f"shape={tuple(z_latent_batch.shape)} stats={z_stats} z_sha={z_sig[:8]}",
+                flush=True,
+            )
             pred_path = patient_dir / "activity_pred.npy"
             pred_vol = export_activity_volume(
                 generator,
-                z_latent,
+                z_latent_batch,
                 pred_path,
                 args.export_vol_res,
                 device,
                 log_world_range=args.debug_sanity_checks,
             )
             pred_vol = np.asarray(pred_vol, dtype=np.float32)
+            pred_stats = (float(pred_vol.min()), float(pred_vol.mean()), float(pred_vol.max()))
+            pred_range = _describe_active_axis_range(pred_vol, thr=1e-8)
+            range_desc = (
+                f"axis{pred_range['axis']} {pred_range['min']}-{pred_range['max']} "
+                f"({pred_range['n_slices']} slices)"
+                if pred_range
+                else "no active slices"
+            )
+            print(
+                f"[test][slices][pred] patient={patient_id} stats(min/mean/max)=("
+                f"{pred_stats[0]:.3e}/{pred_stats[1]:.3e}/{pred_stats[2]:.3e}) {range_desc}",
+                flush=True,
+            )
             act_tensor = batch.get("act")
             gt_vol = None
             act_vol_plot = None
@@ -1245,6 +1389,17 @@ def save_test_volume_slices(
                 if act_nd.ndim == 3:
                     gt_vol = act_nd.cpu().numpy().astype(np.float32)
                     act_vol_plot = act_nd
+                    gt_range = _describe_active_axis_range(gt_vol, thr=1e-8)
+                    gt_desc = (
+                        f"axis{gt_range['axis']} {gt_range['min']}-{gt_range['max']} "
+                        f"({gt_range['n_slices']} slices)"
+                        if gt_range
+                        else "no active slices"
+                    )
+                    print(
+                        f"[test][slices][gt] patient={patient_id} gt_range={gt_desc}",
+                        flush=True,
+                    )
             final_filename = patient_dir / f"final_{patient_id}_act_compare_axial.png"
             save_final_act_compare_volume_slicing(
                 args,
@@ -1270,6 +1425,11 @@ def save_test_volume_slices(
             generator.eval()
         else:
             generator.train()
+        if encoder is not None and prev_encoder_training is not None:
+            if prev_encoder_training:
+                encoder.train()
+            else:
+                encoder.eval()
     if not saved_info:
         return
     meta_path = slice_root / "slices_meta.json"
@@ -7492,10 +7652,13 @@ def train():
             save_test_volume_slices(
                 args,
                 generator,
-                last_z_latent.detach(),
+                z_latent_base.detach(),
                 test_loader,
                 outdir,
                 device,
+                encoder=encoder,
+                z_fuser=z_fuser,
+                z_enc_alpha=z_enc_alpha,
             )
         else:
             reason = "run_final_test disabled or no test_loader"

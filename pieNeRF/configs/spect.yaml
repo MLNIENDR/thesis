@@ -20,7 +20,7 @@ expname: spect_emission
 data:
   # -------- Dataset ----------
   type: spect
-  manifest: data/manifest.csv
+  manifest: data/manifest_abs.csv
   imsize: null                 # null => no resize (native resolution)
   white_bkgd: false
   fixed_poses: ap_pa           # feste AP/PA-Posen
@@ -48,9 +48,9 @@ data:
   split_mode: counts           # counts ist robust bei kleinen N (wie bei dir)
 
   # 6 train, 1 val, 2 test (bei 9 phantoms)
-  split_train_count: 1
+  split_train_count: 7
   split_val_count: 0
-  split_test_count: 0
+  split_test_count: 2
 
   # -------- NeRF Raum-Parameter ----------
   # radius/fov bleiben als Legacy/Default drin; bei anisotropem Setup ist radius_xyz_cm maßgeblich.
