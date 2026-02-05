@@ -48,7 +48,7 @@ data:
   split_mode: counts           # counts ist robust bei kleinen N (wie bei dir)
 
   # 6 train, 1 val, 2 test (bei 9 phantoms)
-  split_train_count: 7
+  split_train_count: 6
   split_val_count: 0
   split_test_count: 2
 

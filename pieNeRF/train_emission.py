@@ -1098,6 +1098,69 @@ def save_img(arr, path, title=None):
     plt.close()
 
 
+def save_img_abs(
+    arr,
+    path,
+    *,
+    title=None,
+    step=None,
+    view=None,
+    patient_id=None,
+    vmin: float = 0.0,
+    vmax: Optional[float] = None,
+    allow_arr_max: bool = True,
+    cbar_label="counts",
+    cmap="viridis",
+):
+    """Save a counts-based preview image (no normalization) with colorbar."""
+    import matplotlib.pyplot as plt
+
+    data = np.asarray(arr, dtype=np.float32)
+    data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+    finite = np.isfinite(data)
+    if vmax is None:
+        if finite.any():
+            try:
+                candidate = float(np.nanquantile(data[finite], 0.995))
+            except Exception:
+                candidate = float(np.nanmax(data[finite]))
+        else:
+            candidate = 0.0
+    else:
+        candidate = float(vmax)
+    if allow_arr_max and finite.any():
+        candidate = max(candidate, float(np.nanmax(data[finite])))
+    candidate = max(candidate, vmin + 1e-6, 1e-6)
+    vmin = float(vmin)
+    if vmin >= candidate:
+        candidate = vmin + 1e-6
+    fig, ax = plt.subplots(figsize=(6, 4))
+    im = ax.imshow(data, origin="upper", cmap=cmap, vmin=vmin, vmax=candidate)
+    cbar = fig.colorbar(im, ax=ax, label=cbar_label)
+    title_parts = []
+    if title:
+        title_parts.append(str(title))
+    if view:
+        title_parts.append(view)
+    if step is not None:
+        title_parts.append(f"step {step}")
+    if patient_id:
+        title_parts.append(f"id {patient_id}")
+    minv = float(np.nanmin(data)) if finite.any() else 0.0
+    maxv = float(np.nanmax(data)) if finite.any() else 0.0
+    sumv = float(np.nansum(data))
+    title_parts.append(f"min={minv:.2e}")
+    title_parts.append(f"max={maxv:.2e}")
+    title_parts.append(f"sum={sumv:.2e}")
+    title_parts.append(f"vmax={candidate:.2e}")
+    ax.set_title(" | ".join(title_parts))
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    plt.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
 def log_projection_quantiles(ap_pred, pa_pred, ap_target=None, pa_target=None, tag="final"):
     quantiles = [0.5, 0.8, 0.95, 0.99]
 
@@ -2217,6 +2280,7 @@ def maybe_render_preview(
     target_pa=None,
     target_ap_counts=None,
     target_pa_counts=None,
+    patient_id: Optional[str] = None,
 ):
     # Volle AP/PA-Renderings sind teuer; nur alle N Schritte ausführen
     if args.preview_every <= 0 or (step % args.preview_every) != 0:
@@ -2235,8 +2299,74 @@ def maybe_render_preview(
     pa_np = proj_pa[0].reshape(H, W).detach().cpu().numpy()
     out_dir = outdir / "preview"
     out_dir.mkdir(parents=True, exist_ok=True)
-    save_img(ap_np, out_dir / f"step_{step:05d}_AP.png", title=f"AP @ step {step}")
-    save_img(pa_np, out_dir / f"step_{step:05d}_PA.png", title=f"PA @ step {step}")
+    def _proj_to_img(tensor: Optional[torch.Tensor]) -> Optional[np.ndarray]:
+        if tensor is None:
+            return None
+        t = tensor.detach()
+        if t.numel() == H * W:
+            t = t.view(H, W)
+        elif t.dim() >= 2 and t.shape[-2:] == (H, W):
+            t = t.reshape(-1, H, W)[0]
+        else:
+            return None
+        return t.cpu().numpy()
+
+    def _choose_vmax(reference: Optional[np.ndarray], fallback: float) -> float:
+        if reference is not None:
+            finite = np.isfinite(reference)
+            if finite.any():
+                try:
+                    val = float(np.quantile(reference[finite], 0.995))
+                except Exception:
+                    val = float(np.nanmax(reference[finite]))
+                if np.isfinite(val) and val > 0.0:
+                    return max(val, fallback, 1e-6)
+        if np.isfinite(fallback) and fallback > 0.0:
+            return max(fallback, 1e-6)
+        return 1e-6
+
+    def _first_not_none(*values):
+        for v in values:
+            if v is not None:
+                return v
+        return None
+
+    ap_target_img = _first_not_none(_proj_to_img(target_ap_counts), _proj_to_img(target_ap))
+    pa_target_img = _first_not_none(_proj_to_img(target_pa_counts), _proj_to_img(target_pa))
+
+    def _save_view(pred_img: np.ndarray, target_img: Optional[np.ndarray], view: str):
+        vmax = _choose_vmax(target_img, float(np.nanmax(pred_img)))
+        # keep colorscale anchored to the target counts, never expanded by pred max
+        save_img_abs(
+            pred_img,
+            out_dir / f"step_{step:05d}_{view}.png",
+            step=step,
+            view=view,
+            patient_id=patient_id,
+            vmax=vmax,
+            allow_arr_max=False,
+            cbar_label="counts",
+        )
+        if target_img is None or target_img.shape != pred_img.shape:
+            return
+        diff = pred_img - target_img
+        diff_vmax = float(np.nanmax(np.abs(diff))) if np.isfinite(diff).any() else 0.0
+        diff_vmax = max(diff_vmax, 1e-6)
+        save_img_abs(
+            diff,
+            out_dir / f"step_{step:05d}_{view}_diff.png",
+            title="pred-target",
+            step=step,
+            view=f"{view} diff",
+            patient_id=patient_id,
+            vmin=-diff_vmax,
+            vmax=diff_vmax,
+            cbar_label="counts",
+            cmap="RdBu_r",
+        )
+
+    _save_view(ap_np, ap_target_img, "AP")
+    _save_view(pa_np, pa_target_img, "PA")
     save_depth_profile(
         step,
         generator,
@@ -2284,27 +2414,61 @@ def init_log_file(path: Path) -> Path:
         "loss_tv",
         "mae_ap",
         "mae_pa",
-        "psnr_ap",
-        "psnr_pa",
+        "rmse_ap",
+        "rmse_pa",
+        "nll_ap",
+        "nll_pa",
+        "dev_ap",
+        "dev_pa",
         "pred_mean_ap",
         "pred_mean_pa",
         "pred_std_ap",
         "pred_std_pa",
+        "val_loss",
+        "val_loss_ap",
+        "val_loss_pa",
+        "val_mae",
+        "val_rmse",
+        "val_nll",
+        "val_dev",
+        "val_mae_ap",
+        "val_mae_pa",
+        "val_rmse_ap",
+        "val_rmse_pa",
+        "val_nll_ap",
+        "val_nll_pa",
+        "val_dev_ap",
+        "val_dev_pa",
+        "val_loss_fg",
+        "val_mae_fg",
+        "val_rmse_fg",
+        "val_nll_fg",
+        "val_dev_fg",
+        "val_loss_top10",
+        "val_mae_top10",
+        "val_rmse_top10",
+        "val_nll_top10",
+        "val_dev_top10",
+        "val_loss_bg",
+        "val_mae_bg",
+        "val_rmse_bg",
+        "val_nll_bg",
+        "val_dev_bg",
         "loss_test_all",
         "loss_test_ap",
         "loss_test_pa",
-        "psnr_test_all",
-        "psnr_test_ap",
-        "psnr_test_pa",
         "mae_test_all",
         "mae_test_ap",
         "mae_test_pa",
-        "loss_test_fg",
-        "psnr_test_fg",
-        "mae_test_fg",
-        "loss_test_top10",
-        "psnr_test_top10",
-        "mae_test_top10",
+        "rmse_test_all",
+        "rmse_test_ap",
+        "rmse_test_pa",
+        "nll_test_all",
+        "nll_test_ap",
+        "nll_test_pa",
+        "dev_test_all",
+        "dev_test_ap",
+        "dev_test_pa",
         "iter_ms",
         "lr",
         "ray_tv_mode",
@@ -2446,11 +2610,23 @@ def save_checkpoint(step, generator, optimizer, scaler, ckpt_dir: Path, encoder=
     print(f"💾 Checkpoint gespeichert: {ckpt_path}", flush=True)
 
 
-def compute_psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
-    mse = torch.mean((pred - target) ** 2).item()
-    if mse <= 0:
-        return float("inf")
-    return -10.0 * math.log10(mse + 1e-12)
+def compute_projection_metrics(pred: torch.Tensor, target: torch.Tensor, *, eps: float = 1e-8) -> dict:
+    """Forward-only projection metrics for counts (MAE/RMSE) and Poisson diagnostics."""
+
+    pred_clamped = torch.clamp(pred, min=eps)
+    target_clamped = torch.clamp(target, min=eps)
+    diff = pred - target
+    mae = float(torch.mean(torch.abs(diff)).item())
+    rmse = float(torch.sqrt(torch.mean(diff * diff)).item())
+    nll = float(torch.mean(pred_clamped - target * torch.log(pred_clamped)).item())
+    ratio = target_clamped / pred_clamped
+    poisson_deviance = float(torch.mean(2.0 * (diff + target * torch.log(ratio))).item())
+    return {
+        "mae": mae,
+        "rmse": rmse,
+        "nll": nll,
+        "dev": poisson_deviance,
+    }
 
 
 def save_depth_profile(
@@ -4079,10 +4255,8 @@ def evaluate_pixel_subsets(
             loss_pa = loss_fn(pred_pa, target_pa, weight=weight_pa)
             loss_total = 0.5 * (loss_ap + loss_pa)
 
-            psnr_ap = compute_psnr(pred_ap, target_ap)
-            psnr_pa = compute_psnr(pred_pa, target_pa)
-            mae_ap = torch.mean(torch.abs(pred_ap - target_ap)).item()
-            mae_pa = torch.mean(torch.abs(pred_pa - target_pa)).item()
+            metrics_ap = compute_projection_metrics(pred_ap, target_ap)
+            metrics_pa = compute_projection_metrics(pred_pa, target_pa)
 
             phys_metrics = None
             if scale_ap is not None and scale_pa is not None:
@@ -4092,16 +4266,16 @@ def evaluate_pixel_subsets(
                 pred_pa_phys = pred_pa * scale_pa_f
                 target_ap_phys = target_ap * scale_ap_f
                 target_pa_phys = target_pa * scale_pa_f
-                psnr_ap_phys = compute_psnr(pred_ap_phys, target_ap_phys)
-                psnr_pa_phys = compute_psnr(pred_pa_phys, target_pa_phys)
-                mae_ap_phys = torch.mean(torch.abs(pred_ap_phys - target_ap_phys)).item()
-                mae_pa_phys = torch.mean(torch.abs(pred_pa_phys - target_pa_phys)).item()
+                metrics_phys_ap = compute_projection_metrics(pred_ap_phys, target_ap_phys)
+                metrics_phys_pa = compute_projection_metrics(pred_pa_phys, target_pa_phys)
                 phys_metrics = {
-                    "psnr": 0.5 * (psnr_ap_phys + psnr_pa_phys),
-                    "mae": 0.5 * (mae_ap_phys + mae_pa_phys),
+                    "mae": 0.5 * (metrics_phys_ap["mae"] + metrics_phys_pa["mae"]),
+                    "rmse": 0.5 * (metrics_phys_ap["rmse"] + metrics_phys_pa["rmse"]),
+                    "nll": 0.5 * (metrics_phys_ap["nll"] + metrics_phys_pa["nll"]),
+                    "dev": 0.5 * (metrics_phys_ap["dev"] + metrics_phys_pa["dev"]),
                     "view": {
-                        "ap": {"psnr": psnr_ap_phys, "mae": mae_ap_phys},
-                        "pa": {"psnr": psnr_pa_phys, "mae": mae_pa_phys},
+                        "ap": metrics_phys_ap,
+                        "pa": metrics_phys_pa,
                     },
                 }
 
@@ -4109,13 +4283,15 @@ def evaluate_pixel_subsets(
                 "loss": loss_total.item(),
                 "loss_ap": loss_ap.item(),
                 "loss_pa": loss_pa.item(),
-                "psnr": 0.5 * (psnr_ap + psnr_pa),
-                "mae": 0.5 * (mae_ap + mae_pa),
+                "mae": 0.5 * (metrics_ap["mae"] + metrics_pa["mae"]),
+                "rmse": 0.5 * (metrics_ap["rmse"] + metrics_pa["rmse"]),
+                "nll": 0.5 * (metrics_ap["nll"] + metrics_pa["nll"]),
+                "dev": 0.5 * (metrics_ap["dev"] + metrics_pa["dev"]),
                 "pred_mean": ((float(pred_ap.mean()), float(pred_pa.mean()))),
                 "target_mean": ((float(target_ap.mean()), float(target_pa.mean()))),
                 "view": {
-                    "ap": {"loss": loss_ap.item(), "psnr": psnr_ap, "mae": mae_ap},
-                    "pa": {"loss": loss_pa.item(), "psnr": psnr_pa, "mae": mae_pa},
+                    "ap": {"loss": loss_ap.item(), **metrics_ap},
+                    "pa": {"loss": loss_pa.item(), **metrics_pa},
                 },
                 "phys": phys_metrics,
             }
@@ -4208,8 +4384,10 @@ def _aggregate_subset_metrics(metrics_list):
         "loss": _mean([m["loss"] for m in metrics_list]),
         "loss_ap": _mean([m["loss_ap"] for m in metrics_list]),
         "loss_pa": _mean([m["loss_pa"] for m in metrics_list]),
-        "psnr": _mean([m["psnr"] for m in metrics_list]),
         "mae": _mean([m["mae"] for m in metrics_list]),
+        "rmse": _mean([m["rmse"] for m in metrics_list]),
+        "nll": _mean([m["nll"] for m in metrics_list]),
+        "dev": _mean([m["dev"] for m in metrics_list]),
         "pred_mean": (
             _mean([m["pred_mean"][0] for m in metrics_list]),
             _mean([m["pred_mean"][1] for m in metrics_list]),
@@ -4221,13 +4399,17 @@ def _aggregate_subset_metrics(metrics_list):
         "view": {
             "ap": {
                 "loss": _mean([m["view"]["ap"]["loss"] for m in metrics_list]),
-                "psnr": _mean([m["view"]["ap"]["psnr"] for m in metrics_list]),
                 "mae": _mean([m["view"]["ap"]["mae"] for m in metrics_list]),
+                "rmse": _mean([m["view"]["ap"]["rmse"] for m in metrics_list]),
+                "nll": _mean([m["view"]["ap"]["nll"] for m in metrics_list]),
+                "dev": _mean([m["view"]["ap"]["dev"] for m in metrics_list]),
             },
             "pa": {
                 "loss": _mean([m["view"]["pa"]["loss"] for m in metrics_list]),
-                "psnr": _mean([m["view"]["pa"]["psnr"] for m in metrics_list]),
                 "mae": _mean([m["view"]["pa"]["mae"] for m in metrics_list]),
+                "rmse": _mean([m["view"]["pa"]["rmse"] for m in metrics_list]),
+                "nll": _mean([m["view"]["pa"]["nll"] for m in metrics_list]),
+                "dev": _mean([m["view"]["pa"]["dev"] for m in metrics_list]),
             },
         },
     }
@@ -4235,16 +4417,22 @@ def _aggregate_subset_metrics(metrics_list):
     phys_list = [m.get("phys") for m in metrics_list if m.get("phys") is not None]
     if phys_list:
         aggregated["phys"] = {
-            "psnr": _mean([p["psnr"] for p in phys_list]),
             "mae": _mean([p["mae"] for p in phys_list]),
+            "rmse": _mean([p["rmse"] for p in phys_list]),
+            "nll": _mean([p["nll"] for p in phys_list]),
+            "dev": _mean([p["dev"] for p in phys_list]),
             "view": {
                 "ap": {
-                    "psnr": _mean([p["view"]["ap"]["psnr"] for p in phys_list]),
                     "mae": _mean([p["view"]["ap"]["mae"] for p in phys_list]),
+                    "rmse": _mean([p["view"]["ap"]["rmse"] for p in phys_list]),
+                    "nll": _mean([p["view"]["ap"]["nll"] for p in phys_list]),
+                    "dev": _mean([p["view"]["ap"]["dev"] for p in phys_list]),
                 },
                 "pa": {
-                    "psnr": _mean([p["view"]["pa"]["psnr"] for p in phys_list]),
                     "mae": _mean([p["view"]["pa"]["mae"] for p in phys_list]),
+                    "rmse": _mean([p["view"]["pa"]["rmse"] for p in phys_list]),
+                    "nll": _mean([p["view"]["pa"]["nll"] for p in phys_list]),
+                    "dev": _mean([p["view"]["pa"]["dev"] for p in phys_list]),
                 },
             },
         }
@@ -6903,38 +7091,41 @@ def train():
                 if pred_ap_raw is not None and pred_pa_raw is not None:
                     pred_mean_raw = (pred_ap_raw.mean().item(), pred_pa_raw.mean().item())
                     pred_std_raw = (pred_ap_raw.std().item(), pred_pa_raw.std().item())
-                if not proj_metrics_enabled:
-                    mae_ap = float("nan")
-                    mae_pa = float("nan")
-                    pred_mean = pred_mean_raw
-                    pred_std = pred_std_raw
-                    psnr_ap = float("nan")
-                    psnr_pa = float("nan")
-                    psnr_ap_phys = None
-                    psnr_pa_phys = None
-                    mae_ap_phys = None
-                    mae_pa_phys = None
-                else:
-                    mae_ap = torch.mean(torch.abs(pred_ap - target_ap)).item()
-                    mae_pa = torch.mean(torch.abs(pred_pa - target_pa)).item()
+                metrics_ap = None
+                metrics_pa = None
+                metrics_phys_ap = None
+                metrics_phys_pa = None
+                pred_mean = pred_mean_raw
+                pred_std = pred_std_raw
+                if proj_metrics_enabled:
+                    metrics_ap = compute_projection_metrics(pred_ap, target_ap)
+                    metrics_pa = compute_projection_metrics(pred_pa, target_pa)
                     pred_mean = (pred_ap.mean().item(), pred_pa.mean().item())
                     pred_std = (pred_ap.std().item(), pred_pa.std().item())
-                    psnr_ap = compute_psnr(pred_ap, target_ap)
-                    psnr_pa = compute_psnr(pred_pa, target_pa)
-                    psnr_ap_phys = None
-                    psnr_pa_phys = None
-                    mae_ap_phys = None
-                    mae_pa_phys = None
                     if log_proj_metrics_physical:
                         pred_ap_phys = pred_ap * float(scale_ap_used)
                         pred_pa_phys = pred_pa * float(scale_pa_used)
                         target_ap_phys = target_ap * float(scale_ap_used)
                         target_pa_phys = target_pa * float(scale_pa_used)
-                        psnr_ap_phys = compute_psnr(pred_ap_phys, target_ap_phys)
-                        psnr_pa_phys = compute_psnr(pred_pa_phys, target_pa_phys)
-                        mae_ap_phys = torch.mean(torch.abs(pred_ap_phys - target_ap_phys)).item()
-                        mae_pa_phys = torch.mean(torch.abs(pred_pa_phys - target_pa_phys)).item()
-                if debug_sanity_checks and (step == 1 or (step % debug_sanity_every) == 0):
+                        metrics_phys_ap = compute_projection_metrics(pred_ap_phys, target_ap_phys)
+                        metrics_phys_pa = compute_projection_metrics(pred_pa_phys, target_pa_phys)
+                mae_ap = metrics_ap["mae"] if metrics_ap else float("nan")
+                mae_pa = metrics_pa["mae"] if metrics_pa else float("nan")
+                rmse_ap = metrics_ap["rmse"] if metrics_ap else float("nan")
+                rmse_pa = metrics_pa["rmse"] if metrics_pa else float("nan")
+                dev_ap = metrics_ap["dev"] if metrics_ap else float("nan")
+                dev_pa = metrics_pa["dev"] if metrics_pa else float("nan")
+                nll_ap = metrics_ap["nll"] if metrics_ap else float("nan")
+                nll_pa = metrics_pa["nll"] if metrics_pa else float("nan")
+                phys_mae_ap = metrics_phys_ap["mae"] if metrics_phys_ap else None
+                phys_mae_pa = metrics_phys_pa["mae"] if metrics_phys_pa else None
+                phys_rmse_ap = metrics_phys_ap["rmse"] if metrics_phys_ap else None
+                phys_rmse_pa = metrics_phys_pa["rmse"] if metrics_phys_pa else None
+                phys_nll_ap = metrics_phys_ap["nll"] if metrics_phys_ap else None
+                phys_nll_pa = metrics_phys_pa["nll"] if metrics_phys_pa else None
+                phys_dev_ap = metrics_phys_ap["dev"] if metrics_phys_ap else None
+                phys_dev_pa = metrics_phys_pa["dev"] if metrics_phys_pa else None
+            if debug_sanity_checks and (step == 1 or (step % debug_sanity_every) == 0):
                     if proj_warmup_active and proj_loss_active:
                         print(
                             f"[sanity][step {step}] WARN: proj_warmup_active=True but proj_loss_active=True",
@@ -6950,246 +7141,252 @@ def train():
                                     f"(diff_ap={diff_ap:.3e}, diff_pa={diff_pa:.3e})",
                                     flush=True,
                                 )
-                bg_depth_frac = float(bg_depth_frac_t.detach().cpu().item())
-                if hybrid_enabled and hybrid_log_path is not None and need_raw_stats:
-                    target_ap_stats = tensor_stats(target_ap)
-                    target_pa_stats = tensor_stats(target_pa)
-                    pred_ap_stats = tensor_stats(pred_ap)
-                    pred_pa_stats = tensor_stats(pred_pa)
-                    atten_scale = float(generator.render_kwargs_train.get("atten_scale", ATTEN_SCALE_DEFAULT))
-                    (
-                        lambda_stats,
-                        mu_stats,
-                        atten_stats,
-                        atten_frac_gt20,
-                        atten_frac_clamp,
+            bg_depth_frac = float(bg_depth_frac_t.detach().cpu().item())
+            if hybrid_enabled and hybrid_log_path is not None and need_raw_stats:
+                target_ap_stats = tensor_stats(target_ap)
+                target_pa_stats = tensor_stats(target_pa)
+                pred_ap_stats = tensor_stats(pred_ap)
+                pred_pa_stats = tensor_stats(pred_pa)
+                atten_scale = float(generator.render_kwargs_train.get("atten_scale", ATTEN_SCALE_DEFAULT))
+                (
+                    lambda_stats,
+                    mu_stats,
+                    atten_stats,
+                    atten_frac_gt20,
+                    atten_frac_clamp,
+                    nonfinite_lambda,
+                    nonfinite_atten,
+                ) = compute_lambda_and_attenuation_stats([extras_ap, extras_pa], atten_scale=atten_scale)
+                nonfinite_pred = nonfinite_fraction(torch.cat([pred_ap, pred_pa], dim=1))
+                proj_scale_enc_val = (
+                    float(proj_scale_enc.mean().item()) if torch.is_tensor(proj_scale_enc) else float("nan")
+                )
+                gain_log_src = gain_val_used if gain_val_used is not None else gain_val
+                gain_log = float(gain_log_src.mean().item()) if gain_log_src is not None else float("nan")
+                z_enc_l2 = (
+                    float(z_enc_proj.detach().norm(dim=1).mean().item()) if z_enc_proj is not None else float("nan")
+                )
+                z_latent_l2 = float(z_latent.detach().norm(dim=1).mean().item())
+
+                def _stat(stats, key):
+                    return float(stats[key]) if stats is not None and key in stats else float("nan")
+
+                print(
+                    f"[hybrid][step {step:05d}] "
+                    f"t_ap(min/mean/p95/max)=({_stat(target_ap_stats,'min'):.3e},"
+                    f"{_stat(target_ap_stats,'mean'):.3e},{_stat(target_ap_stats,'p95'):.3e},"
+                    f"{_stat(target_ap_stats,'max'):.3e}) "
+                    f"t_pa(min/mean/p95/max)=({_stat(target_pa_stats,'min'):.3e},"
+                    f"{_stat(target_pa_stats,'mean'):.3e},{_stat(target_pa_stats,'p95'):.3e},"
+                    f"{_stat(target_pa_stats,'max'):.3e}) "
+                    f"p_ap(min/mean/p95/max)=({_stat(pred_ap_stats,'min'):.3e},"
+                    f"{_stat(pred_ap_stats,'mean'):.3e},{_stat(pred_ap_stats,'p95'):.3e},"
+                    f"{_stat(pred_ap_stats,'max'):.3e}) "
+                    f"p_pa(min/mean/p95/max)=({_stat(pred_pa_stats,'min'):.3e},"
+                    f"{_stat(pred_pa_stats,'mean'):.3e},{_stat(pred_pa_stats,'p95'):.3e},"
+                    f"{_stat(pred_pa_stats,'max'):.3e}) "
+                    f"lambda_ray(min/mean/p95/max)=({_stat(lambda_stats,'min'):.3e},"
+                    f"{_stat(lambda_stats,'mean'):.3e},{_stat(lambda_stats,'p95'):.3e},"
+                    f"{_stat(lambda_stats,'max'):.3e}) "
+                    f"mu(min/mean/p95/max)=({_stat(mu_stats,'min'):.3e},"
+                    f"{_stat(mu_stats,'mean'):.3e},{_stat(mu_stats,'p95'):.3e},"
+                    f"{_stat(mu_stats,'max'):.3e}) "
+                    f"atten(min/mean/p95/max)=({_stat(atten_stats,'min'):.3e},"
+                    f"{_stat(atten_stats,'mean'):.3e},{_stat(atten_stats,'p95'):.3e},"
+                    f"{_stat(atten_stats,'max'):.3e}) "
+                    f"gain={gain_log:.3e} "
+                    f"atten>20={atten_frac_gt20 if atten_frac_gt20 is not None else float('nan'):.3f} "
+                    f"atten=60={atten_frac_clamp if atten_frac_clamp is not None else float('nan'):.3f} "
+                    f"nonfinite(pred/lambda/atten)=({nonfinite_pred:.3e},{nonfinite_lambda:.3e},{nonfinite_atten:.3e}) "
+                    f"grad_norm={grad_norm_global:.3e} clip={int(clip_event)}",
+                    flush=True,
+                )
+    
+                append_hybrid_log(
+                    hybrid_log_path,
+                    [
+                        step,
+                        proj_weight_used,
+                        float(loss_proj.item()),
+                        float(loss_ap.item()),
+                        float(loss_pa.item()),
+                        float(loss_act.item()),
+                        float(loss_gain.item()),
+                        float(gain_prior) if gain_prior is not None else float("nan"),
+                        float(act_norm_factor),
+                        float(loss.item()),
+                        proj_scale_enc_val,
+                        _stat(target_ap_stats, "min"),
+                        _stat(target_ap_stats, "mean"),
+                        _stat(target_ap_stats, "p95"),
+                        _stat(target_ap_stats, "max"),
+                        _stat(target_pa_stats, "min"),
+                        _stat(target_pa_stats, "mean"),
+                        _stat(target_pa_stats, "p95"),
+                        _stat(target_pa_stats, "max"),
+                        _stat(pred_ap_stats, "min"),
+                        _stat(pred_ap_stats, "mean"),
+                        _stat(pred_ap_stats, "p95"),
+                        _stat(pred_ap_stats, "max"),
+                        _stat(pred_pa_stats, "min"),
+                        _stat(pred_pa_stats, "mean"),
+                        _stat(pred_pa_stats, "p95"),
+                        _stat(pred_pa_stats, "max"),
+                        _stat(lambda_stats, "min"),
+                        _stat(lambda_stats, "mean"),
+                        _stat(lambda_stats, "p95"),
+                        _stat(lambda_stats, "max"),
+                        _stat(mu_stats, "min"),
+                        _stat(mu_stats, "mean"),
+                        _stat(mu_stats, "p95"),
+                        _stat(mu_stats, "max"),
+                        _stat(atten_stats, "min"),
+                        _stat(atten_stats, "mean"),
+                        _stat(atten_stats, "p95"),
+                        _stat(atten_stats, "max"),
+                        float(atten_frac_gt20) if atten_frac_gt20 is not None else float("nan"),
+                        float(atten_frac_clamp) if atten_frac_clamp is not None else float("nan"),
+                        gain_log,
+                        nonfinite_pred,
                         nonfinite_lambda,
                         nonfinite_atten,
-                    ) = compute_lambda_and_attenuation_stats([extras_ap, extras_pa], atten_scale=atten_scale)
-                    nonfinite_pred = nonfinite_fraction(torch.cat([pred_ap, pred_pa], dim=1))
-                    proj_scale_enc_val = (
-                        float(proj_scale_enc.mean().item()) if torch.is_tensor(proj_scale_enc) else float("nan")
-                    )
-                    gain_log_src = gain_val_used if gain_val_used is not None else gain_val
-                    gain_log = float(gain_log_src.mean().item()) if gain_log_src is not None else float("nan")
-                    z_enc_l2 = (
-                        float(z_enc_proj.detach().norm(dim=1).mean().item()) if z_enc_proj is not None else float("nan")
-                    )
-                    z_latent_l2 = float(z_latent.detach().norm(dim=1).mean().item())
-    
-                    def _stat(stats, key):
-                        return float(stats[key]) if stats is not None and key in stats else float("nan")
-    
-                    print(
-                        f"[hybrid][step {step:05d}] "
-                        f"t_ap(min/mean/p95/max)=({_stat(target_ap_stats,'min'):.3e},"
-                        f"{_stat(target_ap_stats,'mean'):.3e},{_stat(target_ap_stats,'p95'):.3e},"
-                        f"{_stat(target_ap_stats,'max'):.3e}) "
-                        f"t_pa(min/mean/p95/max)=({_stat(target_pa_stats,'min'):.3e},"
-                        f"{_stat(target_pa_stats,'mean'):.3e},{_stat(target_pa_stats,'p95'):.3e},"
-                        f"{_stat(target_pa_stats,'max'):.3e}) "
-                        f"p_ap(min/mean/p95/max)=({_stat(pred_ap_stats,'min'):.3e},"
-                        f"{_stat(pred_ap_stats,'mean'):.3e},{_stat(pred_ap_stats,'p95'):.3e},"
-                        f"{_stat(pred_ap_stats,'max'):.3e}) "
-                        f"p_pa(min/mean/p95/max)=({_stat(pred_pa_stats,'min'):.3e},"
-                        f"{_stat(pred_pa_stats,'mean'):.3e},{_stat(pred_pa_stats,'p95'):.3e},"
-                        f"{_stat(pred_pa_stats,'max'):.3e}) "
-                        f"lambda_ray(min/mean/p95/max)=({_stat(lambda_stats,'min'):.3e},"
-                        f"{_stat(lambda_stats,'mean'):.3e},{_stat(lambda_stats,'p95'):.3e},"
-                        f"{_stat(lambda_stats,'max'):.3e}) "
-                        f"mu(min/mean/p95/max)=({_stat(mu_stats,'min'):.3e},"
-                        f"{_stat(mu_stats,'mean'):.3e},{_stat(mu_stats,'p95'):.3e},"
-                        f"{_stat(mu_stats,'max'):.3e}) "
-                        f"atten(min/mean/p95/max)=({_stat(atten_stats,'min'):.3e},"
-                        f"{_stat(atten_stats,'mean'):.3e},{_stat(atten_stats,'p95'):.3e},"
-                        f"{_stat(atten_stats,'max'):.3e}) "
-                        f"gain={gain_log:.3e} "
-                        f"atten>20={atten_frac_gt20 if atten_frac_gt20 is not None else float('nan'):.3f} "
-                        f"atten=60={atten_frac_clamp if atten_frac_clamp is not None else float('nan'):.3f} "
-                        f"nonfinite(pred/lambda/atten)=({nonfinite_pred:.3e},{nonfinite_lambda:.3e},{nonfinite_atten:.3e}) "
-                        f"grad_norm={grad_norm_global:.3e} clip={int(clip_event)}",
-                        flush=True,
-                    )
-    
-                    append_hybrid_log(
-                        hybrid_log_path,
-                        [
-                            step,
-                            proj_weight_used,
-                            float(loss_proj.item()),
-                            float(loss_ap.item()),
-                            float(loss_pa.item()),
-                            float(loss_act.item()),
-                            float(loss_gain.item()),
-                            float(gain_prior) if gain_prior is not None else float("nan"),
-                            float(act_norm_factor),
-                            float(loss.item()),
-                            proj_scale_enc_val,
-                            _stat(target_ap_stats, "min"),
-                            _stat(target_ap_stats, "mean"),
-                            _stat(target_ap_stats, "p95"),
-                            _stat(target_ap_stats, "max"),
-                            _stat(target_pa_stats, "min"),
-                            _stat(target_pa_stats, "mean"),
-                            _stat(target_pa_stats, "p95"),
-                            _stat(target_pa_stats, "max"),
-                            _stat(pred_ap_stats, "min"),
-                            _stat(pred_ap_stats, "mean"),
-                            _stat(pred_ap_stats, "p95"),
-                            _stat(pred_ap_stats, "max"),
-                            _stat(pred_pa_stats, "min"),
-                            _stat(pred_pa_stats, "mean"),
-                            _stat(pred_pa_stats, "p95"),
-                            _stat(pred_pa_stats, "max"),
-                            _stat(lambda_stats, "min"),
-                            _stat(lambda_stats, "mean"),
-                            _stat(lambda_stats, "p95"),
-                            _stat(lambda_stats, "max"),
-                            _stat(mu_stats, "min"),
-                            _stat(mu_stats, "mean"),
-                            _stat(mu_stats, "p95"),
-                            _stat(mu_stats, "max"),
-                            _stat(atten_stats, "min"),
-                            _stat(atten_stats, "mean"),
-                            _stat(atten_stats, "p95"),
-                            _stat(atten_stats, "max"),
-                            float(atten_frac_gt20) if atten_frac_gt20 is not None else float("nan"),
-                            float(atten_frac_clamp) if atten_frac_clamp is not None else float("nan"),
-                            gain_log,
-                            nonfinite_pred,
-                            nonfinite_lambda,
-                            nonfinite_atten,
-                            grad_norm_global,
-                            float(grad_norm_gen),
-                            int(clip_event),
-                            z_enc_l2,
-                            z_latent_l2,
-                        ],
-                    )
-                val_stats = None
-                should_run_val = (
-                    val_interval > 0
-                    and (step % val_interval) == 0
-                    and (not args.no_val)
-                    and proj_loss_active
+                        grad_norm_global,
+                        float(grad_norm_gen),
+                        int(clip_event),
+                        z_enc_l2,
+                        z_latent_l2,
+                    ],
                 )
-                def _should_log_val_skip(reason_str):
-                    if debug_eval_flow:
-                        return True
-                    if step == 1:
-                        return True
-                    if val_interval > 0:
-                        interval_reason = f"step%val_interval={step % val_interval}"
-                        if reason_str == interval_reason:
-                            return False
+            val_stats = None
+            should_run_val = (
+                val_interval > 0
+                and (step % val_interval) == 0
+                and (not args.no_val)
+                and proj_loss_active
+            )
+            def _should_log_val_skip(reason_str):
+                if debug_eval_flow:
                     return True
+                if step == 1:
+                    return True
+                if val_interval > 0:
+                    interval_reason = f"step%val_interval={step % val_interval}"
+                    if reason_str == interval_reason:
+                        return False
+                return True
 
-                if should_run_val:
-                    rays_eval = None if ray_split_enabled else rays_per_proj
-                    subsets = {
-                        "test_all": ray_indices["pixel"]["test_idx_all"],
-                    }
-                    if ray_split_enabled:
-                        subsets["test_fg"] = ray_indices["pixel"]["test_idx_fg"]
-                        subsets["test_top10"] = ray_indices["pixel"]["test_idx_top10"]
-                        subsets["test_bg"] = ray_indices["pixel"]["test_idx_bg"]
-                    gain_for_eval = None
-                    if hybrid_enabled and args.proj_target_source == "counts":
-                        gain_for_eval = gain_val_used if gain_val_used is not None else gain_val
-                        if val_loader is None or len(val_loader.dataset) == 0:
-                            skip_reason = "val_loader missing or empty"
-                            print("[eval][warn] val_loader missing or empty; skipping evaluation.", flush=True)
-                            if _should_log_val_skip(skip_reason):
-                                print(
-                                    f"[val][skip] reason={skip_reason} val_interval={val_interval} step={step} "
-                                    f"no_val={args.no_val} proj_loss_active={proj_loss_active}",
-                                    flush=True,
-                                )
-                                if debug_eval_flow:
-                                    print(
-                                        f"[val][done] step={step} metrics_keys=None (reason: {skip_reason})",
-                                        flush=True,
-                                    )
-                        else:
-                            n_val_batches = len(val_loader) if hasattr(val_loader, "__len__") else "?"
-                            if debug_eval_flow:
-                                print(
-                                    f"[val][enter] step={step} val_interval={val_interval}",
-                                    flush=True,
-                                )
-                                print(
-                                    f"[val][call] n_val_batches={n_val_batches}",
-                                    flush=True,
-                                )
-                            val_stats = evaluate_val_loader(
-                                val_loader,
-                                generator,
-                                z_latent.detach(),
-                                rays_cache,
-                                subsets,
-                                device,
-                                args,
-                                loss_fn,
-                                proj_loss_active,
-                                rays_eval,
-                                args.bg_weight,
-                                args.weight_threshold,
-                                pa_xflip,
-                                W,
-                                gain_for_eval,
-                                log_proj_metrics_physical,
-                            )
-                            if debug_eval_flow:
-                                if val_stats is None:
-                                    print(
-                                        f"[val][done] step={step} metrics_keys=None (reason: evaluate_val_loader returned None)",
-                                        flush=True,
-                                    )
-                                else:
-                                    metrics_keys = _format_val_metrics_keys(sorted(val_stats.keys()))
-                                    print(
-                                        f"[val][done] step={step} metrics_keys={metrics_keys}",
-                                        flush=True,
-                                    )
-                else:
-                    reason_parts = []
-                    if val_interval <= 0:
-                        reason_parts.append(f"val_interval={val_interval}<=0")
-                    if args.no_val:
-                        reason_parts.append("no_val=True")
-                    if not proj_loss_active:
-                        reason_parts.append("proj_loss_active=False")
-                    if val_interval > 0 and (step % val_interval) != 0:
-                        reason_parts.append(f"step%val_interval={step % val_interval}")
-                    if not reason_parts:
-                        reason_parts.append("unknown")
-                    reason_str = "; ".join(reason_parts)
-                    if _should_log_val_skip(reason_str):
-                        print(
-                            f"[val][skip] reason={reason_str} val_interval={val_interval} step={step} "
-                            f"no_val={args.no_val} proj_loss_active={proj_loss_active}",
-                            flush=True,
-                        )
-                        if debug_eval_flow:
+            if should_run_val:
+                rays_eval = None if ray_split_enabled else rays_per_proj
+                subsets = {
+                    "test_all": ray_indices["pixel"]["test_idx_all"],
+                }
+                if ray_split_enabled:
+                    subsets["test_fg"] = ray_indices["pixel"]["test_idx_fg"]
+                    subsets["test_top10"] = ray_indices["pixel"]["test_idx_top10"]
+                    subsets["test_bg"] = ray_indices["pixel"]["test_idx_bg"]
+                gain_for_eval = None
+                if hybrid_enabled and args.proj_target_source == "counts":
+                    gain_for_eval = gain_val_used if gain_val_used is not None else gain_val
+                    if val_loader is None or len(val_loader.dataset) == 0:
+                        skip_reason = "val_loader missing or empty"
+                        print("[eval][warn] val_loader missing or empty; skipping evaluation.", flush=True)
+                        if _should_log_val_skip(skip_reason):
                             print(
-                                f"[val][done] step={step} metrics_keys=None (reason: {reason_str})",
+                                f"[val][skip] reason={skip_reason} val_interval={val_interval} step={step} "
+                                f"no_val={args.no_val} proj_loss_active={proj_loss_active}",
                                 flush=True,
                             )
+                            if debug_eval_flow:
+                                print(
+                                    f"[val][done] step={step} metrics_keys=None (reason: {skip_reason})",
+                                    flush=True,
+                                )
+                    else:
+                        n_val_batches = len(val_loader) if hasattr(val_loader, "__len__") else "?"
+                        if debug_eval_flow:
+                            print(
+                                f"[val][enter] step={step} val_interval={val_interval}",
+                                flush=True,
+                            )
+                            print(
+                                f"[val][call] n_val_batches={n_val_batches}",
+                                flush=True,
+                            )
+                        val_stats = evaluate_val_loader(
+                            val_loader,
+                            generator,
+                            z_latent.detach(),
+                            rays_cache,
+                            subsets,
+                            device,
+                            args,
+                            loss_fn,
+                            proj_loss_active,
+                            rays_eval,
+                            args.bg_weight,
+                            args.weight_threshold,
+                            pa_xflip,
+                            W,
+                            gain_for_eval,
+                            log_proj_metrics_physical,
+                        )
+                        if debug_eval_flow:
+                            if val_stats is None:
+                                print(
+                                    f"[val][done] step={step} metrics_keys=None (reason: evaluate_val_loader returned None)",
+                                    flush=True,
+                                )
+                            else:
+                                metrics_keys = _format_val_metrics_keys(sorted(val_stats.keys()))
+                                print(
+                                    f"[val][done] step={step} metrics_keys={metrics_keys}",
+                                    flush=True,
+                                )
+            else:
+                reason_parts = []
+                if val_interval <= 0:
+                    reason_parts.append(f"val_interval={val_interval}<=0")
+                if args.no_val:
+                    reason_parts.append("no_val=True")
+                if not proj_loss_active:
+                    reason_parts.append("proj_loss_active=False")
+                if val_interval > 0 and (step % val_interval) != 0:
+                    reason_parts.append(f"step%val_interval={step % val_interval}")
+                if not reason_parts:
+                    reason_parts.append("unknown")
+                reason_str = "; ".join(reason_parts)
+                if _should_log_val_skip(reason_str):
+                    print(
+                        f"[val][skip] reason={reason_str} val_interval={val_interval} step={step} "
+                        f"no_val={args.no_val} proj_loss_active={proj_loss_active}",
+                        flush=True,
+                    )
+                    if debug_eval_flow:
+                        print(
+                            f"[val][done] step={step} metrics_keys=None (reason: {reason_str})",
+                            flush=True,
+                        )
             val_all = val_stats.get("test_all") if isinstance(val_stats, dict) else None
             val_fg = val_stats.get("test_fg") if isinstance(val_stats, dict) else None
             val_top10 = val_stats.get("test_top10") if isinstance(val_stats, dict) else None
             val_bg = val_stats.get("test_bg") if isinstance(val_stats, dict) else None
     
             val_loss = val_all["loss"] if val_all is not None else None
-            val_psnr = val_all["psnr"] if val_all is not None else None
             val_mae = val_all["mae"] if val_all is not None else None
-    
+            val_rmse = val_all["rmse"] if val_all is not None else None
+            val_nll = val_all["nll"] if val_all is not None else None
+            val_dev = val_all["dev"] if val_all is not None else None
+
             val_loss_fg = val_fg["loss"] if val_fg is not None else None
-            val_psnr_fg = val_fg["psnr"] if val_fg is not None else None
             val_mae_fg = val_fg["mae"] if val_fg is not None else None
+            val_rmse_fg = val_fg["rmse"] if val_fg is not None else None
+            val_nll_fg = val_fg["nll"] if val_fg is not None else None
+            val_dev_fg = val_fg["dev"] if val_fg is not None else None
             val_loss_bg = val_bg["loss"] if val_bg is not None else None
-            val_psnr_bg = val_bg["psnr"] if val_bg is not None else None
             val_mae_bg = val_bg["mae"] if val_bg is not None else None
+            val_rmse_bg = val_bg["rmse"] if val_bg is not None else None
+            val_nll_bg = val_bg["nll"] if val_bg is not None else None
+            val_dev_bg = val_bg["dev"] if val_bg is not None else None
             val_pred_mean_bg = val_bg.get("pred_mean") if val_bg is not None else None
             val_target_mean_bg = val_bg.get("target_mean") if val_bg is not None else None
             val_view_all = val_all.get("view") if val_all is not None else None
@@ -7199,14 +7396,36 @@ def train():
             val_phys_top10 = val_top10.get("phys") if val_top10 is not None else None
             val_loss_ap = val_view_all["ap"]["loss"] if val_view_all is not None else None
             val_loss_pa = val_view_all["pa"]["loss"] if val_view_all is not None else None
-            val_psnr_ap_val = val_view_all["ap"]["psnr"] if val_view_all is not None else None
-            val_psnr_pa_val = val_view_all["pa"]["psnr"] if val_view_all is not None else None
+            val_rmse_ap_val = val_view_all["ap"]["rmse"] if val_view_all is not None else None
+            val_rmse_pa_val = val_view_all["pa"]["rmse"] if val_view_all is not None else None
+            val_nll_ap_val = val_view_all["ap"]["nll"] if val_view_all is not None else None
+            val_nll_pa_val = val_view_all["pa"]["nll"] if val_view_all is not None else None
+            val_dev_ap_val = val_view_all["ap"]["dev"] if val_view_all is not None else None
+            val_dev_pa_val = val_view_all["pa"]["dev"] if val_view_all is not None else None
             val_mae_ap_val = val_view_all["ap"]["mae"] if val_view_all is not None else None
             val_mae_pa_val = val_view_all["pa"]["mae"] if val_view_all is not None else None
-    
+            loss_test_all = val_loss
+            loss_test_ap = val_loss_ap
+            loss_test_pa = val_loss_pa
+            mae_test_all = val_mae
+            mae_test_ap = val_mae_ap_val
+            mae_test_pa = val_mae_pa_val
+            rmse_test_all = val_rmse
+            rmse_test_ap = val_rmse_ap_val
+            rmse_test_pa = val_rmse_pa_val
+            nll_test_all = val_nll
+            nll_test_ap = val_nll_ap_val
+            nll_test_pa = val_nll_pa_val
+            dev_test_all = val_dev
+            dev_test_ap = val_dev_ap_val
+            dev_test_pa = val_dev_pa_val
+            val_top10 = val_stats.get("test_top10") if isinstance(val_stats, dict) else None
+
             val_loss_top10 = val_top10["loss"] if val_top10 is not None else None
-            val_psnr_top10 = val_top10["psnr"] if val_top10 is not None else None
             val_mae_top10 = val_top10["mae"] if val_top10 is not None else None
+            val_rmse_top10 = val_top10["rmse"] if val_top10 is not None else None
+            val_nll_top10 = val_top10["nll"] if val_top10 is not None else None
+            val_dev_top10 = val_top10["dev"] if val_top10 is not None else None
     
             act_tv_loss_value = float(loss_act_tv.item())
             act_tv_contrib = float(args.act_tv_weight) * act_tv_loss_value
@@ -7224,14 +7443,16 @@ def train():
                 msg += (
                     f"| ap={loss_ap.item():.6f} | pa={loss_pa.item():.6f} "
                     f"| mae_ap={mae_ap:.6f} | mae_pa={mae_pa:.6f} "
-                    f"| psnr_ap={psnr_ap:.2f} | psnr_pa={psnr_pa:.2f} "
+                    f"| rmse_ap={rmse_ap:.6f} | rmse_pa={rmse_pa:.6f} "
+                    f"| dev_ap={dev_ap:.6f} | dev_pa={dev_pa:.6f} "
                     f"| predμ_raw=({pred_mean_raw[0]:.3e},{pred_mean_raw[1]:.3e}) predσ_raw=({pred_std_raw[0]:.3e},{pred_std_raw[1]:.3e}) "
                     f"| predμ=({pred_mean[0]:.3e},{pred_mean[1]:.3e}) predσ=({pred_std[0]:.3e},{pred_std[1]:.3e})"
                 )
-            if proj_metrics_enabled and log_proj_metrics_physical and psnr_ap_phys is not None:
+            if log_proj_metrics_physical and (metrics_phys_ap is not None and metrics_phys_pa is not None):
                 msg += (
-                    f" | mae_ap_phys={mae_ap_phys:.6f} | mae_pa_phys={mae_pa_phys:.6f} "
-                    f"| psnr_ap_phys={psnr_ap_phys:.2f} | psnr_pa_phys={psnr_pa_phys:.2f}"
+                    f" | phys_mae_ap={metrics_phys_ap['mae']:.6f} | phys_mae_pa={metrics_phys_pa['mae']:.6f} "
+                    f"| phys_rmse_ap={metrics_phys_ap['rmse']:.6f} | phys_rmse_pa={metrics_phys_pa['rmse']:.6f} "
+                    f"| phys_dev_ap={metrics_phys_ap['dev']:.6f} | phys_dev_pa={metrics_phys_pa['dev']:.6f}"
                 )
             if ray_tv_weight != 0.0:
                 msg += f" | ray_tv_mode={ray_tv_mode}"
@@ -7246,36 +7467,43 @@ def train():
                     )
             if val_all is not None:
                 msg += (
-                    f" | val_all_loss={val_loss:.6f} | val_all_psnr={val_psnr:.2f} | val_all_mae={val_mae:.6f}"
+                    f" | val_all_loss={val_loss:.6f} | val_all_rmse={val_rmse:.6f} | val_all_mae={val_mae:.6f} "
+                    f"| val_all_dev={val_dev:.6f}"
                 )
             if val_fg is not None:
                 msg += (
-                    f" | val_fg_loss={val_loss_fg:.6f} | val_fg_psnr={val_psnr_fg:.2f} | val_fg_mae={val_mae_fg:.6f}"
+                    f" | val_fg_loss={val_loss_fg:.6f} | val_fg_rmse={val_rmse_fg:.6f} "
+                    f"| val_fg_dev={val_dev_fg:.6f} | val_fg_mae={val_mae_fg:.6f}"
                 )
             if val_top10 is not None:
                 msg += (
-                    f" | val_top10_loss={val_loss_top10:.6f} | val_top10_psnr={val_psnr_top10:.2f} "
-                    f"| val_top10_mae={val_mae_top10:.6f}"
+                    f" | val_top10_loss={val_loss_top10:.6f} | val_top10_rmse={val_rmse_top10:.6f} "
+                    f"| val_top10_dev={val_dev_top10:.6f} | val_top10_mae={val_mae_top10:.6f}"
                 )
             if val_bg is not None:
                 msg += (
-                    f" | val_bg_loss={val_loss_bg:.6f} | val_bg_psnr={val_psnr_bg:.2f} | val_bg_mae={val_mae_bg:.6f}"
+                    f" | val_bg_loss={val_loss_bg:.6f} | val_bg_rmse={val_rmse_bg:.6f} "
+                    f"| val_bg_dev={val_dev_bg:.6f} | val_bg_mae={val_mae_bg:.6f}"
                 )
             if log_proj_metrics_physical and val_phys_all is not None:
                 msg += (
-                    f" | val_all_psnr_phys={val_phys_all['psnr']:.2f} | val_all_mae_phys={val_phys_all['mae']:.6f}"
+                    f" | val_all_phys_rmse={val_phys_all['rmse']:.6f} | val_all_phys_mae={val_phys_all['mae']:.6f} "
+                    f"| val_all_phys_dev={val_phys_all['dev']:.6f}"
                 )
             if log_proj_metrics_physical and val_phys_fg is not None:
                 msg += (
-                    f" | val_fg_psnr_phys={val_phys_fg['psnr']:.2f} | val_fg_mae_phys={val_phys_fg['mae']:.6f}"
+                    f" | val_fg_phys_rmse={val_phys_fg['rmse']:.6f} | val_fg_phys_mae={val_phys_fg['mae']:.6f} "
+                    f"| val_fg_phys_dev={val_phys_fg['dev']:.6f}"
                 )
             if log_proj_metrics_physical and val_phys_top10 is not None:
                 msg += (
-                    f" | val_top10_psnr_phys={val_phys_top10['psnr']:.2f} | val_top10_mae_phys={val_phys_top10['mae']:.6f}"
+                    f" | val_top10_phys_rmse={val_phys_top10['rmse']:.6f} | val_top10_phys_mae={val_phys_top10['mae']:.6f} "
+                    f"| val_top10_phys_dev={val_phys_top10['dev']:.6f}"
                 )
             if log_proj_metrics_physical and val_phys_bg is not None:
                 msg += (
-                    f" | val_bg_psnr_phys={val_phys_bg['psnr']:.2f} | val_bg_mae_phys={val_phys_bg['mae']:.6f}"
+                    f" | val_bg_phys_rmse={val_phys_bg['rmse']:.6f} | val_bg_phys_mae={val_phys_bg['mae']:.6f} "
+                    f"| val_bg_phys_dev={val_phys_bg['dev']:.6f}"
                 )
             if val_pred_mean_bg is not None and val_target_mean_bg is not None:
                 print(
@@ -7285,8 +7513,9 @@ def train():
                 )
             if val_view_all is not None:
                 msg += (
-                    f" | test_ap_loss={val_loss_ap:.6f} | test_ap_psnr={val_psnr_ap_val:.2f} | test_ap_mae={val_mae_ap_val:.6f}"
-                    f" | test_pa_loss={val_loss_pa:.6f} | test_pa_psnr={val_psnr_pa_val:.2f} | test_pa_mae={val_mae_pa_val:.6f}"
+                    f" | test_ap_loss={val_loss_ap:.6f} | test_ap_rmse={val_rmse_ap_val:.6f} | test_ap_dev={val_dev_ap_val:.6f}"
+                    f" | test_pa_loss={val_loss_pa:.6f} | test_pa_rmse={val_rmse_pa_val:.6f} | test_pa_dev={val_dev_pa_val:.6f}"
+                    f" | test_ap_mae={val_mae_ap_val:.6f} | test_pa_mae={val_mae_pa_val:.6f}"
                 )
             print(msg, flush=True)
             lambda_mean = float("nan")
@@ -7341,8 +7570,12 @@ def train():
                     loss_tv.item(),
                     mae_ap,
                     mae_pa,
-                    psnr_ap,
-                    psnr_pa,
+                    rmse_ap,
+                    rmse_pa,
+                    nll_ap,
+                    nll_pa,
+                    dev_ap,
+                    dev_pa,
                     pred_mean[0],
                     pred_mean[1],
                     pred_std[0],
@@ -7350,18 +7583,48 @@ def train():
                     val_loss,
                     val_loss_ap,
                     val_loss_pa,
-                    val_psnr,
-                    val_psnr_ap_val,
-                    val_psnr_pa_val,
                     val_mae,
+                    val_rmse,
+                    val_nll,
+                    val_dev,
                     val_mae_ap_val,
                     val_mae_pa_val,
+                    val_rmse_ap_val,
+                    val_rmse_pa_val,
+                    val_nll_ap_val,
+                    val_nll_pa_val,
+                    val_dev_ap_val,
+                    val_dev_pa_val,
                     val_loss_fg,
-                    val_psnr_fg,
                     val_mae_fg,
+                    val_rmse_fg,
+                    val_nll_fg,
+                    val_dev_fg,
                     val_loss_top10,
-                    val_psnr_top10,
                     val_mae_top10,
+                    val_rmse_top10,
+                    val_nll_top10,
+                    val_dev_top10,
+                    val_loss_bg,
+                    val_mae_bg,
+                    val_rmse_bg,
+                    val_nll_bg,
+                    val_dev_bg,
+                    loss_test_all,
+                    loss_test_ap,
+                    loss_test_pa,
+                    mae_test_all,
+                    mae_test_ap,
+                    mae_test_pa,
+                    rmse_test_all,
+                    rmse_test_ap,
+                    rmse_test_pa,
+                    nll_test_all,
+                    nll_test_ap,
+                    nll_test_pa,
+                    dev_test_all,
+                    dev_test_ap,
+                    dev_test_pa,
                     iter_ms,
                     optimizer.param_groups[0]["lr"],
                     ray_tv_mode,
@@ -7393,6 +7656,7 @@ def train():
                 target_pa=pa,
                 target_ap_counts=ap_counts,
                 target_pa_counts=pa_counts,
+                patient_id=safe_patient_id,
             )
             pred_path_step = None
             pred_vol_step = None
@@ -7636,7 +7900,7 @@ def train():
                 test_all = final_test_stats.get("test_all")
                 print(
                     f"[test][final][summary] test_all_loss={test_all['loss']:.6f} "
-                    f"test_all_psnr={test_all['psnr']:.2f} test_all_mae={test_all['mae']:.6f}",
+                    f"test_all_rmse={test_all['rmse']:.6f} test_all_dev={test_all['dev']:.6f} test_all_mae={test_all['mae']:.6f}",
                     flush=True,
                 )
             patient_ids = (

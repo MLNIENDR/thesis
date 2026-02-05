@@ -78,11 +78,10 @@ Funktionen/Konstanten:
 - `build_pose_rays(generator, pose)`: Precomputet alle Rays für Pose, legt sie auf Generator-Device; Output Tensor `[2, H*W, 3]`.  
 - `slice_rays(rays_full, ray_idx)`: Wählt Teilrays nach Indizes.  
 - `render_minibatch(generator, z_latent, rays_subset, need_raw, ct_context)`: Rendert Teilrays mit Train-/Test-Settings; gibt proj_map-Flat und Extras zurück.  
-- `maybe_render_preview(step, args, generator, z_eval, outdir, ct_volume, act_volume, ct_context)`: Rendert und speichert volle AP/PA-Previews und Depth-Profile in Eval-Mode in festen Intervallen.  
+- `maybe_render_preview(...)`: Rendert und speichert volle AP/PA-Previews mit absoluter Counts-Skala, Colorbars, Differenzbildern sowie Depth-Profile (Eval-Mode, feste Intervalle).  
 - `init_log_file(path)` / `append_log(path, row)`: CSV-Header anlegen bzw. Zeile anhängen.  
 - `save_checkpoint(step, generator, optimizer, scaler, ckpt_dir, encoder=None, z_fuser=None, gain_head=None, gain_param=None)`: Speichert Step, Optimizer, AMP-Scaler, coarse/fine Netze und optionale Hybridmodule; ältere Checkpoints mit `z_train` werden nicht unterstützt.  
 - `dump_debug_tensor(outpath, tensor)`: Speichert Tensor auf CPU.  
-- `compute_psnr(pred, target)`: PSNR-Berechnung.  
 - `sample_act_points(act, nsamples, radius)`: Zieht zufällige Voxel aus act-Volumen, gibt Koordinaten (Welt) + Werte zurück; erwartet `act` als [D,H,W] oder [1,D,H,W].  
 - `query_emission_at_points(generator, z_latent, coords)`: Fragt NeRF an spezifischen Weltpunkten ab; Output Emissionswerte.  
 - `idx_to_coord(idx, size, radius)`: Mappt Index → Weltkoordinate [-radius, radius].  
