@@ -639,6 +639,40 @@ def parse_args():
         help="Optionales Warmup: Schritte 0..W nur ACT+TV, Projection-Loss danach aktiv.",
     )
     parser.add_argument(
+        "--latent-dropout-prob",
+        type=float,
+        default=0.0,
+        help="Wahrscheinlichkeit, mit der z_latent während des Trainings pro Sample auf 0 gesetzt wird.",
+    )
+    parser.add_argument(
+        "--debug-z-sensitivity",
+        action="store_true",
+        help="Aktiviere Diagnostik: prüft, wie stark z_latent die Projektionen/ACT beeinflusst (nur einmal am Ende).",
+    )
+    parser.add_argument(
+        "--debug-z-cosine",
+        action="store_true",
+        help="Logge Cosine-Similarity/L2-Abstand der z_enc_proj der Test-Patients in save_test_volume_slices.",
+    )
+    parser.add_argument(
+        "--grad-clip-enabled",
+        action="store_true",
+        default=True,
+        help="Aktiviere grad clipping (clip_grad_norm) für den Generator (standardmäßig an).",
+    )
+    parser.add_argument(
+        "--no-grad-clip",
+        action="store_false",
+        dest="grad_clip_enabled",
+        help="Deaktiviere grad clipping, wenn standardmäßig aktiviert.",
+    )
+    parser.add_argument(
+        "--grad-clip-max-norm",
+        type=float,
+        default=1.0,
+        help="max_norm für grad clipping (nur aktiv wenn --grad-clip-enabled gesetzt).",
+    )
+    parser.add_argument(
         "--proj-weight-min",
         type=float,
         default=0.005,
@@ -1321,6 +1355,8 @@ def save_test_volume_slices(
         encoder.eval()
 
     hybrid_enabled = bool(getattr(args, "hybrid", False))
+    debug_cos_latents: list[torch.Tensor] = []
+    debug_cos_patients: list[str] = []
 
     def _tensor_stats_and_sig(tensor):
         if tensor is None or not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
@@ -1406,6 +1442,9 @@ def save_test_volume_slices(
                 z_latent_batch = _build_test_latent(batch)
             else:
                 z_latent_batch = z_latent_base.detach()
+            if args.debug_z_cosine and hybrid_enabled and encoder is not None:
+                debug_cos_patients.append(patient_id)
+                debug_cos_latents.append(z_latent_batch.detach().clone())
             z_arr = z_latent_batch.detach().cpu().numpy().astype(np.float32)
             z_stats = (
                 (float(z_arr.min()), float(z_arr.mean()), float(z_arr.max()))
@@ -1493,6 +1532,34 @@ def save_test_volume_slices(
                 encoder.train()
             else:
                 encoder.eval()
+    if args.debug_z_cosine and debug_cos_latents:
+        latents = torch.cat(debug_cos_latents, dim=0).detach().cpu()
+        n = latents.shape[0]
+        if n > 0:
+            names = ", ".join(debug_cos_patients[:n])
+            if n > 1:
+                normed = latents / (latents.norm(dim=1, keepdim=True) + 1e-8)
+                cos_matrix = normed @ normed.t()
+                off = ~torch.eye(n, dtype=torch.bool)
+                cos_off = cos_matrix[off]
+                cos_min = float(cos_off.min().item())
+                cos_mean = float(cos_off.mean().item())
+                cos_max = float(cos_off.max().item())
+                dist_matrix = torch.cdist(latents, latents, p=2)
+                dist_off = dist_matrix[off]
+                dist_min = float(dist_off.min().item())
+                dist_mean = float(dist_off.mean().item())
+                dist_max = float(dist_off.max().item())
+                print(
+                    f"[debug-z][cosine] patients=[{names}] cos_off(min/mean/max)={cos_min:.3e}/{cos_mean:.3e}/{cos_max:.3e} "
+                    f"L2_off(min/mean/max)={dist_min:.3e}/{dist_mean:.3e}/{dist_max:.3e}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[debug-z][cosine] patient={debug_cos_patients[0]} only one patient -> no cross-similarity",
+                    flush=True,
+                )
     if not saved_info:
         return
     meta_path = slice_root / "slices_meta.json"
@@ -2090,6 +2157,18 @@ def global_grad_norm(params) -> float:
     total = 0.0
     for p in params:
         if p is None or p.grad is None:
+            continue
+        g = p.grad.detach()
+        total += float(g.norm().item()) ** 2
+    return math.sqrt(total) if total > 0.0 else 0.0
+
+
+def module_grad_norm(module: Optional[nn.Module]) -> float:
+    if module is None:
+        return 0.0
+    total = 0.0
+    for p in module.parameters():
+        if p.grad is None:
             continue
         g = p.grad.detach()
         total += float(g.norm().item()) ** 2
@@ -3904,7 +3983,6 @@ def save_final_act_compare_volume_slicing(
     base_dir = base_out_path.parent
     base_name = base_out_path.stem
     abs_shared_path = base_dir / f"{base_name}_abs_shared.png"
-    loss_shared_path = base_dir / f"{base_name}_loss_shared.png"
 
     act_t = act_vol.detach()
     if act_t.dim() == 4:
@@ -4106,15 +4184,6 @@ def save_final_act_compare_volume_slicing(
             vmax_abs = 1.0
     vmax_abs = max(vmax_abs, 1e-6)
     vmin_abs = 0.0
-    gt_loss_all = np.log1p(gt_abs / act_norm_factor)
-    pred_loss_all = np.log1p(pred_abs / act_norm_factor)
-    loss_vals = np.concatenate([gt_loss_all.ravel(), pred_loss_all.ravel()])
-    if loss_vals.size == 0:
-        loss_vals = np.array([0.0], dtype=np.float32)
-    vmin_loss, vmax_loss = _robust_limits(loss_vals)
-    gt_loss_slices = [gt_loss_all[:, :, z_pred] for (_, z_pred) in z_pairs]
-    pred_loss_slices = [pred_loss_all[:, :, z_pred] for (_, z_pred) in z_pairs]
-
     def _render_shared_plot(
         gt_imgs: list[np.ndarray],
         pr_imgs: list[np.ndarray],
@@ -4174,7 +4243,6 @@ def save_final_act_compare_volume_slicing(
         print(f"[final-act-compare] Saved {file_path.resolve()}", flush=True)
 
     _render_shared_plot(gt_slices, pred_slices, abs_shared_path, "Activity (absolute shared)", vmin_abs, vmax_abs, " [abs]")
-    _render_shared_plot(gt_loss_slices, pred_loss_slices, loss_shared_path, "Activity (log1p shared)", vmin_loss, vmax_loss, " [loss]")
 
 
 def evaluate_pixel_subsets(
@@ -5331,6 +5399,16 @@ def train():
         else:
             z_latent = z_base
 
+        z_latent_pre_dropout = z_latent.detach()
+        latent_dropout_frac = 0.0
+        dropout_prob = float(max(0.0, min(1.0, args.latent_dropout_prob)))
+        if dropout_prob > 0.0 and generator.training:
+            dropout_mask = torch.rand(z_latent.shape[0], device=z_latent.device) < dropout_prob
+            latent_dropout_frac = float(dropout_mask.float().mean().item()) if z_latent.shape[0] > 0 else 0.0
+            if dropout_mask.any():
+                z_latent = z_latent.clone()
+                z_latent[dropout_mask] = 0.0
+
         scale_joint_used = 1.0
         if isinstance(meta, dict):
             meta_scale = meta.get("proj_scale_joint_p99")
@@ -5479,6 +5557,30 @@ def train():
                     loss_act = torch.mean(weights_act * diff)
                     loss = loss + args.act_loss_weight * loss_act
 
+        if args.debug_z_sensitivity and debug_z_sample is None:
+            debug_z_sample = {
+                "z_latent": z_latent_pre_dropout.clone(),
+                "ray_batch_ap": ray_batch_ap.detach().clone(),
+                "ray_batch_pa": ray_batch_pa.detach().clone(),
+                "ct_context": ct_context,
+                "target_ap": target_ap.detach().clone(),
+                "target_pa": target_pa.detach().clone(),
+                "pred_ap_normal": pred_ap.detach().clone(),
+                "pred_pa_normal": pred_pa.detach().clone(),
+                "proj_loss_type": args.proj_loss_type,
+                "poisson_rate_mode": args.poisson_rate_mode,
+                "poisson_rate_floor": float(args.poisson_rate_floor),
+                "poisson_rate_floor_mode": args.poisson_rate_floor_mode,
+                "use_counts": use_counts,
+                "gain_val": gain_val.detach().clone() if gain_val is not None else None,
+                "gain_param": gain_param.detach().clone() if gain_param is not None else None,
+                "act_coords": coords.detach().clone() if ('coords' in locals() and coords is not None) else None,
+                "act_samples": act_samples.detach().clone() if ('act_samples' in locals() and act_samples is not None) else None,
+                "act_pred": pred_act.detach().clone() if ('pred_act' in locals() and pred_act is not None) else None,
+                "act_pred_raw": pred_act_raw.detach().clone() if ('pred_act_raw' in locals() and pred_act_raw is not None) else None,
+                "latent_dropout_frac": latent_dropout_frac,
+                "amp_enabled": amp_enabled,
+            }
         scaler.scale(loss).backward()
         print(
             f"[smoke-test] loss={loss.item():.6f} | proj={loss_proj.item():.6f} | act={loss_act.item():.6f} "
@@ -5532,6 +5634,7 @@ def train():
     act_norm_global = None
     last_act_tv_value = 0.0
     last_z_latent = z_latent_base
+    debug_z_sample = None
     last_gain_val = None
     gain_prior_ema = None
     gain_prior_final = None
@@ -7032,9 +7135,6 @@ def train():
                 else:
                     print(f"[DEBUG][ACT][grad][net_final] grad is None", flush=True)
 
-                grad_norm_gen_val = torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
-                print(f"[DEBUG][ACT][grad] clip_grad_norm_(generator) returned: {float(grad_norm_gen_val):.6f}", flush=True)
-
             # --- Instrumentierung: Parameter Update Check (Pre-Step) ---
             do_param_debug = args.debug_enc and step in (1, 2)
             enc_p0, enc_p0_before, enc_p0_norm = None, None, 0.0
@@ -7056,10 +7156,23 @@ def train():
                         break
 
             grad_norm_global = global_grad_norm(opt_params) if hybrid_enabled else 0.0
-            grad_norm_gen = torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
-            clip_event = float(grad_norm_gen) > 1.0
+            grad_norm_gen_pre = module_grad_norm(generator)
+            grad_norm_gen_post = grad_norm_gen_pre
+            clip_event = 0
+            if args.grad_clip_enabled:
+                if amp_enabled:
+                    scaler.unscale_(optimizer)
+                grad_norm_gen_post = torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=args.grad_clip_max_norm)
+                clip_event = float(grad_norm_gen_post) > args.grad_clip_max_norm
             scaler.step(optimizer)
             scaler.update()
+
+            if debug_act_step:
+                print(
+                    f"[DEBUG][ACT][grad] grad_norm_global={grad_norm_global:.6f} "
+                    f"gen_pre={grad_norm_gen_pre:.6f} gen_post={grad_norm_gen_post:.6f} clip_max={args.grad_clip_max_norm} clip_event={clip_event}",
+                    flush=True,
+                )
 
             # --- Instrumentierung: Parameter Update Check (Post-Step) ---
             if do_param_debug:
@@ -7251,7 +7364,7 @@ def train():
                         nonfinite_lambda,
                         nonfinite_atten,
                         grad_norm_global,
-                        float(grad_norm_gen),
+                        float(grad_norm_gen_pre),
                         int(clip_event),
                         z_enc_l2,
                         z_latent_l2,
@@ -7939,6 +8052,8 @@ def train():
             gain_param=gain_param,
         )
         print("✅ Training run finished.", flush=True)
+        if args.debug_z_sensitivity and debug_z_sample is not None:
+            _log_debug_z_sensitivity(debug_z_sample, generator, args)
     
     
         print(f"[end] reached step={last_step} max_steps={max_steps} exit_reason={exit_reason}", flush=True)
@@ -7949,6 +8064,116 @@ def train():
         raise
     finally:
         print(f"[end] reached step={last_step} max_steps={max_steps} exit_reason={exit_reason}", flush=True)
+def _apply_debug_projection_postprocessing(pred_ap_raw, pred_pa_raw, sample, args):
+    if args.proj_loss_type == "poisson":
+        pred_ap = compute_poisson_rate(pred_ap_raw, args.poisson_rate_mode, eps=1e-6)
+        pred_pa = compute_poisson_rate(pred_pa_raw, args.poisson_rate_mode, eps=1e-6)
+    else:
+        pred_ap = pred_ap_raw
+        pred_pa = pred_pa_raw
+
+    if sample.get("use_counts"):
+        gain_val = sample.get("gain_val")
+        if gain_val is not None:
+            pred_ap = pred_ap * gain_val
+            pred_pa = pred_pa * gain_val
+        else:
+            gain_param = sample.get("gain_param")
+            if gain_param is not None:
+                gain_scale = F.softplus(gain_param)
+                pred_ap = pred_ap * gain_scale
+                pred_pa = pred_pa * gain_scale
+
+    poisson_floor = float(sample.get("poisson_rate_floor", 0.0))
+    floor_mode = sample.get("poisson_rate_floor_mode", args.poisson_rate_floor_mode)
+    if sample.get("use_counts") and poisson_floor > 0.0 and args.proj_loss_type == "poisson":
+        pred_ap, _ = apply_poisson_rate_floor(pred_ap, poisson_floor, floor_mode)
+        pred_pa, _ = apply_poisson_rate_floor(pred_pa, poisson_floor, floor_mode)
+    return pred_ap, pred_pa
+
+
+def _evaluate_debug_projection(generator, sample, z_variant, args):
+    ct_context = sample.get("ct_context")
+    with torch.no_grad():
+        with torch.cuda.amp.autocast(enabled=sample["amp_enabled"]):
+            pred_ap_raw, _ = render_minibatch(generator, z_variant, sample["ray_batch_ap"], ct_context=ct_context)
+            pred_pa_raw, _ = render_minibatch(generator, z_variant, sample["ray_batch_pa"], ct_context=ct_context)
+    pred_ap, pred_pa = _apply_debug_projection_postprocessing(pred_ap_raw, pred_pa_raw, sample, args)
+    metrics_ap = compute_projection_metrics(pred_ap, sample["target_ap"])
+    metrics_pa = compute_projection_metrics(pred_pa, sample["target_pa"])
+    return pred_ap, pred_pa, metrics_ap, metrics_pa
+
+
+def _evaluate_debug_act(generator, sample, z_variant):
+    coords = sample.get("act_coords")
+    if coords is None:
+        return None, None
+    with torch.no_grad():
+        pred_act, pred_act_raw = query_emission_at_points(generator, z_variant, coords, return_raw=True)
+    return pred_act, pred_act_raw
+
+
+def _log_debug_z_sensitivity(sample, generator, args):
+    if sample is None:
+        return
+
+    base_ap = sample["pred_ap_normal"]
+    base_pa = sample["pred_pa_normal"]
+    base_abs_mean = base_ap.abs().mean() + base_pa.abs().mean()
+    denom = 0.5 * base_abs_mean + 1e-8
+
+    variants = [
+        ("normal", sample["z_latent"]),
+        ("zero", torch.zeros_like(sample["z_latent"])),
+    ]
+    z_latent = sample["z_latent"]
+    if z_latent.shape[0] > 1:
+        perm = torch.randperm(z_latent.shape[0], device=z_latent.device)
+        variants.append(("swap", z_latent[perm].clone()))
+    else:
+        variants.append(("swap", z_latent + 0.01 * torch.randn_like(z_latent)))
+    variants.append(("noise", z_latent + 0.01 * torch.randn_like(z_latent)))
+
+    print("[debug-z] Starting sensitivity check", flush=True)
+    for name, z_variant in variants:
+        if name == "normal":
+            pred_ap = base_ap
+            pred_pa = base_pa
+            metrics_ap = compute_projection_metrics(pred_ap, sample["target_ap"])
+            metrics_pa = compute_projection_metrics(pred_pa, sample["target_pa"])
+        else:
+            pred_ap, pred_pa, metrics_ap, metrics_pa = _evaluate_debug_projection(
+                generator,
+                sample,
+                z_variant.detach(),
+                args,
+            )
+
+        diff_ap = (base_ap - pred_ap).abs().mean().item()
+        diff_pa = (base_pa - pred_pa).abs().mean().item()
+        z_effect_proj = 0.5 * (diff_ap + diff_pa) / denom
+
+        def _fmt_metrics(metrics):
+            return f"mae={metrics['mae']:.6f} rmse={metrics['rmse']:.6f} nll={metrics['nll']:.6f}"
+
+        print(
+            f"[debug-z] variant={name} proj_ap({_fmt_metrics(metrics_ap)}) "
+            f"proj_pa({_fmt_metrics(metrics_pa)}) z_effect_proj={z_effect_proj:.3e}",
+            flush=True,
+        )
+
+        if sample.get("act_coords") is not None and sample.get("act_pred_raw") is not None:
+            act_base_raw = sample["act_pred_raw"]
+            act_result, act_result_raw = _evaluate_debug_act(generator, sample, z_variant.detach())
+            if act_result_raw is not None:
+                diff_act = (act_base_raw - act_result_raw).abs().mean().item()
+                stats = tensor_stats(act_result_raw)
+                print(
+                    f"[debug-z][act] variant={name} act_raw_stats={fmt_stats(stats)} act_diff_mean={diff_act:.6e}",
+                    flush=True,
+                )
+
+
 def split_by_patient_id(
     dataset,
     seed: int,

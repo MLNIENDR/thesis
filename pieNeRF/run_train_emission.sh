@@ -38,7 +38,8 @@ srun ${PYTHON_BIN} -u train_emission.py \
   --hybrid \
   --seed 0 \
   --max-steps 1200 \
-  --save-every 200 \
+  --save-every 400 \
+  --z-enc-alpha 1.0 \
   --proj-target-source counts \
   --proj-loss-type poisson \
   --proj-loss-weight 0.1 \
@@ -51,8 +52,12 @@ srun ${PYTHON_BIN} -u train_emission.py \
   --act-tv-weight 1e-6 \
   --act-samples 16384 \
   --ct-loss-weight 1e-4 \
-  --final-act-compare \
-  --debug-act|| exit_code=$?
+  --poisson-rate-mode softplus_shift \
+  --latent-dropout-prob 0.25 \
+  --no-grad-clip \
+  --debug-z-sensitivity \
+  --debug-z-cosine \
+  --final-act-compare|| exit_code=$?
 echo "python_exit=$exit_code"
 if [ $exit_code -ne 0 ]; then
   echo "[ERROR] Training failed with exit_code=$exit_code"
