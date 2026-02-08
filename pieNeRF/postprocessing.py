@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Postprocess run results: total-activity bias, voxel metrics, optional organ/projection metrics.
 
-Usage examples:
-  python postprocessing.py --run-dir results_spect
-  python postprocessing.py --run-dir results_spect --checkpoint results_spect/checkpoints/checkpoint_step00400.pt
-  python postprocessing.py --run-dir results_spect --pred-ap-path results_spect/pred_ap.npy --pred-pa-path results_spect/pred_pa.npy
+python postprocessing.py \
+  --run-dir results_spect \
+  --split-json results_spect/split.json \
+  --manifest data/manifest_abs.csv \
+  --out-dir results_spect/postproc \
+  --save-proj-npy \
+  --mask-path-pattern /home/mnguest12/projects/thesis/Data_Processing/{phantom}/out/mask.npy \
+  --device cuda
+
 """
 import argparse
 import csv
@@ -29,9 +34,14 @@ METRICS_CSV_HEADER = [
     "vol_rmse_roi",
     "activity_bias_roi",
     "activity_rel_abs_error_roi",
+    "voxel_mae_fg",
+    "voxel_rmse_fg",
+    "voxel_n_fg",
+    "fg_tau",
     "proj_mae_counts",
     "proj_poisson_dev_counts",
     "organ_rel_error_total_activity",
+    "organ_fraction_mae",
     "A_gt_roi",
     "A_pred_roi",
     "A_pred_native",
@@ -40,7 +50,11 @@ METRICS_CSV_HEADER = [
     "config_path",
     "proj_status",
     "proj_domain",
+    "proj_is_normalized",
+    "proj_norm_factor",
 ]
+
+FG_THRESHOLD = 1e-6
 
 
 def parse_args():
@@ -264,6 +278,21 @@ def compute_voxel_metrics(gt_roi: np.ndarray, pred_roi: np.ndarray) -> tuple[flo
     return mae, rmse
 
 
+def masked_voxel_metrics(gt: np.ndarray, pred: np.ndarray, mask: np.ndarray) -> tuple[float, float, int]:
+    if mask is None or not mask.any():
+        return float("nan"), float("nan"), 0
+    gt_vals = gt[mask]
+    pred_vals = pred[mask]
+    diff = gt_vals - pred_vals
+    mae = float(np.mean(np.abs(diff)))
+    rmse = float(np.sqrt(np.mean(diff * diff)))
+    return mae, rmse, int(mask.sum())
+
+
+def clamp_non_negative(array: np.ndarray) -> np.ndarray:
+    return np.clip(array, 0.0, None)
+
+
 def load_mask(mask_path: Path, gt_shape: tuple[int, int, int]) -> np.ndarray | None:
     if not mask_path.exists():
         return None
@@ -368,12 +397,12 @@ def compute_organ_statistics(
     roi_slice: tuple[slice, slice, slice],
     spacing_gt: tuple[float, float, float],
     organ_map: dict[int, str],
-) -> tuple[dict[int, dict], float]:
+ ) -> tuple[dict[int, dict], float, float]:
     roi_mask = np.zeros_like(mask, dtype=bool)
     roi_mask[roi_slice] = True
     organ_ids = sorted(set(np.unique(mask)) - {0})
     if not organ_ids:
-        return {}, float("nan")
+        return {}, float("nan"), float("nan")
     vol_voxel = spacing_gt[0] * spacing_gt[1] * spacing_gt[2]
     stats = {}
     rel_errors = []
@@ -399,8 +428,22 @@ def compute_organ_statistics(
             "rel_error_total_activity": rel_error,
         }
     aggregate = float(np.nanmean(rel_errors)) if rel_errors else float("nan")
-    return stats, aggregate
+    fraction_mae = compute_organ_fraction_error(stats)
+    return stats, aggregate, fraction_mae
 
+
+def compute_organ_fraction_error(stats: dict[int, dict]) -> float:
+    if not stats:
+        return float("nan")
+    gt_sums = np.array([row["gt_sum_activity"] for row in stats.values()], dtype=np.float64)
+    pred_sums = np.array([row["pred_sum_activity"] for row in stats.values()], dtype=np.float64)
+    total_gt = float(gt_sums.sum())
+    total_pred = float(pred_sums.sum())
+    if total_gt <= 1e-12 or total_pred <= 1e-12:
+        return float("nan")
+    gt_frac = gt_sums / total_gt
+    pred_frac = pred_sums / total_pred
+    return float(np.mean(np.abs(gt_frac - pred_frac)))
 
 def render_projections_stub():
     # Projections currently not rendered (no checkpoint or latent).
@@ -519,9 +562,10 @@ def main():
             raise RuntimeError(f"no pred path for {pid}")
         pred_act = load_array(pred_path)
         pred_resampled = resample_pred_to_gt(pred_act, gt_shape, args.device)
+        pred_resampled_phys = clamp_non_negative(pred_resampled)
         roi_slices = slices
         gt_roi = gt_act[roi_slices]
-        pred_roi = pred_resampled[roi_slices]
+        pred_roi = pred_resampled_phys[roi_slices]
         V_gt = spacing_gt[0] * spacing_gt[1] * spacing_gt[2]
         A_gt_roi = float(gt_roi.sum()) * V_gt
         A_pred_roi = float(pred_roi.sum()) * V_gt
@@ -531,16 +575,20 @@ def main():
         pred_res = pred_act.shape
         spacing_pred = tuple((2.0 * float(radius_xyz[i])) / (pred_res[i] - 1) for i in range(3))
         V_pred = spacing_pred[0] * spacing_pred[1] * spacing_pred[2]
-        A_pred_native = float(pred_act.sum()) * V_pred
+        pred_act_phys = clamp_non_negative(pred_act)
+        A_pred_native = float(pred_act_phys.sum()) * V_pred
+        fg_mask = gt_roi > FG_THRESHOLD
+        voxel_mae_fg, voxel_rmse_fg, voxel_n_fg = masked_voxel_metrics(gt_roi, pred_roi, fg_mask)
         mask_path = Path(args.mask_path_pattern.format(phantom=pid))
         mask = load_mask(mask_path, gt_shape)
         organ_stats = {}
         organ_rel_error = float("nan")
+        organ_fraction_mae = float("nan")
         if mask is not None:
-            organ_stats, organ_rel_error = compute_organ_statistics(
+            organ_stats, organ_rel_error, organ_fraction_mae = compute_organ_statistics(
                 mask,
                 gt_act,
-                pred_resampled,
+                pred_resampled_phys,
                 roi_slices,
                 spacing_gt,
                 organ_name_map,
@@ -573,6 +621,8 @@ def main():
         proj_metrics = compute_projection_metrics_with_fallback(
             args, run_dir, out_dir, pid, gt_ap, gt_pa, proj_domain
         )
+        proj_is_normalized = proj_domain == "normalized"
+        proj_norm_factor = None
         metrics_data = {
             "phantom_id": pid,
             "run": {
@@ -601,14 +651,21 @@ def main():
                 "vol_rmse_roi": vol_rmse,
                 "activity_bias_roi": bias_roi,
                 "activity_rel_abs_error_roi": rel_abs,
+                "voxel_mae_fg": voxel_mae_fg,
+                "voxel_rmse_fg": voxel_rmse_fg,
+                "voxel_n_fg": voxel_n_fg,
+                "fg_tau": FG_THRESHOLD,
                 "proj_mae_counts": proj_metrics["proj_mae_counts"],
                 "proj_poisson_dev_counts": proj_metrics["proj_poisson_dev_counts"],
                 "organ_rel_error_total_activity": organ_rel_error,
+                "organ_fraction_mae": organ_fraction_mae,
                 "A_gt_roi": A_gt_roi,
                 "A_pred_roi": A_pred_roi,
                 "A_pred_native": A_pred_native,
                 "proj_status": proj_metrics["proj_status"],
                 "proj_domain": proj_metrics.get("proj_domain", proj_domain),
+                "proj_is_normalized": proj_is_normalized,
+                "proj_norm_factor": proj_norm_factor,
             },
             "assumptions": {"roi_assumption": "world box centered on GT grid center"},
         }
@@ -621,9 +678,14 @@ def main():
                 "vol_rmse_roi": vol_rmse,
                 "activity_bias_roi": bias_roi,
                 "activity_rel_abs_error_roi": rel_abs,
+                "voxel_mae_fg": voxel_mae_fg,
+                "voxel_rmse_fg": voxel_rmse_fg,
+                "voxel_n_fg": voxel_n_fg,
+                "fg_tau": FG_THRESHOLD,
                 "proj_mae_counts": proj_metrics["proj_mae_counts"],
                 "proj_poisson_dev_counts": proj_metrics["proj_poisson_dev_counts"],
                 "organ_rel_error_total_activity": organ_rel_error,
+                "organ_fraction_mae": organ_fraction_mae,
                 "A_gt_roi": A_gt_roi,
                 "A_pred_roi": A_pred_roi,
                 "A_pred_native": A_pred_native,
@@ -632,6 +694,8 @@ def main():
                 "config_path": config_path,
                 "proj_status": proj_metrics["proj_status"],
                 "proj_domain": proj_metrics.get("proj_domain", proj_domain),
+                "proj_is_normalized": proj_is_normalized,
+                "proj_norm_factor": proj_norm_factor,
             },
         )
         _LOG.info(

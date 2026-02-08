@@ -9,6 +9,7 @@ import re
 import signal
 import subprocess
 import sys
+import textwrap
 import time
 import traceback
 from pathlib import Path
@@ -603,7 +604,7 @@ def parse_args():
     parser.add_argument(
         "--poisson-rate-mode",
         type=str,
-        default="softplus_shift",
+        default="identity",
         choices=["softplus_shift", "identity"],
         help="Poisson-Rate-Definition: softplus_shift (legacy) oder identity (rate=pred).",
     )
@@ -791,6 +792,12 @@ def parse_args():
         type=float,
         default=1.0,
         help="Fixer Normierungsfaktor fuer ACT-Loss (nur bei act-norm-source=fixed).",
+    )
+    parser.add_argument(
+        "--act-scale-reg-weight",
+        type=float,
+        default=1e-6,
+        help="Gewicht fuer ACT-Skalenregularisierung (sum(pred_act_raw) ≈ sum(gt_act)).",
     )
     parser.add_argument(
         "--encoder-use-ct",
@@ -1187,7 +1194,9 @@ def save_img_abs(
     title_parts.append(f"max={maxv:.2e}")
     title_parts.append(f"sum={sumv:.2e}")
     title_parts.append(f"vmax={candidate:.2e}")
-    ax.set_title(" | ".join(title_parts))
+    title_text = " | ".join(title_parts)
+    title_wrapped = textwrap.fill(title_text, width=72)
+    ax.set_title(title_wrapped, loc="left")
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     plt.tight_layout()
@@ -1336,7 +1345,7 @@ def save_test_volume_slices(
     test_loader,
     outdir: Path,
     device: torch.device,
-    max_patients: int = 2,
+    max_patients: int = 4,
     slice_percents=(0.1, 0.5, 0.9),
     encoder: Optional[nn.Module] = None,
     z_fuser: Optional[nn.Module] = None,
@@ -1819,6 +1828,18 @@ def fmt_stats(stats: Optional[dict]) -> str:
         "min/mean/p95/max="
         f"{stats['min']:.3e}/{stats['mean']:.3e}/{stats['p95']:.3e}/{stats['max']:.3e}"
     )
+
+
+def _ratio_stats(pred: torch.Tensor, target: torch.Tensor) -> tuple[float, float, float, float]:
+    eps = 1e-8
+    sum_pred = float(pred.sum().item())
+    sum_target = float(target.sum().item())
+    mean_pred = float(pred.mean().item())
+    mean_target = float(target.mean().item())
+    sum_ratio = sum_pred / (sum_target + eps)
+    mean_ratio = mean_pred / (mean_target + eps)
+    return sum_ratio, mean_ratio, sum_pred, sum_target
+
 
 _ENCODER_INPUT_STATS_LOGGED = False
 
@@ -4306,6 +4327,19 @@ def evaluate_pixel_subsets(
 
             target_ap = ap_flat_proc[0, idx_ap].unsqueeze(0)
             target_pa = pa_flat_proc[0, idx_pa].unsqueeze(0)
+            subset_label = locals().get("name", None)
+            subset_label = subset_label if subset_label is not None else "eval"
+            ratio_used_ap = _ratio_stats(lambda_ap_used, target_ap)
+            ratio_used_pa = _ratio_stats(lambda_pa_used, target_pa)
+            scale_val = float(pred_scale) if (pred_scale is not None and math.isfinite(pred_scale)) else float("nan")
+            should_log_eval = DEBUG_PRINTS or (subset_label == "test_all")
+            if should_log_eval:
+                print(
+                    f"[scale-probe][eval][{subset_label}] pred_scale={scale_val:.3f} "
+                    f"| pred_vs_target_used AP(sum/mean)={ratio_used_ap[0]:.3f}/{ratio_used_ap[1]:.3f} "
+                    f"PA(sum/mean)={ratio_used_pa[0]:.3f}/{ratio_used_pa[1]:.3f}",
+                    flush=True,
+                )
 
             if (target_ap < 0).any() or (target_pa < 0).any():
                 print("[WARN] Negative projection targets detected in eval.", flush=True)
@@ -4560,7 +4594,7 @@ def evaluate_val_loader(
             poisson_rate_floor=args.poisson_rate_floor,
             poisson_rate_floor_mode=args.poisson_rate_floor_mode,
             proj_loss_active=proj_loss_active,
-            pred_scale=prepared["pred_to_counts_scale"] if proj_counts_active else 1.0,
+            pred_scale=1.0,
             gain=gain,
         )
         val_metrics.append(batch_stats)
@@ -4801,6 +4835,9 @@ def train():
         args.act_pos_threshold = float(training_cfg.get("act_pos_threshold", 1e-8))
     else:
         training_cfg["act_pos_threshold"] = args.act_pos_threshold
+    training_cfg.setdefault("proj_warmup_steps", args.proj_warmup_steps)
+    args.proj_warmup_steps = int(training_cfg.get("proj_warmup_steps", args.proj_warmup_steps))
+    training_cfg["proj_warmup_steps"] = args.proj_warmup_steps
     training_cfg.setdefault("ct_loss_weight", 0.0)
     training_cfg.setdefault("ct_threshold", 0.05)
     training_cfg.setdefault("ct_samples", 8192)
@@ -5555,7 +5592,26 @@ def train():
                     )
                     diff = F.smooth_l1_loss(pred_log, act_log, reduction="none")
                     loss_act = torch.mean(weights_act * diff)
-                    loss = loss + args.act_loss_weight * loss_act
+                    scale_loss = torch.tensor(0.0, device=device)
+                    if args.act_scale_reg_weight > 0.0:
+                        pred_sum = pred_pos.sum()
+                        target_sum = act_pos.sum()
+                        scale_diff = pred_sum - target_sum
+                        scale_loss = args.act_scale_reg_weight * scale_diff * scale_diff
+                    loss = loss + args.act_loss_weight * loss_act + scale_loss
+                    need_act_scale_log = args.log_every > 0 and (step == 1 or (step % args.log_every) == 0)
+                    if need_act_scale_log:
+                        pred_sum_val = float(pred_pos.sum().detach().item())
+                        target_sum_val = float(act_pos.sum().detach().item())
+                        pred_mean_val = float(pred_pos.mean().detach().item())
+                        target_mean_val = float(act_pos.mean().detach().item())
+                        scale_loss_val = float(scale_loss.detach().item()) if args.act_scale_reg_weight > 0.0 else 0.0
+                        print(
+                            f"[act-scale][step {step}] pred_sum={pred_sum_val:.3e} mean={pred_mean_val:.3e} "
+                            f"target_sum={target_sum_val:.3e} mean={target_mean_val:.3e} "
+                            f"scale_loss={scale_loss_val:.3e}",
+                            flush=True,
+                        )
 
         if args.debug_z_sensitivity and debug_z_sample is None:
             debug_z_sample = {
@@ -5905,6 +5961,13 @@ def train():
                 and (not hybrid_enabled or proj_weight_used > 0.0)
             )
             proj_metrics_enabled = proj_loss_active
+            if args.log_every > 0 and (step == 1 or (step % args.log_every) == 0):
+                print(
+                    f"[proj-status][step {step}] proj_loss_active={proj_loss_active} "
+                    f"proj_warmup_active={proj_warmup_active} proj_weight_used={proj_weight_used:.3e} "
+                    f"skip_proj={skip_proj}",
+                    flush=True,
+                )
 
             if debug_sanity_checks and (not geometry_checked) and step == 1:
                 geometry_checked = True
@@ -6155,6 +6218,37 @@ def train():
                                   f"sum_pred_with_gain={sum_pred_with_gain.item():.2f} "
                                   f"gain_est={gain_est.item():.4f} gain_learnable_mean={g_raw_v:.4f} "
                                   f"gain_used_final={g_used_v:.4f}", flush=True)
+                    if args.log_every > 0 and (step == 1 or (step % args.log_every) == 0):
+                        ratio_used_ap = _ratio_stats(lambda_ap_used, target_ap)
+                        ratio_used_pa = _ratio_stats(lambda_pa_used, target_pa)
+                        counts_ap_str = "NA/NA"
+                        counts_pa_str = "NA/NA"
+                        if (
+                            use_counts
+                            and ap_counts is not None
+                            and ap_counts.numel() > 0
+                            and pa_counts is not None
+                            and pa_counts.numel() > 0
+                        ):
+                            target_ap_counts = ap_counts.reshape(ap_counts.shape[0], -1)[0, idx_ap].unsqueeze(0)
+                            target_pa_counts = pa_counts.reshape(pa_counts.shape[0], -1)[0, idx_pa].unsqueeze(0)
+                            counts_ap = _ratio_stats(lambda_ap_used, target_ap_counts)
+                            counts_pa = _ratio_stats(lambda_pa_used, target_pa_counts)
+                            counts_ap_str = f"{counts_ap[0]:.3f}/{counts_ap[1]:.3f}"
+                            counts_pa_str = f"{counts_pa[0]:.3f}/{counts_pa[1]:.3f}"
+                        pts = float(pred_to_counts_scale) if pred_to_counts_scale is not None else float("nan")
+                        msg = (
+                            f"[scale-probe][train][step {step}] use_counts={use_counts} "
+                            f"pred_to_counts_scale={pts:.3e} "
+                            f"| pred_vs_target_used AP(sum/mean)={ratio_used_ap[0]:.3f}/{ratio_used_ap[1]:.3f} "
+                            f"PA(sum/mean)={ratio_used_pa[0]:.3f}/{ratio_used_pa[1]:.3f}"
+                        )
+                        if counts_ap_str != "NA/NA":
+                            msg += (
+                                " | pred_vs_counts "
+                                f"AP(sum/mean)={counts_ap_str} PA(sum/mean)={counts_pa_str}"
+                            )
+                        print(msg, flush=True)
                     lambda_ap_eff = lambda_ap_used
                     lambda_pa_eff = lambda_pa_used
                     if proj_loss_type == "poisson" and proj_loss_active and float(args.poisson_rate_floor) > 0.0:

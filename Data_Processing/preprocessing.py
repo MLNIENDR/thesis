@@ -37,10 +37,10 @@ Erzeugt im out/-Ordner:
 Beispielaufruf:
 
 python3 preprocessing.py \
-  --base /home/mnguest12/projects/thesis/Data_Processing/phantom_09 \
-  --spect_bin phantom_09_spect208keV.par_atn_1.bin \
-  --ct_bin    phantom_09_ct80keV.par_atn_1.bin \
-  --mask_bin  phantom_09_mask.par_act_1.bin \
+  --base /home/mnguest12/projects/thesis/Data_Processing/phantom_34 \
+  --spect_bin phantom_34_spect208keV.par_atn_1.bin \
+  --ct_bin    phantom_34_ct80keV.par_atn_1.bin \
+  --mask_bin  phantom_34_mask.par_act_1.bin \
   --shape 256,256,651 \
   --spect_dtype float32 \
   --ct_dtype    float32 \
@@ -52,8 +52,8 @@ python3 preprocessing.py \
   --activity_seed -1 \
   --sensitivity_cps_per_mbq 65 \
   --acq_time_s 300 \
-  --manifest /home/mnguest12/projects/thesis/pieNeRF/data/manifest.csv \
-  --patient-id phantom_09 \
+  --manifest /home/mnguest12/projects/thesis/pieNeRF/data/manifest_abs.csv \
+  --patient-id phantom_34 \
   --manifest-id-column patient_id
 
 
@@ -640,6 +640,8 @@ def main():
         raise ValueError(f"Shape-Mismatch: spect={spect_xyz.shape}, ct={ct_xyz.shape}, mask={mask_xyz.shape}")
 
     print(f"[SHAPE] Volumina: {spect_xyz.shape} (x,y,z)")
+
+    np.save(out_dir / "mask.npy", mask_xyz.astype(np.float32))
 
     # Build activity (kBq/mL) -> A_xyz_MBq (MBq/voxel)
     # Seed wählen: fix oder aus Phantom-Namen abgeleitet
