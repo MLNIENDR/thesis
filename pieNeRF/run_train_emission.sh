@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:A100:1
 #SBATCH --mem=64G
-#SBATCH --time=06:00:00
+#SBATCH --time=10:00:00
 #SBATCH --output=/home/mnguest12/slurm/emission_train.%j.out
 #SBATCH --error=/home/mnguest12/slurm/emission_train.%j.err
 #SBATCH --chdir=/home/mnguest12/projects/thesis/pieNeRF
@@ -51,7 +51,7 @@ srun ${PYTHON_BIN} -u train_emission.py \
   --act-pos-weight 10.0 \
   --act-sparsity-weight 5e-4 \
   --act-tv-weight 1e-6 \
-  --act-samples 16384 \
+  --act-samples 32768 \
   --ct-loss-weight 1e-4 \
   --final-act-compare|| exit_code=$?
 echo "python_exit=$exit_code"
