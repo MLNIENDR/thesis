@@ -211,8 +211,10 @@ def gamma_camera_core(
 # ------------------------------------------------------------------------------
 
 def save_png(arr: np.ndarray, path: Path, title: str = None) -> None:
+    """Render the projection with a 90° rotation (counter-clockwise) while keeping axes/labels unchanged."""
     plt.figure(figsize=(6, 6))
-    plt.imshow(arr, cmap="inferno", origin="lower")
+    rotated = np.rot90(arr, k=1)
+    plt.imshow(rotated, cmap="inferno", origin="lower")
     plt.colorbar(label="Intensity")
     if title:
         plt.title(title)
