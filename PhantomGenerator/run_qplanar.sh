@@ -75,7 +75,7 @@ for NUM in {15..34}; do
     --shape 256,256,651 \
     --pixel_size_mm 1.5 \
     --poisson \
-    --counts_per_pixel 20000 \
+    --counts_per_pixel 30 \
     --save_pngs \
     --out_dir "${OUT_DIR}"
 

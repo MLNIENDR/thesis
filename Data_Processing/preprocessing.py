@@ -37,10 +37,10 @@ Erzeugt im out/-Ordner:
 Beispielaufruf:
 
 python3 preprocessing.py \
-  --base /home/mnguest12/projects/thesis/Data_Processing/phantom_34 \
-  --spect_bin phantom_34_spect208keV.par_atn_1.bin \
-  --ct_bin    phantom_34_ct80keV.par_atn_1.bin \
-  --mask_bin  phantom_34_mask.par_act_1.bin \
+  --base /home/mnguest12/projects/thesis/Data_Processing/phantom_28 \
+  --spect_bin phantom_28_spect208keV.par_atn_1.bin \
+  --ct_bin    phantom_28_ct80keV.par_atn_1.bin \
+  --mask_bin  phantom_28_mask.par_act_1.bin \
   --shape 256,256,651 \
   --spect_dtype float32 \
   --ct_dtype    float32 \
@@ -53,7 +53,7 @@ python3 preprocessing.py \
   --sensitivity_cps_per_mbq 65 \
   --acq_time_s 300 \
   --manifest /home/mnguest12/projects/thesis/pieNeRF/data/manifest_abs.csv \
-  --patient-id phantom_34 \
+  --patient-id phantom_28 \
   --manifest-id-column patient_id
 
 

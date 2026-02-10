@@ -7,6 +7,12 @@ per-organ results into a single pandas DataFrame, computes summary statistics,
 saves CSV/LaTeX artifacts, and draws diagnostics (GT vs REC scatter, boxplots,
 and a Bland-Altman plot). The boxplot visualizes the distribution of
 `rel_error_percent` per organ.
+
+
+python3 eval_qplanar_results.py \
+  --root /home/mnguest12/projects/thesis/PhantomGenerator \
+  --out /home/mnguest12/projects/thesis/PhantomGenerator/qplanar_eval
+
 """
 
 import argparse
