@@ -1,9 +1,5 @@
 #!/bin/bash
-#
-# SLURM job wrapper to run inference postprocessing (pieNeRF/postprocessing.py) on GPU.
-#
-
-#SBATCH --job-name=postprocessing
+#SBATCH --job-name=postproc_projW005
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --partition=dgx
@@ -17,20 +13,19 @@
 
 set -euo pipefail
 
-PYTHON_BIN=${PYTHON_BIN:-python3}
-RUN_DIR=${RUN_DIR:-results_spect}
-SPLIT_JSON=${SPLIT_JSON:-"$RUN_DIR/split.json"}
-MANIFEST=${MANIFEST:-data/manifest_abs.csv}
-CONFIG=${CONFIG:-configs/spect.yaml}
-OUT_DIR=${OUT_DIR:-"$RUN_DIR/postproc"}
+# ---- hard-wire this run (projW_0.05) ----
+RUN_DIR="/home/mnguest12/projects/thesis/pieNeRF/results_spect_sweep/projW_0.05/results_spect"
+SPLIT_JSON="${RUN_DIR}/split.json"
+MANIFEST="/home/mnguest12/projects/thesis/pieNeRF/data/manifest_abs.csv"
+CONFIG="/home/mnguest12/projects/thesis/pieNeRF/results_spect_sweep/projW_0.05/spect_projW_0.05.yaml"
+OUT_DIR="/home/mnguest12/projects/thesis/pieNeRF/results_spect_sweep/projW_0.05/postproc"
+MASK_PATTERN='/home/mnguest12/projects/thesis/Data_Processing/{phantom}/out/mask.npy'
+DEVICE="cuda"
 
-# Important: mask path pattern uses {phantom} placeholder
-MASK_PATTERN=${MASK_PATTERN:-'/home/mnguest12/projects/thesis/Data_Processing/{phantom}/out/mask.npy'}
+CONDA_ENV="totalseg"
+CONDA_ACTIVATE="/home/mnguest12/mambaforge/bin/activate"
+PYTHON_BIN="python"
 
-# Use GPU in postprocessing.py
-DEVICE=${DEVICE:-cuda}
-
-# Threading hygiene (prevents oversubscription on CPU-heavy parts)
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK}
@@ -38,52 +33,56 @@ export NUMEXPR_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 
 echo "🛠 Starting postprocessing job on ${HOSTNAME}"
 echo "📅 Job started at: $(date)"
-echo "🧠 GPUs assigned: ${SLURM_JOB_GPUS:-unknown}"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
-echo "🗂 run_dir=${RUN_DIR}"
-echo "🧾 split_json=${SPLIT_JSON}"
-echo "🧾 manifest=${MANIFEST}"
-echo "🧾 config=${CONFIG}"
-echo "🧹 out_dir=${OUT_DIR}"
-echo "🩻 mask_pattern=${MASK_PATTERN}"
-echo "🧮 device=${DEVICE}"
-echo "🧵 cpus_per_task=${SLURM_CPUS_PER_TASK}"
+echo "run_dir=${RUN_DIR}"
+echo "split_json=${SPLIT_JSON}"
+echo "manifest=${MANIFEST}"
+echo "config=${CONFIG}"
+echo "out_dir=${OUT_DIR}"
+echo "mask_pattern=${MASK_PATTERN}"
+echo "device=${DEVICE}"
 
-# 1) Activate env
-echo "⏱ Activate start: $(date +%s)"
-source /home/mnguest12/mambaforge/bin/activate totalseg
-echo "⏱ Activate end:   $(date +%s)"
+source "${CONDA_ACTIVATE}"
+conda activate "${CONDA_ENV}"
 
-# 2) Project dir
-cd /home/mnguest12/projects/thesis/pieNeRF
+echo "python=$(which "${PYTHON_BIN}")"
+"${PYTHON_BIN}" -V
 
-# 3) GPU info
-echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+echo "PWD=$(pwd)"
 nvidia-smi || true
 
-# 4) Run postprocessing
+# --- sanity checks ---
+test -d "${RUN_DIR}" || { echo "[ERROR] RUN_DIR not found: ${RUN_DIR}"; exit 2; }
+test -f "${SPLIT_JSON}" || { echo "[ERROR] SPLIT_JSON not found: ${SPLIT_JSON}"; exit 2; }
+test -f "${MANIFEST}" || { echo "[ERROR] MANIFEST not found: ${MANIFEST}"; exit 2; }
+test -f "${CONFIG}" || { echo "[ERROR] CONFIG not found: ${CONFIG}"; exit 2; }
+mkdir -p "${OUT_DIR}"
+
+# ensure imports work (Data_Processing + repo)
+export PYTHONPATH="/home/mnguest12/projects/thesis:/home/mnguest12/projects/thesis/pieNeRF:${PYTHONPATH:-}"
+
 echo "🔁 Running postprocessing.py..."
-echo "⏱ Python start:   $(date +%s)"
+echo "[DBG] Listing ${RUN_DIR}/test_slices:"
+ls -lah "${RUN_DIR}/test_slices" || true
 
-exit_code=0
-srun /usr/bin/time -v ${PYTHON_BIN} -u postprocessing.py \
-  --run-dir "$RUN_DIR" \
-  --split-json "$SPLIT_JSON" \
-  --manifest "$MANIFEST" \
-  --config "$CONFIG" \
-  --out-dir "$OUT_DIR" \
-  --mask-path-pattern "$MASK_PATTERN" \
-  --device "$DEVICE" \
+# ---- run ----
+set -x
+srun /usr/bin/time -v "${PYTHON_BIN}" -u postprocessing.py \
+  --run-dir "${RUN_DIR}" \
+  --split-json "${SPLIT_JSON}" \
+  --manifest "${MANIFEST}" \
+  --config "${CONFIG}" \
+  --out-dir "${OUT_DIR}" \
+  --mask-path-pattern "${MASK_PATTERN}" \
+  --device "${DEVICE}" \
+  --pred-act-per-phantom \
+  --pred-act-pattern "test_slices/{phantom}/activity_pred.npy" \
+  --render-projections \
   --save-proj-npy \
+  --save-proj-png \
   --timing \
-  || exit_code=$?
-
-echo "python_exit=$exit_code"
-echo "⏱ Python end:     $(date +%s)"
-
-if [ $exit_code -ne 0 ]; then
-  echo "[ERROR] Postprocessing failed with exit_code=$exit_code"
-  exit $exit_code
-fi
+  --skip-plots \
+  --save-active-organ-plots
+set +x
 
 echo "✅ Postprocessing finished at: $(date)"

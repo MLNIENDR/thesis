@@ -37,20 +37,20 @@ srun ${PYTHON_BIN} -u train_emission.py \
   --config configs/spect.yaml \
   --hybrid \
   --seed 0 \
-  --max-steps 20000 \
-  --log-every 400 \
-  --save-every 1000 \
+  --max-steps 8000 \
+  --log-every 200 \
+  --save-every 500 \
   --proj-target-source counts \
   --poisson-rate-mode identity \
   --proj-loss-type poisson \
   --proj-loss-weight 0.1 \
   --proj-warmup-steps 150 \
-  --proj-ramp-steps 600 \
+  --proj-ramp-steps 1000 \
   --act-loss-weight 3.0 \
   --act-pos-fraction 0.05 \
   --act-pos-weight 10.0 \
-  --act-sparsity-weight 2e-3 \
-  --act-tv-weight 1e-5 \
+  --act-sparsity-weight 5e-4 \
+  --act-tv-weight 1e-6 \
   --act-samples 32768 \
   --ct-loss-weight 1e-4 \
   --final-act-compare|| exit_code=$?

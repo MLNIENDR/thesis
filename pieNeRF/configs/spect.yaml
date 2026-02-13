@@ -49,8 +49,8 @@ data:
 
 
   split_train_count: 16
-  split_val_count: 0
-  split_test_count: 4
+  split_val_count: 1
+  split_test_count: 3
 
   # -------- NeRF Raum-Parameter ----------
   # radius/fov bleiben als Legacy/Default drin; bei anisotropem Setup ist radius_xyz_cm maßgeblich.
