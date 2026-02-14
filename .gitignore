@@ -13,3 +13,4 @@
 *.npy
 *.log
 *.IMA
+*.npz

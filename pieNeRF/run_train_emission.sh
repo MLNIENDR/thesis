@@ -51,7 +51,7 @@ srun ${PYTHON_BIN} -u train_emission.py \
   --act-pos-weight 10.0 \
   --act-sparsity-weight 5e-4 \
   --act-tv-weight 1e-6 \
-  --act-samples 32768 \
+  --act-samples 32768 \     #hier muss mit der Hälfte nochmal durchgeführt werden, so ist es nämlich in allen Ablations gemacht worden
   --ct-loss-weight 1e-4 \
   --final-act-compare|| exit_code=$?
 echo "python_exit=$exit_code"

@@ -13,12 +13,11 @@
 
 set -euo pipefail
 
-# ---- hard-wire this run (projW_0.05) ----
-RUN_DIR="/home/mnguest12/projects/thesis/pieNeRF/results_spect_sweep/projW_0.05/results_spect"
+RUN_DIR="/home/mnguest12/projects/thesis/pieNeRF/results_spect_sweep/gainReg_1e-5/results_spect"
 SPLIT_JSON="${RUN_DIR}/split.json"
 MANIFEST="/home/mnguest12/projects/thesis/pieNeRF/data/manifest_abs.csv"
-CONFIG="/home/mnguest12/projects/thesis/pieNeRF/results_spect_sweep/projW_0.05/spect_projW_0.05.yaml"
-OUT_DIR="/home/mnguest12/projects/thesis/pieNeRF/results_spect_sweep/projW_0.05/postproc"
+CONFIG="/home/mnguest12/projects/thesis/pieNeRF/results_spect_sweep/gainReg_1e-5/spect_gainReg_1e-5.yaml"
+OUT_DIR="/home/mnguest12/projects/thesis/pieNeRF/results_spect_sweep/gainReg_1e-5/postproc"
 MASK_PATTERN='/home/mnguest12/projects/thesis/Data_Processing/{phantom}/out/mask.npy'
 DEVICE="cuda"
 
