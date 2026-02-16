@@ -1,4 +1,4 @@
-expname: spect_emission_gainReg_1e-4
+expname: spect_emission_projW_0.2
 data:
   type: spect
   manifest: data/manifest_abs.csv
@@ -61,7 +61,7 @@ discriminator:
   ndf: 64
   hflip: false
 training:
-  outdir: /home/mnguest12/projects/thesis/pieNeRF/results_spect_sweep/gainReg_1e-4/results_spect
+  outdir: /home/mnguest12/projects/thesis/pieNeRF/results_spect_sweep_projW/projW_0.2/results_spect
   model_file: model_spect.pt
   monitoring: tensorboard
   use_amp: false
@@ -110,6 +110,6 @@ training:
   save_every: 500
   backup_every: 0
   video_every: 0
-outdir: /home/mnguest12/projects/thesis/pieNeRF/results_spect_sweep/gainReg_1e-4/results_spect
+outdir: /home/mnguest12/projects/thesis/pieNeRF/results_spect_sweep_projW/projW_0.2/results_spect
 hybrid:
-  gain_reg_weight: 0.0001
+  proj_loss_weight: 0.2

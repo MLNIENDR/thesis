@@ -45,6 +45,20 @@ def compute_run_stats(metrics_path):
     return means, stds
 
 
+def resolve_metrics_path(tag_dir: Path) -> Path | None:
+    # Preferred current layout from run_postprocessing.sh
+    candidates = [
+        tag_dir / "results_spect" / "postproc_baseline_calib" / "metrics.csv",
+        # Backward-compatible layouts
+        tag_dir / "results_spect" / "postproc" / "metrics.csv",
+        tag_dir / "postproc" / "metrics.csv",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sweep-root", required=True,
@@ -60,16 +74,20 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     tag_dirs = sorted(
-        [d for d in sweep_root.iterdir()
-         if d.is_dir() and d.name.startswith(args.tag_prefix)]
+        [
+            d for d in sweep_root.iterdir()
+            if d.is_dir()
+            and d.name.startswith(args.tag_prefix)
+            and (d / "results_spect").exists()
+        ]
     )
 
     table = {}
 
     for tag_dir in tag_dirs:
-        metrics_path = tag_dir / "postproc" / "metrics.csv"
-        if not metrics_path.exists():
-            print(f"[WARN] missing {metrics_path}")
+        metrics_path = resolve_metrics_path(tag_dir)
+        if metrics_path is None:
+            print(f"[WARN] missing metrics.csv for {tag_dir}")
             continue
 
         means, stds = compute_run_stats(metrics_path)

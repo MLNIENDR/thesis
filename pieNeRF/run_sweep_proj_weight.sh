@@ -21,15 +21,34 @@ ROOT="/home/mnguest12/projects/thesis/pieNeRF"
 TRAIN_PY="${ROOT}/train_emission.py"
 BASE_CFG="${ROOT}/configs/spect.yaml"
 
-# make repo importable
 export PYTHONPATH="${ROOT}:${PYTHONPATH:-}"
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-16}"
 
-BASE_DIR="${ROOT}/results_spect_sweep"
+BASE_DIR="${ROOT}/results_spect_sweep_projW"
 mkdir -p "${BASE_DIR}"
 
-# ✅ only the remaining runs
-PROJ_WEIGHTS=(0.1 0.3)
+# ✅ only varying parameter:
+PROJ_WEIGHTS=(0.03 0.1 0.2 0.3)
+
+# ✅ baseline-fixed parameters (MUST match your baseline run)
+SEED=0
+MAX_STEPS=8000
+LOG_EVERY=200
+SAVE_EVERY=500
+
+PROJ_TARGET_SOURCE="counts"
+POISSON_RATE_MODE="identity"
+PROJ_LOSS_TYPE="poisson"
+PROJ_WARMUP_STEPS=150
+PROJ_RAMP_STEPS=1000
+
+ACT_LOSS_WEIGHT="3.0"
+ACT_POS_FRACTION="0.05"
+ACT_POS_WEIGHT="10.0"
+ACT_SPARSITY_WEIGHT="5e-4"
+ACT_TV_WEIGHT="1e-6"
+ACT_SAMPLES="32768"          # ✅ baseline said 32768
+CT_LOSS_WEIGHT="1e-4"
 
 for W in "${PROJ_WEIGHTS[@]}"; do
   TAG="projW_${W}"
@@ -40,26 +59,19 @@ for W in "${PROJ_WEIGHTS[@]}"; do
   FINAL_CKPT="${RUN_OUT}/checkpoints/checkpoint_step08000.pt"
 
   echo "=============================="
-  echo "Starting run with proj-weight=${W}"
-  echo "RUN_DIR=${RUN_DIR}"
+  echo "Starting run with proj-loss-weight=${W}"
   echo "RUN_OUT=${RUN_OUT}"
-  echo "RUN_CFG=${RUN_CFG}"
-  echo "FINAL_CKPT=${FINAL_CKPT}"
-  echo "PYTHONPATH=${PYTHONPATH}"
   echo "=============================="
 
   mkdir -p "${RUN_DIR}" "${RUN_OUT}"
 
-  # ✅ skip if already finished
   if [ -f "${FINAL_CKPT}" ]; then
-    echo "[sweep] SKIP ${TAG}: already finished (${FINAL_CKPT} exists)"
+    echo "[sweep] SKIP ${TAG}: already finished"
     continue
   fi
 
-  # ---- write per-run config (patch multiple possible outdir keys) ----
   ${PYTHON_BIN} - <<PY
 import os, yaml
-
 base_cfg = r"${BASE_CFG}"
 run_cfg  = r"${RUN_CFG}"
 run_out  = r"${RUN_OUT}"
@@ -82,16 +94,9 @@ def set_if_path(cfg, path, value):
 
 cfg["expname"] = f"spect_emission_{tag}"
 
-patched = []
-cfg["outdir"] = run_out; patched.append("outdir")
-
-for p in [
-    ("training","outdir"),
-    ("logging","outdir"),
-    ("trainer","outdir"),
-    ("experiment","outdir"),
-    ("paths","outdir"),
-]:
+patched=[]
+cfg["outdir"]=run_out; patched.append("outdir")
+for p in [("training","outdir"),("logging","outdir"),("trainer","outdir"),("experiment","outdir"),("paths","outdir")]:
     if set_if_path(cfg, list(p), run_out):
         patched.append(".".join(p))
 
@@ -102,63 +107,45 @@ os.makedirs(os.path.dirname(run_cfg), exist_ok=True)
 with open(run_cfg, "w") as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
 
-print(f"[sweep] wrote {run_cfg}")
-print(f"[sweep] expname = {cfg.get('expname')}")
-print(f"[sweep] outdir  = {run_out}")
-print(f"[sweep] patched keys: {patched}")
+print("[sweep] wrote", run_cfg)
+print("[sweep] patched:", patched)
+print("[sweep] hybrid.proj_loss_weight =", cfg["hybrid"]["proj_loss_weight"])
 PY
-
-  # ---- TRAIN ----
-  echo ""
-  echo "[sweep] TRAIN (live log -> slurm + ${TRAIN_LOG})"
-  echo ""
 
   set -x
   ( cd "${ROOT}" && stdbuf -oL -eL srun --export=ALL,PYTHONPATH="${PYTHONPATH}" ${PYTHON_BIN} -u "${TRAIN_PY}" \
       --config "${RUN_CFG}" \
       --hybrid \
-      --seed 0 \
-      --max-steps 8000 \
-      --log-every 200 \
-      --save-every 500 \
-      --proj-target-source counts \
-      --poisson-rate-mode identity \
-      --proj-loss-type poisson \
+      --seed "${SEED}" \
+      --max-steps "${MAX_STEPS}" \
+      --log-every "${LOG_EVERY}" \
+      --save-every "${SAVE_EVERY}" \
+      --proj-target-source "${PROJ_TARGET_SOURCE}" \
+      --poisson-rate-mode "${POISSON_RATE_MODE}" \
+      --proj-loss-type "${PROJ_LOSS_TYPE}" \
       --proj-loss-weight "${W}" \
-      --proj-warmup-steps 150 \
-      --proj-ramp-steps 1000 \
-      --act-loss-weight 3.0 \
-      --act-pos-fraction 0.05 \
-      --act-pos-weight 10.0 \
-      --act-sparsity-weight 5e-4 \
-      --act-tv-weight 1e-6 \
-      --act-samples 16384 \
-      --ct-loss-weight 1e-4 \
+      --proj-warmup-steps "${PROJ_WARMUP_STEPS}" \
+      --proj-ramp-steps "${PROJ_RAMP_STEPS}" \
+      --act-loss-weight "${ACT_LOSS_WEIGHT}" \
+      --act-pos-fraction "${ACT_POS_FRACTION}" \
+      --act-pos-weight "${ACT_POS_WEIGHT}" \
+      --act-sparsity-weight "${ACT_SPARSITY_WEIGHT}" \
+      --act-tv-weight "${ACT_TV_WEIGHT}" \
+      --act-samples "${ACT_SAMPLES}" \
+      --ct-loss-weight "${CT_LOSS_WEIGHT}" \
       --final-act-compare \
     |& tee "${TRAIN_LOG}" )
   set +x
 
-  # ---- HARD GUARD: must write into sweep outdir ----
   if grep -q "Output-Ordner: ${RUN_OUT}" "${TRAIN_LOG}"; then
     echo "[guard] TRAIN wrote into sweep outdir ✅"
   else
-    echo "[guard][FATAL] TRAIN wrote to WRONG outdir. Found:"
+    echo "[guard][FATAL] WRONG outdir"
     grep -m 1 "Output-Ordner:" "${TRAIN_LOG}" || true
-    echo "Aborting to prevent baseline overwrite."
     exit 3
   fi
 
-  # ---- finished marker for downstream postproc jobs ----
-  if [ -f "${FINAL_CKPT}" ]; then
-    echo "[sweep] finished ${TAG} ✅  (${FINAL_CKPT})"
-  else
-    echo "[sweep][WARN] ${TAG} ended but final ckpt missing: ${FINAL_CKPT}"
-  fi
-
-  echo ""
-  echo "Training finished for ${TAG}"
-  echo "NOTE: postprocessing is decoupled (submit separately)."
-  echo ""
+  [ -f "${FINAL_CKPT}" ] && echo "[sweep] finished ${TAG} ✅" || echo "[sweep][WARN] final ckpt missing"
 done
 
 echo "SWEEP FINISHED (training only)"

@@ -93,6 +93,8 @@ METRICS_CSV_HEADER = [
     "proj_domain",
     "proj_is_normalized",
     "proj_norm_factor",
+    "calibration_scale",
+    "calibrate_scale_enabled",
 ]
 
 FG_THRESHOLD = 1e-6
@@ -188,6 +190,11 @@ def parse_args():
         "--save-proj-png",
         action="store_true",
         help="save pred/gt projection PNG previews in postproc/<phantom>/plots",
+    )
+    parser.add_argument(
+        "--calibrate-scale",
+        action="store_true",
+        help="apply per-phantom joint AP/PA least-squares scale before metrics",
     )
     parser.add_argument("--render-projections", action="store_true", help="render AP/PA projections from volumes")
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu", help="torch device")
@@ -726,6 +733,19 @@ def _compute_projection_scale_factors(
     return alpha_sum, alpha_ls
 
 
+def _compute_joint_projection_ls_scale(
+    pred_ap: np.ndarray,
+    pred_pa: np.ndarray,
+    gt_ap: np.ndarray,
+    gt_pa: np.ndarray,
+) -> float:
+    # Joint AP+PA least-squares scalar:
+    # s = ( <gt_ap,pred_ap> + <gt_pa,pred_pa> ) / ( <pred_ap,pred_ap> + <pred_pa,pred_pa> )
+    denom = float(np.nansum(pred_ap * pred_ap)) + float(np.nansum(pred_pa * pred_pa))
+    numer = float(np.nansum(gt_ap * pred_ap)) + float(np.nansum(gt_pa * pred_pa))
+    return numer / denom if denom > 0 else float("nan")
+
+
 def _log_projection_stats(
     phantom_id: str,
     pred_ap: np.ndarray,
@@ -1203,6 +1223,21 @@ def run_postprocessing(args):
             half_extent = ((size - 1) / 2.0) * spacing_gt[axis]
             phys_extent[f"axis{axis}"] = [-half_extent, half_extent]
         roi_shape = gt_shape
+        ct_path = Path(entry["ct_path"]) if entry.get("ct_path") else None
+        meta = _load_meta_simple(act_path)
+        kernel_default = Path("Data_Processing/LEAP_Kernel.mat")
+        projector_config = _build_projector_config(meta, args, spacing_gt, kernel_default)
+        proj_domain_requested = args.proj_domain
+        domain_loaded, gt_ap_counts, gt_pa_counts = _load_gt_projections(
+            entry,
+            counts_keys_ap,
+            counts_keys_pa,
+            norm_keys_ap,
+            norm_keys_pa,
+            pid,
+            proj_domain_requested,
+        )
+        proj_domain_loaded = domain_loaded
 
         with timer.block("load_pred"):
             pred_path = pred_paths.get(pid)
@@ -1216,6 +1251,33 @@ def run_postprocessing(args):
                 fast_warning_logged = True
             pred_gt_full = resample_pred_to_gt(pred_act, gt_shape, args.device)
             pred_roi = pred_gt_full[slices]
+        calibration_scale = 1.0
+        if args.calibrate_scale:
+            if ct_path is None or not ct_path.exists():
+                raise FileNotFoundError(f"--calibrate-scale requires ct_path for {pid}")
+            if projector_config is None:
+                raise RuntimeError(f"--calibrate-scale requires valid projector configuration for {pid}")
+            ct_vol_cal = load_array(ct_path).astype(np.float32)
+            pred_proj_for_cal = project_activity(pred_roi, ct_vol_cal, spacing_gt, projector_config)
+            pred_ap_cal = (
+                pred_proj_for_cal["ap_counts"] if proj_domain_loaded == "counts" else pred_proj_for_cal["ap_norm"]
+            )
+            pred_pa_cal = (
+                pred_proj_for_cal["pa_counts"] if proj_domain_loaded == "counts" else pred_proj_for_cal["pa_norm"]
+            )
+            calibration_scale = _compute_joint_projection_ls_scale(
+                pred_ap_cal,
+                pred_pa_cal,
+                gt_ap_counts,
+                gt_pa_counts,
+            )
+            if not np.isfinite(calibration_scale):
+                raise ValueError(f"invalid calibration scale for {pid}: {calibration_scale}")
+            scale32 = np.float32(calibration_scale)
+            pred_act = (pred_act * scale32).astype(np.float32, copy=False)
+            pred_gt_full = (pred_gt_full * scale32).astype(np.float32, copy=False)
+            pred_roi = (pred_roi * scale32).astype(np.float32, copy=False)
+            _LOG.info("[%s] calibration scale=%.5f", pid, calibration_scale)
         gt_roi = gt_act[slices]
         V_gt = spacing_gt[0] * spacing_gt[1] * spacing_gt[2]
         A_gt_vol = float(gt_roi.sum()) * V_gt
@@ -1358,39 +1420,27 @@ def run_postprocessing(args):
                 )
 
         with timer.block("projections"):
-            proj_domain = args.proj_domain
+            proj_domain = proj_domain_loaded
             proj_metrics: dict[str, float] | None = None
             proj_status = "missing"
             proj_norm_factor = None
             pred_save_ap = None
             pred_save_pa = None
-            gt_save_ap = None
-            gt_save_pa = None
-            ct_path = Path(entry["ct_path"]) if entry.get("ct_path") else None
-            meta = _load_meta_simple(act_path)
-            kernel_default = Path("Data_Processing/LEAP_Kernel.mat")
-            projector_config = _build_projector_config(meta, args, spacing_gt, kernel_default)
-
-            domain_loaded, gt_ap_counts, gt_pa_counts = _load_gt_projections(
-                entry,
-                counts_keys_ap,
-                counts_keys_pa,
-                norm_keys_ap,
-                norm_keys_pa,
-                pid,
-                proj_domain,
-            )
-            proj_domain = domain_loaded
-            proj_is_normalized = proj_domain == "normalized"
             gt_save_ap = gt_ap_counts
             gt_save_pa = gt_pa_counts
+            proj_is_normalized = proj_domain == "normalized"
 
-            if args.render_projections and ct_path and ct_path.exists() and projector_config is not None:
+            should_render_projections = args.render_projections or args.calibrate_scale
+            if should_render_projections and ct_path and ct_path.exists() and projector_config is not None:
                 try:
                     ct_vol = load_array(ct_path).astype(np.float32)
                     pred_proj = project_activity(pred_roi, ct_vol, spacing_gt, projector_config)
                 except Exception as exc:
                     _LOG.exception("failed to render projections for %s: %s", pid, exc)
+                    if args.calibrate_scale:
+                        raise RuntimeError(
+                            f"--calibrate-scale failed while rendering scaled projections for {pid}"
+                        ) from exc
                     proj_status = "failed"
                 else:
                     pred_save_ap = (
@@ -1413,8 +1463,18 @@ def run_postprocessing(args):
                         proj_norm_factor = pred_proj.get("norm_scale")
 
             if proj_metrics is None:
+                if args.calibrate_scale:
+                    raise RuntimeError(
+                        f"--calibrate-scale requires rendered scaled projections for metrics, but rendering was unavailable for {pid}"
+                    )
                 fallback_result = compute_projection_metrics_with_fallback(
-                    args, run_dir, out_dir, pid, gt_save_ap, gt_save_pa, proj_domain
+                    args,
+                    run_dir,
+                    out_dir,
+                    pid,
+                    gt_save_ap,
+                    gt_save_pa,
+                    proj_domain,
                 )
                 pred_save_ap = pred_save_ap or fallback_result.pop("pred_ap", None)
                 pred_save_pa = pred_save_pa or fallback_result.pop("pred_pa", None)
@@ -1544,6 +1604,8 @@ def run_postprocessing(args):
                 "proj_domain": proj_domain,
                 "proj_is_normalized": proj_is_normalized,
                 "proj_norm_factor": proj_norm_factor,
+                "calibration_scale": calibration_scale,
+                "calibrate_scale_enabled": bool(args.calibrate_scale),
             },
             "assumptions": assumptions,
         }
@@ -1599,6 +1661,8 @@ def run_postprocessing(args):
                 "proj_domain": proj_domain,
                 "proj_is_normalized": proj_is_normalized,
                 "proj_norm_factor": proj_norm_factor,
+                "calibration_scale": calibration_scale,
+                "calibrate_scale_enabled": bool(args.calibrate_scale),
             },
         )
         _LOG.info(

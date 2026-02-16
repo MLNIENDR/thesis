@@ -656,6 +656,17 @@ def parse_args():
         help="Logge Cosine-Similarity/L2-Abstand der z_enc_proj der Test-Patients in save_test_volume_slices.",
     )
     parser.add_argument(
+        "--debug-latent-stats",
+        action="store_true",
+        help="Logge z-Conditioning-Statistiken (Normen, Cosines, Gradnormen) waehrend Training.",
+    )
+    parser.add_argument(
+        "--debug-latent-stats-every",
+        type=int,
+        default=50,
+        help="Intervall fuer --debug-latent-stats (in Steps).",
+    )
+    parser.add_argument(
         "--grad-clip-enabled",
         action="store_true",
         default=True,
@@ -1152,6 +1163,8 @@ def save_img_abs(
     allow_arr_max: bool = True,
     cbar_label="counts",
     cmap="viridis",
+    header_text: Optional[str] = None,
+    include_data_stats: bool = True,
 ):
     """Save a counts-based preview image (no normalization) with colorbar."""
     import matplotlib.pyplot as plt
@@ -1178,29 +1191,33 @@ def save_img_abs(
     fig, ax = plt.subplots(figsize=(6, 4))
     im = ax.imshow(data, origin="upper", cmap=cmap, vmin=vmin, vmax=candidate)
     cbar = fig.colorbar(im, ax=ax, label=cbar_label)
-    title_parts = []
-    if title:
-        title_parts.append(str(title))
-    if view:
-        title_parts.append(view)
-    if step is not None:
-        title_parts.append(f"step {step}")
-    if patient_id:
-        title_parts.append(f"id {patient_id}")
-    minv = float(np.nanmin(data)) if finite.any() else 0.0
-    maxv = float(np.nanmax(data)) if finite.any() else 0.0
-    sumv = float(np.nansum(data))
-    title_parts.append(f"min={minv:.2e}")
-    title_parts.append(f"max={maxv:.2e}")
-    title_parts.append(f"sum={sumv:.2e}")
-    title_parts.append(f"vmax={candidate:.2e}")
-    title_text = " | ".join(title_parts)
-    max_chars = max(20, int(fig.get_size_inches()[0] * 10))
-    title_wrapped = textwrap.fill(title_text, width=max_chars)
-    ax.set_title(title_wrapped, loc="left")
+    if header_text is not None:
+        ax.set_title(str(header_text), loc="center", pad=10)
+    else:
+        title_parts = []
+        if title:
+            title_parts.append(str(title))
+        if view:
+            title_parts.append(view)
+        if step is not None:
+            title_parts.append(f"step {step}")
+        if patient_id:
+            title_parts.append(f"id {patient_id}")
+        if include_data_stats:
+            minv = float(np.nanmin(data)) if finite.any() else 0.0
+            maxv = float(np.nanmax(data)) if finite.any() else 0.0
+            sumv = float(np.nansum(data))
+            title_parts.append(f"min={minv:.2e}")
+            title_parts.append(f"max={maxv:.2e}")
+            title_parts.append(f"sum={sumv:.2e}")
+            title_parts.append(f"vmax={candidate:.2e}")
+        title_text = " | ".join(title_parts)
+        max_chars = max(20, int(fig.get_size_inches()[0] * 10))
+        title_wrapped = textwrap.fill(title_text, width=max_chars)
+        ax.set_title(title_wrapped, loc="left", pad=10)
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    plt.tight_layout()
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
     fig.savefig(path, dpi=150)
     plt.close(fig)
 
@@ -1255,7 +1272,7 @@ def log_projection_quantiles_scaled(
 def export_activity_volume(
     generator,
     z_latent,
-    out_path: Path,
+    out_path: Optional[Path],
     res: int,
     device: torch.device,
     radius_xyz: Optional[Tuple[float, float, float]] = None,
@@ -1304,8 +1321,9 @@ def export_activity_volume(
             pred = pred.view(z_coords.numel(), res, res).detach().cpu().numpy().astype(np.float32)
             vol[z_start:z_end, :, :] = pred
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(out_path, vol)
+    if out_path is not None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(out_path, vol)
     if ACT_DEBUG_WORLD_COORDS and not ACT_DEBUG_WORLD_REPORTED:
         coords_list = [
             torch.tensor(world, device=device, dtype=torch.float32) for world, _ in ACT_DEBUG_WORLD_COORDS
@@ -1367,6 +1385,9 @@ def save_test_volume_slices(
     hybrid_enabled = bool(getattr(args, "hybrid", False))
     debug_cos_latents: list[torch.Tensor] = []
     debug_cos_patients: list[str] = []
+    latent_diag_rows: list[dict] = []
+    z_enc_vectors: list[torch.Tensor] = []
+    z_enc_patients: list[str] = []
 
     def _tensor_stats_and_sig(tensor):
         if tensor is None or not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
@@ -1377,41 +1398,31 @@ def save_test_volume_slices(
         sig = hashlib.sha1(arr.tobytes()).hexdigest()
         return stats, sig
 
-    def _build_test_latent(batch: dict) -> torch.Tensor:
+    def _build_test_latent(batch: dict) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         if not (hybrid_enabled and encoder is not None):
             raise RuntimeError("Hybrid encoder required for test slices.")
-        ap = batch.get("ap")
-        pa = batch.get("pa")
-        if ap is None or pa is None:
-            raise RuntimeError("Test batch missing AP/PA to build latent.")
-        ap = ap.to(device, non_blocking=True).float()
-        pa = pa.to(device, non_blocking=True).float()
-        ap_enc_input = batch.get("proj_input_ap", ap)
-        pa_enc_input = batch.get("proj_input_pa", pa)
-        if ap_enc_input is not ap:
-            ap_enc_input = ap_enc_input.to(device, non_blocking=True).float()
-        if pa_enc_input is not pa:
-            pa_enc_input = pa_enc_input.to(device, non_blocking=True).float()
-        with torch.no_grad():
-            proj_scale_enc = compute_proj_scale(ap, pa, args.proj_scale_source, batch.get("meta"))
-            proj_scale_enc = torch.clamp(proj_scale_enc, min=1e-6)
-            ct_vol = batch.get("ct")
-            if ct_vol is not None and ct_vol.numel() > 0:
-                ct_vol = ct_vol.to(device, non_blocking=True).float()
-            else:
-                ct_vol = None
-            enc_input = build_encoder_input(
-                ap_enc_input,
-                pa_enc_input,
-                ct_vol,
-                proj_scale_enc,
-                args.encoder_proj_transform,
-                args.encoder_use_ct,
-            )
-            z_enc = encoder(enc_input)
-            z_enc_proj = z_fuser(z_enc) if z_fuser is not None else z_enc
-            latent = z_enc_proj
-        return latent.detach()
+        return build_hybrid_latent_from_batch(
+            args=args,
+            batch=batch,
+            device=device,
+            z_latent_base=z_latent_base,
+            encoder=encoder,
+            z_fuser=z_fuser,
+            z_enc_alpha=z_enc_alpha,
+        )
+
+    def _vec_stats(t: Optional[torch.Tensor]) -> Optional[dict]:
+        if t is None or not isinstance(t, torch.Tensor) or t.numel() == 0:
+            return None
+        flat = t.detach().reshape(t.shape[0], -1).float()
+        norms = flat.norm(dim=1)
+        return {
+            "shape": list(flat.shape),
+            "norm_mean": float(norms.mean().item()),
+            "norm_std": float(norms.std().item()) if norms.numel() > 1 else 0.0,
+            "val_mean": float(flat.mean().item()),
+            "val_std": float(flat.std().item()),
+        }
 
     patient_iter = iter(test_loader)
     try:
@@ -1449,12 +1460,25 @@ def save_test_volume_slices(
                 flush=True,
             )
             if hybrid_enabled and encoder is not None:
-                z_latent_batch = _build_test_latent(batch)
+                z_latent_batch, z_enc_batch, z_enc_proj_batch = _build_test_latent(batch)
             else:
                 z_latent_batch = z_latent_base.detach()
+                z_enc_batch = None
+                z_enc_proj_batch = None
             if args.debug_z_cosine and hybrid_enabled and encoder is not None:
                 debug_cos_patients.append(patient_id)
                 debug_cos_latents.append(z_latent_batch.detach().clone())
+            if z_enc_batch is not None and z_enc_batch.numel() > 0:
+                z_enc_patients.append(patient_id)
+                z_enc_vectors.append(z_enc_batch[0].detach().reshape(-1).cpu())
+            latent_diag_rows.append(
+                {
+                    "patient_id": patient_id,
+                    "z_enc": _vec_stats(z_enc_batch),
+                    "z_enc_proj": _vec_stats(z_enc_proj_batch),
+                    "z_latent": _vec_stats(z_latent_batch),
+                }
+            )
             z_arr = z_latent_batch.detach().cpu().numpy().astype(np.float32)
             z_stats = (
                 (float(z_arr.min()), float(z_arr.mean()), float(z_arr.max()))
@@ -1570,6 +1594,33 @@ def save_test_volume_slices(
                     f"[debug-z][cosine] patient={debug_cos_patients[0]} only one patient -> no cross-similarity",
                     flush=True,
                 )
+    if latent_diag_rows:
+        diag_payload: dict[str, Any] = {"per_patient": latent_diag_rows}
+        if len(z_enc_vectors) > 1:
+            z_stack = torch.stack(z_enc_vectors, dim=0)
+            z_norm = z_stack / (z_stack.norm(dim=1, keepdim=True) + 1e-8)
+            cos_m = (z_norm @ z_norm.t()).cpu()
+            pair_rows = []
+            for i in range(cos_m.shape[0]):
+                for j in range(i + 1, cos_m.shape[1]):
+                    pair_rows.append(
+                        {
+                            "id_a": z_enc_patients[i],
+                            "id_b": z_enc_patients[j],
+                            "cosine": float(cos_m[i, j].item()),
+                        }
+                    )
+            if pair_rows:
+                cos_vals = [p["cosine"] for p in pair_rows]
+                print(
+                    f"[test][slices][z-enc] pairwise cosine min/mean/max="
+                    f"{min(cos_vals):.3e}/{(sum(cos_vals)/len(cos_vals)):.3e}/{max(cos_vals):.3e}",
+                    flush=True,
+                )
+            diag_payload["pairwise_z_enc_cosine"] = pair_rows
+        diag_path = slice_root / "latent_stats.json"
+        diag_path.write_text(json.dumps(diag_payload, indent=2))
+        print(f"[test][slices] wrote latent diagnostics to {diag_path}", flush=True)
     if not saved_info:
         return
     meta_path = slice_root / "slices_meta.json"
@@ -1898,6 +1949,55 @@ def build_encoder_input(
     return torch.cat(inputs, dim=1)
 
 
+def build_hybrid_latent_from_batch(
+    args,
+    batch: dict,
+    device: torch.device,
+    z_latent_base: torch.Tensor,
+    encoder: Optional[nn.Module],
+    z_fuser: Optional[nn.Module],
+    z_enc_alpha: float,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Build per-batch hybrid latent: z = z_base + alpha * z_enc_proj."""
+    if encoder is None:
+        return z_latent_base.detach(), None, None
+    ap = batch.get("ap")
+    pa = batch.get("pa")
+    if ap is None or pa is None:
+        raise RuntimeError("Batch missing AP/PA for hybrid latent build.")
+    ap = ap.to(device, non_blocking=True).float()
+    pa = pa.to(device, non_blocking=True).float()
+    ap_enc_input = batch.get("proj_input_ap", ap)
+    pa_enc_input = batch.get("proj_input_pa", pa)
+    if ap_enc_input is not ap:
+        ap_enc_input = ap_enc_input.to(device, non_blocking=True).float()
+    if pa_enc_input is not pa:
+        pa_enc_input = pa_enc_input.to(device, non_blocking=True).float()
+    ct_vol = batch.get("ct")
+    if ct_vol is not None and ct_vol.numel() > 0:
+        ct_vol = ct_vol.to(device, non_blocking=True).float()
+    else:
+        ct_vol = None
+    with torch.no_grad():
+        proj_scale_enc = compute_proj_scale(ap, pa, args.proj_scale_source, batch.get("meta"))
+        proj_scale_enc = torch.clamp(proj_scale_enc, min=1e-6)
+        enc_input = build_encoder_input(
+            ap_enc_input,
+            pa_enc_input,
+            ct_vol,
+            proj_scale_enc,
+            args.encoder_proj_transform,
+            args.encoder_use_ct,
+        )
+        z_enc = encoder(enc_input)
+        z_enc_proj = z_fuser(z_enc) if z_fuser is not None else z_enc
+        z_base = z_latent_base
+        if z_base.shape[0] != z_enc_proj.shape[0]:
+            z_base = z_base.expand(z_enc_proj.shape[0], -1)
+        z_latent = z_base + (float(z_enc_alpha) * z_enc_proj)
+    return z_latent.detach(), z_enc.detach(), z_enc_proj.detach()
+
+
 def build_hwfr_from_config(data_cfg: dict) -> list:
     """Fallback HWFR fuer Smoke-Tests ohne Datenzugriff."""
     imsize = data_cfg.get("imsize") or data_cfg.get("H") or 128
@@ -2206,6 +2306,60 @@ def module_grad_mean_abs(module: Optional[nn.Module]) -> float:
     return float(torch.stack(vals).mean().item())
 
 
+def _log_latent_conditioning_stats(
+    step: int,
+    z_base: torch.Tensor,
+    z_enc: Optional[torch.Tensor],
+    z_enc_proj: Optional[torch.Tensor],
+    z_latent: torch.Tensor,
+    alpha: float,
+) -> None:
+    """Logs latent-mix diagnostics for hybrid conditioning."""
+    if z_enc is None or z_enc_proj is None:
+        return
+    with torch.no_grad():
+        eps = 1e-8
+        delta = z_latent - z_base
+        alpha_e = float(alpha) * z_enc_proj
+
+        def _ms(v: torch.Tensor) -> tuple[float, float]:
+            if v.numel() == 0:
+                return float("nan"), float("nan")
+            return float(v.mean().item()), float(v.std(unbiased=False).item())
+
+        n_z_enc = z_enc.norm(dim=1)
+        n_e = z_enc_proj.norm(dim=1)
+        n_alpha_e = alpha_e.norm(dim=1)
+        n_delta = delta.norm(dim=1)
+        n_delta_enc = (z_latent - z_enc).norm(dim=1)
+
+        cos_enc_final = F.cosine_similarity(z_enc, z_latent, dim=1, eps=eps)
+        cos_proj_final = F.cosine_similarity(z_enc_proj, z_latent, dim=1, eps=eps)
+        ratio_alpha_e = n_alpha_e / (n_z_enc + eps)
+
+        m_nz_enc, s_nz_enc = _ms(n_z_enc)
+        m_ne, s_ne = _ms(n_e)
+        m_nae, s_nae = _ms(n_alpha_e)
+        m_nd, s_nd = _ms(n_delta)
+        m_nde, s_nde = _ms(n_delta_enc)
+        m_c1, s_c1 = _ms(cos_enc_final)
+        m_c2, s_c2 = _ms(cos_proj_final)
+        m_r, s_r = _ms(ratio_alpha_e)
+
+        print(
+            f"[latent][step {step:05d}] "
+            f"||z_enc||(m/std)={m_nz_enc:.3e}/{s_nz_enc:.3e} "
+            f"||E||(m/std)={m_ne:.3e}/{s_ne:.3e} "
+            f"||alphaE||(m/std)={m_nae:.3e}/{s_nae:.3e} "
+            f"||z_final-z_base||(m/std)={m_nd:.3e}/{s_nd:.3e} "
+            f"||z_final-z_enc||(m/std)={m_nde:.3e}/{s_nde:.3e} "
+            f"cos(z_enc,z_final)={m_c1:.3e}±{s_c1:.3e} "
+            f"cos(E,z_final)={m_c2:.3e}±{s_c2:.3e} "
+            f"ratio||alphaE||/||z_enc||={m_r:.3e}±{s_r:.3e}",
+            flush=True,
+        )
+
+
 def safe_git_rev() -> str:
     """Versucht den aktuellen Git-Commit (kurz) zu lesen, fällt andernfalls auf 'unknown' zurück."""
     try:
@@ -2262,7 +2416,8 @@ def log_effective_config(outdir: Path, config: dict, args):
             f"| encoder_proj_transform={args.encoder_proj_transform} "
             f"| proj_scale_source={args.proj_scale_source} | act_norm_source={args.act_norm_source} "
             f"| act_norm_value={args.act_norm_value} | encoder_use_ct={args.encoder_use_ct} "
-            f"| z_enc_alpha={args.z_enc_alpha}",
+            f"| z_enc_alpha={args.z_enc_alpha} | debug_latent_stats={args.debug_latent_stats} "
+            f"| debug_latent_stats_every={args.debug_latent_stats_every}",
             flush=True,
         )
 
@@ -2400,6 +2555,20 @@ def maybe_render_preview(
     pa_np = proj_pa[0].reshape(H, W).detach().cpu().numpy()
     out_dir = outdir / "preview"
     out_dir.mkdir(parents=True, exist_ok=True)
+    def _format_phantom_label(pid: Optional[str]) -> str:
+        if pid is None:
+            return "Phantom ID n/a"
+        pid_s = str(pid)
+        m = re.search(r"(\d+)", pid_s)
+        if m is None:
+            return f"Phantom ID {pid_s}"
+        try:
+            return f"Phantom ID {int(m.group(1))}"
+        except Exception:
+            return f"Phantom ID {m.group(1)}"
+
+    phantom_label = _format_phantom_label(patient_id)
+
     def _proj_to_img(tensor: Optional[torch.Tensor]) -> Optional[np.ndarray]:
         if tensor is None:
             return None
@@ -2447,6 +2616,8 @@ def maybe_render_preview(
             vmax=vmax,
             allow_arr_max=False,
             cbar_label="counts",
+            header_text=f"pred | {view} | step {step} | {phantom_label}",
+            include_data_stats=False,
         )
         if target_img is None or target_img.shape != pred_img.shape:
             return
@@ -2464,6 +2635,8 @@ def maybe_render_preview(
             vmax=diff_vmax,
             cbar_label="counts",
             cmap="RdBu_r",
+            header_text=f"pred-target | {view} diff | step {step} | {phantom_label}",
+            include_data_stats=False,
         )
 
     _save_view(ap_np, ap_target_img, "AP")
@@ -3972,7 +4145,7 @@ def save_final_act_compare_volume_slicing(
     args,
     act_vol: Optional[torch.Tensor],
     outdir: Path,
-    pred_path: Path,
+    pred_path: Optional[Path],
     pred_vol_np: Optional[np.ndarray] = None,
     out_path_override: Optional[Path] = None,
     grid_radius: Optional[float] = None,
@@ -3987,7 +4160,7 @@ def save_final_act_compare_volume_slicing(
         print("[final-act-compare] act_vol fehlt; skippe Activity-Compare.", flush=True)
         return
 
-    if pred_vol_np is None and (not pred_path.exists()):
+    if pred_vol_np is None and (pred_path is None or (not pred_path.exists())):
         print(
             f"[final-act-compare][WARN] Pred-Datei fehlt: {pred_path}; skippe Activity-Compare.",
             flush=True,
@@ -4024,6 +4197,9 @@ def save_final_act_compare_volume_slicing(
     if pred_vol_np is not None:
         pred_np = np.asarray(pred_vol_np, dtype=np.float32)
     else:
+        if pred_path is None:
+            print("[final-act-compare][WARN] pred_path fehlt; skippe Activity-Compare.", flush=True)
+            return
         try:
             pred_np = np.load(pred_path).astype(np.float32, copy=False)
         except Exception as exc:
@@ -4553,6 +4729,7 @@ def evaluate_val_loader(
     val_loader,
     generator,
     z_latent,
+    z_latent_base,
     rays_cache,
     subsets,
     device,
@@ -4566,39 +4743,63 @@ def evaluate_val_loader(
     W,
     gain,
     log_proj_metrics_physical,
+    encoder: Optional[nn.Module] = None,
+    z_fuser: Optional[nn.Module] = None,
+    z_enc_alpha: float = 0.0,
 ):
     if val_loader is None or len(val_loader.dataset) == 0:
         print("[eval][warn] val_loader empty; skipping evaluation.", flush=True)
         return None
 
     proj_counts_active = bool(getattr(args, "hybrid", False)) and (args.proj_target_source == "counts")
+    prev_encoder_training = encoder.training if encoder is not None else None
+    if encoder is not None:
+        encoder.eval()
     val_metrics = []
-    for batch in val_loader:
-        prepared = _prepare_val_batch_for_eval(batch, generator, device, args)
-        batch_stats = evaluate_pixel_subsets(
-            generator,
-            z_latent,
-            rays_cache,
-            subsets,
-            prepared["ap_flat_proc"],
-            prepared["pa_flat_proc"],
-            rays_per_eval,
-            bg_weight,
-            weight_threshold,
-            pa_xflip,
-            ct_context=prepared["ct_context"],
-            W=W,
-            scale_ap=prepared["scale_ap"] if log_proj_metrics_physical else None,
-            scale_pa=prepared["scale_pa"] if log_proj_metrics_physical else None,
-            loss_fn=loss_fn,
-            poisson_rate_mode=args.poisson_rate_mode,
-            poisson_rate_floor=args.poisson_rate_floor,
-            poisson_rate_floor_mode=args.poisson_rate_floor_mode,
-            proj_loss_active=proj_loss_active,
-            pred_scale=1.0,
-            gain=gain,
-        )
-        val_metrics.append(batch_stats)
+    try:
+        for batch in val_loader:
+            prepared = _prepare_val_batch_for_eval(batch, generator, device, args)
+            z_eval = z_latent
+            if bool(getattr(args, "hybrid", False)) and encoder is not None and z_latent_base is not None:
+                z_eval, _, _ = build_hybrid_latent_from_batch(
+                    args=args,
+                    batch=batch,
+                    device=device,
+                    z_latent_base=z_latent_base,
+                    encoder=encoder,
+                    z_fuser=z_fuser,
+                    z_enc_alpha=z_enc_alpha,
+                )
+            batch_stats = evaluate_pixel_subsets(
+                generator,
+                z_eval,
+                rays_cache,
+                subsets,
+                prepared["ap_flat_proc"],
+                prepared["pa_flat_proc"],
+                rays_per_eval,
+                bg_weight,
+                weight_threshold,
+                pa_xflip,
+                ct_context=prepared["ct_context"],
+                W=W,
+                scale_ap=prepared["scale_ap"] if log_proj_metrics_physical else None,
+                scale_pa=prepared["scale_pa"] if log_proj_metrics_physical else None,
+                loss_fn=loss_fn,
+                poisson_rate_mode=args.poisson_rate_mode,
+                poisson_rate_floor=args.poisson_rate_floor,
+                poisson_rate_floor_mode=args.poisson_rate_floor_mode,
+                proj_loss_active=proj_loss_active,
+                pred_scale=1.0,
+                gain=gain,
+            )
+            val_metrics.append(batch_stats)
+    finally:
+        if encoder is not None and prev_encoder_training is not None:
+            if prev_encoder_training:
+                encoder.train()
+            else:
+                encoder.eval()
 
     if not val_metrics:
         print("[eval][warn] val_loader produced no batches; skipping evaluation.", flush=True)
@@ -5914,7 +6115,7 @@ def train():
                 z_latent = z_base + (z_enc_alpha * z_enc_proj)
 
             # (2) Instrumentierung: z_enc/z_latent Graph-Check (step 1)
-            if args.debug_enc and step == 1:
+            if args.debug_enc and step == 1 and z_enc is not None:
                 print(f"[DEBUG][ENC_FWD] z_enc.requires_grad={z_enc.requires_grad}, grad_fn is not None: {z_enc.grad_fn is not None}", flush=True)
                 print(f"[DEBUG][ENC_FWD] z_latent.requires_grad={z_latent.requires_grad}, grad_fn is not None: {z_latent.grad_fn is not None}", flush=True)
                 s = (z_latent * torch.randn_like(z_latent)).sum()
@@ -5922,9 +6123,22 @@ def train():
                 print(f"[DEBUG][ENC_FWD] grad(z_latent, z_enc) is None: {g_z_enc is None}", flush=True)
                 if g_z_enc is not None:
                     print(f"[DEBUG][ENC_FWD] grad(z_latent, z_enc) norm: {g_z_enc.norm().item():.6e}", flush=True)
-            else:
-                z_latent = z_base
             last_z_latent = z_latent
+            latent_stats_every = max(1, int(args.debug_latent_stats_every))
+            should_log_latent_stats = (
+                bool(args.debug_latent_stats)
+                and hybrid_enabled
+                and (step == 1 or (step % latent_stats_every) == 0)
+            )
+            if should_log_latent_stats:
+                _log_latent_conditioning_stats(
+                    step=step,
+                    z_base=z_base,
+                    z_enc=z_enc,
+                    z_enc_proj=z_enc_proj,
+                    z_latent=z_latent,
+                    alpha=z_enc_alpha,
+                )
 
             # Phase A: ACT-only training.
             # Wenn args.act_loss_weight > 0 und alle projektionsrelevanten Gewichte effektiv 0 sind
@@ -7188,6 +7402,24 @@ def train():
                 pred_act_raw.retain_grad()
 
             scaler.scale(loss).backward()
+            if should_log_latent_stats:
+                dec_module = generator.render_kwargs_train.get("network_fn")
+                grad_dec = module_grad_norm(dec_module if isinstance(dec_module, nn.Module) else generator)
+                grad_enc = module_grad_norm(encoder)
+                grad_fuser = module_grad_norm(z_fuser)
+                grad_gain_head = module_grad_norm(gain_head)
+                grad_gain_param = (
+                    float(gain_param.grad.detach().norm().item())
+                    if (gain_param is not None and gain_param.grad is not None)
+                    else 0.0
+                )
+                print(
+                    f"[latent-grad][step {step:05d}] "
+                    f"decoder={grad_dec:.3e} encoder={grad_enc:.3e} "
+                    f"z_fuser={grad_fuser:.3e} gain_head={grad_gain_head:.3e} "
+                    f"gain_param={grad_gain_param:.3e}",
+                    flush=True,
+                )
 
             # (3) Instrumentierung: Gradienten-Check (step 1)
             if args.debug_enc and step == 1:
@@ -7524,6 +7756,7 @@ def train():
                             val_loader,
                             generator,
                             z_latent.detach(),
+                            z_latent_base.detach(),
                             rays_cache,
                             subsets,
                             device,
@@ -7537,6 +7770,9 @@ def train():
                             W,
                             gain_for_eval,
                             log_proj_metrics_physical,
+                            encoder=encoder,
+                            z_fuser=z_fuser,
+                            z_enc_alpha=z_enc_alpha,
                         )
                         if debug_eval_flow:
                             if val_stats is None:
@@ -7881,11 +8117,10 @@ def train():
             if bool(getattr(args, "final_act_compare", False)) and step >= 200 and (step % 200 == 0):
                 if act_vol is not None and act_vol.numel() > 0:
                     if pred_path_step is None:
-                        pred_path_step = outdir / f"activity_pred_step_{step:05d}.npy"
                         pred_vol_step = export_activity_volume(
                             generator,
                             z_latent.detach(),
-                            pred_path_step,
+                            None,
                             args.export_vol_res,
                             device,
                             log_world_range=args.debug_sanity_checks,
@@ -8081,6 +8316,7 @@ def train():
                     test_loader,
                     generator,
                     last_z_latent.detach(),
+                    z_latent_base.detach(),
                     rays_cache,
                     test_subsets,
                     device,
@@ -8094,6 +8330,9 @@ def train():
                     W,
                     None,
                     log_proj_metrics_physical,
+                    encoder=encoder,
+                    z_fuser=z_fuser,
+                    z_enc_alpha=z_enc_alpha,
                 )
             if prev_use_test_kwargs:
                 generator.eval()

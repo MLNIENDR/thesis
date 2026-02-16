@@ -95,9 +95,21 @@ def parse_sweep_param(tag: str) -> tuple[str, Optional[float]]:
     return raw, numeric
 
 
+def resolve_metrics_path(tag_dir: Path) -> Optional[Path]:
+    candidates = [
+        tag_dir / "results_spect" / "postproc_baseline_calib" / "metrics.csv",
+        tag_dir / "results_spect" / "postproc" / "metrics.csv",
+        tag_dir / "postproc" / "metrics.csv",
+    ]
+    for p in candidates:
+        if p.is_file():
+            return p
+    return None
+
+
 def collect_tag_metrics(tag_dir: Path) -> Optional[dict[str, float]]:
-    csv_path = tag_dir / "postproc" / "metrics.csv"
-    if not csv_path.is_file():
+    csv_path = resolve_metrics_path(tag_dir)
+    if csv_path is None:
         logging.warning("Missing metrics.csv in %s", tag_dir)
         return None
 
@@ -133,7 +145,7 @@ def collect_sweep_summary(
     sweep_root: Path, tag_prefix: str, tag_regex: str
 ) -> pd.DataFrame:
     rows = []
-    tag_dirs = [d for d in sorted(sweep_root.iterdir()) if d.is_dir()]
+    tag_dirs = [d for d in sorted(sweep_root.iterdir()) if d.is_dir() and (d / "results_spect").exists()]
     if tag_regex:
         matcher = re.compile(tag_regex)
         tag_dirs = [d for d in tag_dirs if matcher.search(d.name)]

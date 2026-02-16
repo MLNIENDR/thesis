@@ -1,4 +1,4 @@
-expname: spect_emission_actW_2.0
+expname: spect_emission_projW_0.03
 data:
   type: spect
   manifest: data/manifest_abs.csv
@@ -61,7 +61,7 @@ discriminator:
   ndf: 64
   hflip: false
 training:
-  outdir: /home/mnguest12/projects/thesis/pieNeRF/results_spect_sweep/actW_2.0/results_spect
+  outdir: /home/mnguest12/projects/thesis/pieNeRF/results_spect_sweep_projW/projW_0.03/results_spect
   model_file: model_spect.pt
   monitoring: tensorboard
   use_amp: false
@@ -78,7 +78,7 @@ training:
   mu_gate_width: 0.1
   tv3d_weight: 0.0
   tv3d_grid_size: 32
-  act_loss_weight: 2.0
+  act_loss_weight: 0.1
   act_samples: 16384
   act_pos_weight: 2.0
   act_pos_fraction: 0.5
@@ -110,4 +110,6 @@ training:
   save_every: 500
   backup_every: 0
   video_every: 0
-outdir: /home/mnguest12/projects/thesis/pieNeRF/results_spect_sweep/actW_2.0/results_spect
+outdir: /home/mnguest12/projects/thesis/pieNeRF/results_spect_sweep_projW/projW_0.03/results_spect
+hybrid:
+  proj_loss_weight: 0.03
