@@ -282,8 +282,6 @@ def build_activity_from_mask(mask_xyz: np.ndarray,
         "spleen":       (400.0, 1000.0),
         # Leber (moderater Hintergrund)
         "liver":        (200.0, 600.0),
-        # Dünndarm / intestinale Aufnahme
-        "small_intest": (150.0, 400.0),
     }
 
     act = np.zeros(mask_xyz.shape, dtype=np.float32)

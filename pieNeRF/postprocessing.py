@@ -1069,7 +1069,6 @@ ORGAN_LABEL_MAP = {
     1267: "spleen",
     1269: "kidney (right)",
     1270: "kidney (left)",
-    1384: "small intestine",
 }
 
 

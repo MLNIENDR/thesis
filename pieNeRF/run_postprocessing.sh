@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-SWEEP_ROOT="${SWEEP_ROOT:-/home/mnguest12/projects/thesis/pieNeRF/results_spect_sweep_projW}"
+SWEEP_ROOT="${SWEEP_ROOT:-/home/mnguest12/projects/thesis/pieNeRF/results_spect_sweep_ramp}"
 SWEEP_TAGS="${SWEEP_TAGS:-}"
 MANIFEST="/home/mnguest12/projects/thesis/pieNeRF/data/manifest_abs.csv"
 

@@ -186,6 +186,26 @@ In diesem Repository gibt es keine Datei mit diesem Namen; falls benötigt, müs
 - Previews/CSV/Checkpoints landen standardmäßig unter `results_spect/`.  
 - Debug: `--debug-attenuation-ray` loggt λ/μ/T für einen Beispielstrahl; `--debug-zero-var` speichert Tensors, falls Vorhersagen kollabieren.
 
+### Proj-Ramp Smoke-Check
+- Beispielstart:
+```bash
+python3 train_emission.py \
+  --config configs/spect.yaml \
+  --hybrid \
+  --max-steps 22050 \
+  --proj-warmup-steps 1500 \
+  --proj-ramp-steps 20000 \
+  --proj-weight-min 5e-4 \
+  --proj-loss-weight 5e-3 \
+  --log-every 100
+```
+- `proj-status` prüfen:
+  - Bei `step 1500`: `proj_weight_used=0.000e+00`, `proj_loss_active=False`, `ramp_t=0.0000`
+  - Bei `step 1600`: `proj_weight_used` strikt `> 5e-4` und `< 5e-3`, `ramp_t≈0.0050`
+  - Bei `step 21500` (`warmup+ramp`): `proj_weight_used≈5e-3`, `ramp_t=1.0000`
+- Optionaler Term-Grad-Debug: `--debug-grad-terms-every 100`
+- Optionales Decoder-only Clipping: `--clip-grad-decoder 1.0`
+
 ---
 
 ### Datenverarbeitung (Kurzreferenz)

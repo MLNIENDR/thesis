@@ -685,6 +685,18 @@ def parse_args():
         help="max_norm für grad clipping (nur aktiv wenn --grad-clip-enabled gesetzt).",
     )
     parser.add_argument(
+        "--clip-grad-decoder",
+        type=float,
+        default=0.0,
+        help="Optionales decoder-only grad clipping (0=aus).",
+    )
+    parser.add_argument(
+        "--debug-grad-terms-every",
+        type=int,
+        default=0,
+        help="Wenn >0: loggt getrennte Grad-Normen fuer loss_act/loss_proj alle N Steps.",
+    )
+    parser.add_argument(
         "--proj-weight-min",
         type=float,
         default=0.005,
@@ -1023,6 +1035,11 @@ def parse_args():
         "--debug-proj-stats",
         action="store_true",
         help="Einmalige AP/PA-Min/Max/p99.9-Statistiken direkt nach dem Laden loggen.",
+    )
+    parser.add_argument(
+        "--debug-proj-orientation",
+        action="store_true",
+        help="Speichere pro Preview ein JSON mit Orientierungs-Stats (shape/min/max/argmax/center-of-mass/hash) fuer AP/PA.",
     )
     parser.add_argument(
         "--log-proj-metrics-physical",
@@ -1894,6 +1911,33 @@ def _ratio_stats(pred: torch.Tensor, target: torch.Tensor) -> tuple[float, float
 
 
 _ENCODER_INPUT_STATS_LOGGED = False
+_ENCODER_PIPELINE_TRAIN_LOGGED = False
+_ENCODER_PIPELINE_EVAL_LOGGED = False
+
+
+def _encoder_input_min_mean_max(tensor: torch.Tensor) -> tuple[float, float, float]:
+    if tensor is None or tensor.numel() == 0:
+        return float("nan"), float("nan"), float("nan")
+    flat = tensor.detach().reshape(-1).float()
+    return float(flat.min().item()), float(flat.mean().item()), float(flat.max().item())
+
+
+def _log_encoder_pipeline_debug(
+    phase: str,
+    ap_enc_input: torch.Tensor,
+    pa_enc_input: torch.Tensor,
+    proj_transform: str,
+    proj_scale_source: str,
+):
+    ap_stats = _encoder_input_min_mean_max(ap_enc_input)
+    pa_stats = _encoder_input_min_mean_max(pa_enc_input)
+    print(
+        f"[debug][encoder-pipeline][{phase}] pre_build transform={proj_transform} "
+        f"scale_source={proj_scale_source} "
+        f"AP(min/mean/max)={ap_stats[0]:.3e}/{ap_stats[1]:.3e}/{ap_stats[2]:.3e} "
+        f"PA(min/mean/max)={pa_stats[0]:.3e}/{pa_stats[1]:.3e}/{pa_stats[2]:.3e}",
+        flush=True,
+    )
 
 
 def build_encoder_input(
@@ -1981,6 +2025,16 @@ def build_hybrid_latent_from_batch(
     with torch.no_grad():
         proj_scale_enc = compute_proj_scale(ap, pa, args.proj_scale_source, batch.get("meta"))
         proj_scale_enc = torch.clamp(proj_scale_enc, min=1e-6)
+        global _ENCODER_PIPELINE_EVAL_LOGGED
+        if bool(getattr(args, "debug_latent_stats", False)) and (not _ENCODER_PIPELINE_EVAL_LOGGED):
+            _ENCODER_PIPELINE_EVAL_LOGGED = True
+            _log_encoder_pipeline_debug(
+                "val/test",
+                ap_enc_input,
+                pa_enc_input,
+                args.encoder_proj_transform,
+                args.proj_scale_source,
+            )
         enc_input = build_encoder_input(
             ap_enc_input,
             pa_enc_input,
@@ -2306,6 +2360,87 @@ def module_grad_mean_abs(module: Optional[nn.Module]) -> float:
     return float(torch.stack(vals).mean().item())
 
 
+def params_grad_norm(params: List[torch.nn.Parameter]) -> float:
+    total = 0.0
+    for p in params:
+        if p.grad is None:
+            continue
+        g = p.grad.detach()
+        total += float(g.norm().item()) ** 2
+    return math.sqrt(total) if total > 0.0 else 0.0
+
+
+def sanitize_proj_weight_bounds(weight_min: float, weight_max: float) -> tuple[float, float, bool]:
+    w_min = float(weight_min)
+    w_max = float(weight_max)
+    swapped = False
+    if w_min > w_max:
+        w_min, w_max = w_max, w_min
+        swapped = True
+    return w_min, w_max, swapped
+
+
+def compute_proj_weight_schedule(
+    step: int,
+    warmup_steps: int,
+    ramp_steps: int,
+    weight_min: float,
+    weight_max: float,
+) -> tuple[float, bool, bool, float]:
+    """Deterministische Projection-Weight-Schedule (1-indexed step)."""
+    step_i = int(step)
+    warmup = max(0, int(warmup_steps))
+    ramp = max(0, int(ramp_steps))
+    w_min = float(weight_min)
+    w_max = float(weight_max)
+
+    if step_i <= warmup:
+        return 0.0, False, True, 0.0
+
+    if ramp == 0:
+        ramp_t = 1.0
+    else:
+        ramp_t = (step_i - warmup) / float(ramp)
+        ramp_t = min(1.0, max(0.0, ramp_t))
+    weight = w_min + ramp_t * (w_max - w_min)
+    return float(weight), True, False, float(ramp_t)
+
+
+def _self_test_proj_weight_schedule() -> None:
+    w, active, warmup, t = compute_proj_weight_schedule(
+        step=10,
+        warmup_steps=10,
+        ramp_steps=100,
+        weight_min=5e-4,
+        weight_max=5e-3,
+    )
+    assert w == 0.0 and (not active) and warmup and t == 0.0
+    w, active, warmup, t = compute_proj_weight_schedule(
+        step=11,
+        warmup_steps=10,
+        ramp_steps=100,
+        weight_min=5e-4,
+        weight_max=5e-3,
+    )
+    assert active and (not warmup) and 0.0 < t < 1.0 and (5e-4 < w < 5e-3)
+    w, active, warmup, t = compute_proj_weight_schedule(
+        step=111,
+        warmup_steps=10,
+        ramp_steps=100,
+        weight_min=5e-4,
+        weight_max=5e-3,
+    )
+    assert active and (not warmup) and t == 1.0 and abs(w - 5e-3) < 1e-12
+    w, active, warmup, t = compute_proj_weight_schedule(
+        step=11,
+        warmup_steps=10,
+        ramp_steps=0,
+        weight_min=5e-4,
+        weight_max=5e-3,
+    )
+    assert active and (not warmup) and t == 1.0 and abs(w - 5e-3) < 1e-12
+
+
 def _log_latent_conditioning_stats(
     step: int,
     z_base: torch.Tensor,
@@ -2401,6 +2536,8 @@ def log_effective_config(outdir: Path, config: dict, args):
         f"| bg_depth_mass_weight={args.bg_depth_mass_weight} | bg_depth_eps={args.bg_depth_eps} | bg_depth_mode={args.bg_depth_mode} "
         f"| poisson_rate_mode={args.poisson_rate_mode} | poisson_rate_floor={args.poisson_rate_floor} "
         f"| poisson_rate_floor_mode={args.poisson_rate_floor_mode} "
+        f"| grad_clip_enabled={args.grad_clip_enabled} | grad_clip_max_norm={args.grad_clip_max_norm} "
+        f"| clip_grad_decoder={args.clip_grad_decoder} | debug_grad_terms_every={args.debug_grad_terms_every} "
         f"| debug_sanity_checks={bool(getattr(args, 'debug_sanity_checks', False))}",
         flush=True,
     )
@@ -2523,6 +2660,61 @@ def compute_ray_tv(
     return tv, None
 
 
+def _projection_orientation_stats(arr: np.ndarray) -> Dict[str, Any]:
+    img = np.asarray(arr, dtype=np.float64)
+    if img.ndim != 2:
+        img = np.squeeze(img)
+    if img.ndim != 2:
+        raise ValueError(f"Expected 2D projection array, got shape={img.shape}")
+
+    finite = np.isfinite(img)
+    payload: Dict[str, Any] = {
+        "shape": [int(img.shape[0]), int(img.shape[1])],
+        "finite_frac": float(finite.mean()) if finite.size > 0 else 0.0,
+    }
+    if not finite.any():
+        payload.update(
+            {
+                "min": float("nan"),
+                "max": float("nan"),
+                "mean": float("nan"),
+                "sum": float("nan"),
+                "argmax_yx": None,
+                "com_yx": None,
+                "sha1_f32": None,
+            }
+        )
+        return payload
+
+    finite_vals = img[finite]
+    payload.update(
+        {
+            "min": float(np.min(finite_vals)),
+            "max": float(np.max(finite_vals)),
+            "mean": float(np.mean(finite_vals)),
+            "sum": float(np.sum(finite_vals)),
+        }
+    )
+
+    argmax_idx = int(np.nanargmax(np.where(finite, img, -np.inf)))
+    argmax_y, argmax_x = np.unravel_index(argmax_idx, img.shape)
+    payload["argmax_yx"] = [int(argmax_y), int(argmax_x)]
+
+    weights = np.where(finite, np.clip(img, a_min=0.0, a_max=None), 0.0)
+    wsum = float(weights.sum())
+    if wsum > 0.0:
+        yy, xx = np.indices(img.shape)
+        com_y = float((yy * weights).sum() / wsum)
+        com_x = float((xx * weights).sum() / wsum)
+        payload["com_yx"] = [com_y, com_x]
+    else:
+        payload["com_yx"] = None
+
+    digest_arr = np.nan_to_num(img.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    payload["sha1_f32"] = hashlib.sha1(digest_arr.tobytes()).hexdigest()
+    return payload
+
+
 def maybe_render_preview(
     step,
     args,
@@ -2641,6 +2833,23 @@ def maybe_render_preview(
 
     _save_view(ap_np, ap_target_img, "AP")
     _save_view(pa_np, pa_target_img, "PA")
+    if getattr(args, "debug_proj_orientation", False):
+        orientation_payload = {
+            "step": int(step),
+            "patient_id": None if patient_id is None else str(patient_id),
+            "pred": {
+                "ap": _projection_orientation_stats(ap_np),
+                "pa": _projection_orientation_stats(pa_np),
+            },
+            "target": {
+                "ap": None if ap_target_img is None else _projection_orientation_stats(ap_target_img),
+                "pa": None if pa_target_img is None else _projection_orientation_stats(pa_target_img),
+            },
+        }
+        orientation_path = out_dir / f"step_{step:05d}_orientation.json"
+        with orientation_path.open("w", encoding="utf-8") as f:
+            json.dump(orientation_payload, f, indent=2)
+        print(f"[debug][proj-orientation] saved {orientation_path.resolve()}", flush=True)
     save_depth_profile(
         step,
         generator,
@@ -5539,6 +5748,26 @@ def train():
 
     amp_enabled = bool(config["training"].get("use_amp", False))
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    _self_test_proj_weight_schedule()
+
+    proj_weight_min_sched, proj_weight_max_sched, proj_bounds_swapped = sanitize_proj_weight_bounds(
+        args.proj_weight_min,
+        args.proj_loss_weight,
+    )
+    if proj_bounds_swapped:
+        print(
+            f"[WARN][proj-schedule] proj_weight_min ({args.proj_weight_min:.3e}) > "
+            f"proj_loss_weight ({args.proj_loss_weight:.3e}); swapping bounds.",
+            flush=True,
+        )
+
+    decoder_module = generator.render_kwargs_train.get("network_fn")
+    if isinstance(decoder_module, nn.Module):
+        decoder_params = [p for p in decoder_module.parameters() if p.requires_grad]
+    else:
+        decoder_params = [p for p in generator.parameters() if p.requires_grad]
+    encoder_params = [p for p in encoder.parameters() if p.requires_grad] if encoder is not None else []
+    z_fuser_params = [p for p in z_fuser.parameters() if p.requires_grad] if z_fuser is not None else []
 
     if args.smoke_test:
         batch = None
@@ -5905,6 +6134,8 @@ def train():
 
     print(
         f"[sanity] max_steps={max_steps} proj_warmup_steps={args.proj_warmup_steps} "
+        f"proj_ramp_steps={max(0, int(args.proj_ramp_steps))} "
+        f"proj_weight_min/max={proj_weight_min_sched:.3e}/{proj_weight_max_sched:.3e} "
         f"depth_sanity_every={args.depth_sanity_every}",
         flush=True,
     )
@@ -5925,18 +6156,6 @@ def train():
             pa_enc_input = batch.get("proj_input_pa", pa)
             if torch.is_tensor(pa_enc_input):
                 pa_enc_input = pa_enc_input.to(device, non_blocking=True).float()
-
-            # --- Fix: Log1p transform for counts (stabilize encoder input) ---
-            if data_cfg.get("proj_input_source") == "counts":
-                if step == 1:
-                    def _tstat(t): return (float(t.min().item()), float(t.mean().item()), float(t.max().item()))
-                    print(f"[DEBUG][encoder-input] RAW counts AP={_tstat(ap_enc_input)} PA={_tstat(pa_enc_input)}", flush=True)
-                
-                ap_enc_input = torch.log1p(ap_enc_input.float().clamp_min(0.0))
-                pa_enc_input = torch.log1p(pa_enc_input.float().clamp_min(0.0))
-
-                if step == 1:
-                     print(f"[DEBUG][encoder-input] LOG1P transformed AP={_tstat(ap_enc_input)} PA={_tstat(pa_enc_input)}", flush=True)
 
             meta = batch.get("meta")
             meta_scale = None
@@ -6097,6 +6316,22 @@ def train():
             if hybrid_enabled and encoder is not None:
                 proj_scale_enc = compute_proj_scale(ap, pa, args.proj_scale_source, meta)
                 proj_scale_enc = torch.clamp(proj_scale_enc, min=1e-6)
+                global _ENCODER_PIPELINE_TRAIN_LOGGED
+                latent_stats_every = max(1, int(args.debug_latent_stats_every))
+                should_log_encoder_pipeline = (
+                    bool(args.debug_latent_stats)
+                    and (step == 1 or (step % latent_stats_every) == 0)
+                    and (step == 1 or (not _ENCODER_PIPELINE_TRAIN_LOGGED))
+                )
+                if should_log_encoder_pipeline:
+                    _ENCODER_PIPELINE_TRAIN_LOGGED = True
+                    _log_encoder_pipeline_debug(
+                        "train",
+                        ap_enc_input,
+                        pa_enc_input,
+                        args.encoder_proj_transform,
+                        args.proj_scale_source,
+                    )
                 enc_input = build_encoder_input(
                     ap_enc_input,
                     pa_enc_input,
@@ -6152,27 +6387,24 @@ def train():
             )
             skip_proj = bool(args.act_only) or phase_a_active
             debug_act_step = bool(args.debug_act and step == 1)
-            proj_warmup_active = bool(args.proj_warmup_steps > 0 and step <= args.proj_warmup_steps)
-            proj_weight = 0.0
-            if not skip_proj:
-                proj_weight = 1.0
-                if hybrid_enabled:
-                    proj_weight_min = float(args.proj_weight_min)
-                    proj_weight_max = float(args.proj_loss_weight)
-                    if proj_warmup_active:
-                        proj_weight = 0.0
-                    else:
-                        ramp_steps = max(1, int(args.proj_ramp_steps))
-                        ramp_t = min(1.0, max(0.0, (step - max(args.proj_warmup_steps, 0)) / float(ramp_steps)))
-                        proj_weight = proj_weight_min + ramp_t * (proj_weight_max - proj_weight_min)
-                elif proj_warmup_active:
-                    proj_weight = 0.0
+            if not skip_proj and hybrid_enabled:
+                proj_weight_used, proj_loss_active_sched, proj_warmup_active, proj_ramp_t = compute_proj_weight_schedule(
+                    step=step,
+                    warmup_steps=args.proj_warmup_steps,
+                    ramp_steps=args.proj_ramp_steps,
+                    weight_min=proj_weight_min_sched,
+                    weight_max=proj_weight_max_sched,
+                )
+            else:
+                proj_warmup_active = bool(args.proj_warmup_steps > 0 and step <= args.proj_warmup_steps)
+                proj_ramp_t = 1.0 if not proj_warmup_active else 0.0
+                proj_weight_used = 0.0 if proj_warmup_active else (1.0 if not skip_proj else 0.0)
+                proj_loss_active_sched = not proj_warmup_active
 
-            proj_weight_used = 0.0 if proj_warmup_active else float(proj_weight)
             proj_loss_active = (
                 (not skip_proj)
                 and (proj_loss_type == "poisson")
-                and (not proj_warmup_active)
+                and proj_loss_active_sched
                 and (not hybrid_enabled or proj_weight_used > 0.0)
             )
             proj_metrics_enabled = proj_loss_active
@@ -6180,6 +6412,8 @@ def train():
                 print(
                     f"[proj-status][step {step}] proj_loss_active={proj_loss_active} "
                     f"proj_warmup_active={proj_warmup_active} proj_weight_used={proj_weight_used:.3e} "
+                    f"ramp_t={proj_ramp_t:.4f} min={proj_weight_min_sched:.3e} max={proj_weight_max_sched:.3e} "
+                    f"warmup={int(args.proj_warmup_steps)} ramp={max(0, int(args.proj_ramp_steps))} "
                     f"skip_proj={skip_proj}",
                     flush=True,
                 )
@@ -7397,6 +7631,40 @@ def train():
                     flush=True,
                 )
 
+            if args.debug_grad_terms_every > 0 and (step % int(args.debug_grad_terms_every)) == 0:
+                act_term = (args.act_loss_weight * loss_act) if args.act_loss_weight > 0.0 else None
+                proj_term = (proj_weight_used * loss_proj) if proj_loss_active else None
+
+                def _term_grad_norms(loss_term: Optional[torch.Tensor]) -> Optional[tuple[float, float, float]]:
+                    if loss_term is None or (not torch.is_tensor(loss_term)) or (not loss_term.requires_grad):
+                        return None
+                    optimizer.zero_grad(set_to_none=True)
+                    loss_term.backward(retain_graph=True)
+                    return (
+                        params_grad_norm(decoder_params),
+                        params_grad_norm(encoder_params),
+                        params_grad_norm(z_fuser_params),
+                    )
+
+                act_grad_norms = _term_grad_norms(act_term)
+                proj_grad_norms = _term_grad_norms(proj_term) if proj_loss_active else None
+                optimizer.zero_grad(set_to_none=True)
+
+                def _fmt_triplet(values: Optional[tuple[float, float, float]]) -> str:
+                    if values is None:
+                        return "na/na/na"
+                    dec_v, enc_v, fus_v = values
+                    enc_s = f"{enc_v:.3e}" if encoder_params else "na"
+                    fus_s = f"{fus_v:.3e}" if z_fuser_params else "na"
+                    return f"{dec_v:.3e}/{enc_s}/{fus_s}"
+
+                print(
+                    f"[grad-terms][step {step:05d}] "
+                    f"act(dec/enc/fus)={_fmt_triplet(act_grad_norms)} "
+                    f"proj(dec/enc/fus)={_fmt_triplet(proj_grad_norms)}",
+                    flush=True,
+                )
+
             if debug_act_step and pred_act_raw is not None:
                 # Hook für den Gradienten des rohen Netz-Outputs
                 pred_act_raw.retain_grad()
@@ -7486,13 +7754,33 @@ def train():
             grad_norm_gen_pre = module_grad_norm(generator)
             grad_norm_gen_post = grad_norm_gen_pre
             clip_event = 0
+            decoder_clip_before = None
+            decoder_clip_after = None
+            decoder_clip_applied = False
+            need_any_unscale = bool(args.grad_clip_enabled) or (float(args.clip_grad_decoder) > 0.0)
+            if need_any_unscale and amp_enabled:
+                scaler.unscale_(optimizer)
             if args.grad_clip_enabled:
-                if amp_enabled:
-                    scaler.unscale_(optimizer)
                 grad_norm_gen_post = torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=args.grad_clip_max_norm)
                 clip_event = float(grad_norm_gen_post) > args.grad_clip_max_norm
+            if float(args.clip_grad_decoder) > 0.0 and decoder_params:
+                decoder_clip_before = params_grad_norm(decoder_params)
+                torch.nn.utils.clip_grad_norm_(decoder_params, max_norm=float(args.clip_grad_decoder))
+                decoder_clip_after = params_grad_norm(decoder_params)
+                decoder_clip_applied = bool(decoder_clip_before > float(args.clip_grad_decoder))
             scaler.step(optimizer)
             scaler.update()
+
+            if float(args.clip_grad_decoder) > 0.0:
+                clip_log_interval = val_interval if val_interval > 0 else 200
+                if step == 1 or (step % clip_log_interval) == 0:
+                    before_s = f"{decoder_clip_before:.3e}" if decoder_clip_before is not None else "nan"
+                    after_s = f"{decoder_clip_after:.3e}" if decoder_clip_after is not None else "nan"
+                    print(
+                        f"[clip][step {step:05d}] decoder_clip={float(args.clip_grad_decoder):.3e} "
+                        f"applied={decoder_clip_applied} measured_norm_before={before_s} measured_norm_after={after_s}",
+                        flush=True,
+                    )
 
             if debug_act_step:
                 print(
