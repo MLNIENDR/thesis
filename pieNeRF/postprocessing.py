@@ -14,24 +14,32 @@ python postprocessing.py \
 import argparse
 import cProfile
 import csv
+import importlib
+import importlib.util
 import io
 import json
 import logging
 import pstats
+import shlex
 import subprocess
+import sys
 import time
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Union
+from collections.abc import Callable
+from typing import Any, Optional, Union
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import yaml
-from physics.projector import ProjectorConfig, project_activity
-from pieNeRF.train_emission import compute_projection_metrics
+
+_REPO_ROOT = Path(__file__).resolve().parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 try:
     import matplotlib
@@ -43,6 +51,9 @@ except ImportError:  # pragma: no cover - best effort
     _MATPLOTLIB_AVAILABLE = False
 
 _LOG = logging.getLogger(__name__)
+
+_PHYSICS_PROJECTOR_IMPORTS: Optional[tuple[type, Callable[..., Any]]] = None
+_TRAIN_EMISSION_IMPORTS: Optional[dict[str, Any]] = None
 
 METRICS_CSV_HEADER = [
     "phantom_id",
@@ -144,6 +155,8 @@ def _compute_proj_metrics_from_arrays(
     target_pa: np.ndarray,
     device: str,
 ) -> tuple[float, float]:
+    tr = _get_train_emission_imports()
+    compute_projection_metrics = tr["compute_projection_metrics"]
     # robust gegen non-contiguous Arrays (z.B. flip/slice)
     pred_ap_t   = torch.from_numpy(np.ascontiguousarray(pred_ap,   dtype=np.float32)).reshape(1, -1).to(device)
     pred_pa_t   = torch.from_numpy(np.ascontiguousarray(pred_pa,   dtype=np.float32)).reshape(1, -1).to(device)
@@ -177,6 +190,12 @@ def parse_args():
         help="expect run_dir/{phantom}/activity_pred_*.npy",
     )
     parser.add_argument("--checkpoint", help="checkpoint path (optional) to render AP/PA projections")
+    parser.add_argument(
+        "--proj-forward-model",
+        choices=["physics", "train"],
+        default="physics",
+        help="projection forward model: physics projector or training renderer path",
+    )
     parser.add_argument("--pred-ap-path", help="explicit pred AP projection (.npy)")
     parser.add_argument("--pred-pa-path", help="explicit pred PA projection (.npy)")
     parser.add_argument(
@@ -616,12 +635,55 @@ def _load_meta_simple(act_path: Path) -> dict:
         return {}
 
 
+def _get_physics_projector_imports() -> tuple[type, Callable[..., Any]]:
+    global _PHYSICS_PROJECTOR_IMPORTS
+    if _PHYSICS_PROJECTOR_IMPORTS is not None:
+        return _PHYSICS_PROJECTOR_IMPORTS
+    try:
+        from physics.projector import ProjectorConfig, project_activity
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            "Physics projector dependencies missing (e.g. Data_Processing). "
+            "Either add the dependency to PYTHONPATH / install it, or run with "
+            "--proj-forward-model train."
+        ) from e
+    _PHYSICS_PROJECTOR_IMPORTS = (ProjectorConfig, project_activity)
+    return _PHYSICS_PROJECTOR_IMPORTS
+
+
+def _get_train_emission_imports() -> dict[str, Any]:
+    global _TRAIN_EMISSION_IMPORTS
+    if _TRAIN_EMISSION_IMPORTS is not None:
+        return _TRAIN_EMISSION_IMPORTS
+    try:
+        import train_emission as te
+    except ModuleNotFoundError:
+        te_path = _REPO_ROOT / "train_emission.py"
+        spec = importlib.util.spec_from_file_location("train_emission", str(te_path))
+        te = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(te)  # type: ignore[attr-defined]
+    _TRAIN_EMISSION_IMPORTS = {
+        "te": te,
+        "compute_projection_metrics": te.compute_projection_metrics,
+        "compute_proj_scale": te.compute_proj_scale,
+        "build_hybrid_latent_from_batch": te.build_hybrid_latent_from_batch,
+        "build_encoder_input": te.build_encoder_input if hasattr(te, "build_encoder_input") else None,
+        "compute_poisson_rate": te.compute_poisson_rate,
+        "apply_poisson_rate_floor": te.apply_poisson_rate_floor if hasattr(te, "apply_poisson_rate_floor") else None,
+        "get_data": te.get_data if hasattr(te, "get_data") else None,
+        "build_models": te.build_models if hasattr(te, "build_models") else None,
+    }
+    return _TRAIN_EMISSION_IMPORTS
+
+
 def _build_projector_config(
     meta: dict,
     args,
     spacing_gt_cm: tuple[float, float, float],
     default_kernel: Path,
-) -> ProjectorConfig | None:
+    projector_config_cls: type,
+) -> object | None:
     kernel_path = meta.get("kernel_mat")
     if not kernel_path:
         if not default_kernel.exists():
@@ -648,7 +710,7 @@ def _build_projector_config(
     )
     mu_unit_in = meta.get("mu_unit_in", "per_mm")
     mu_unit_out = meta.get("mu_unit_out", "per_cm")
-    return ProjectorConfig(
+    return projector_config_cls(
         kernel_mat=kernel_path,
         kernel_var=kernel_var,
         psf_sigma=psf_sigma,
@@ -1013,6 +1075,322 @@ def render_projections_stub():
     }
 
 
+class TrainForwardProjector:
+    def __init__(self, args, run_dir: Path, manifest: dict[str, dict], device: torch.device):
+        self.args = args
+        self.run_dir = run_dir
+        self.manifest = manifest
+        self.device = device
+        self.repo_root = _REPO_ROOT
+        tr = _get_train_emission_imports()
+        self.train_mod = tr["te"]
+        self.config_mod = importlib.import_module("graf.config")
+        self.cli_tokens = self._extract_train_cli(run_dir / "command.sh")
+        self.train_args = self._parse_train_args(self.cli_tokens)
+        self.config = self._load_train_config(self.train_args.config)
+        self.dataset, hwfr, _ = self.config_mod.get_data(self.config)
+        self.config["data"]["hwfr"] = hwfr
+        self.generator = self._build_models_flexible(self.config, device)
+        self.generator.train()
+        self.generator.use_test_kwargs = False
+        self.generator.set_fixed_ap_pa(radius=hwfr[3])
+        self.z_dim = int(self.config["z_dist"]["dim"])
+        self.z_base = torch.zeros(1, self.z_dim, device=device)
+        self.encoder = None
+        self.z_fuser = None
+        self.gain_head = None
+        self.gain_param = None
+        self._init_hybrid_modules()
+        self.ckpt_path = self._select_checkpoint()
+        self._load_checkpoint(self.ckpt_path)
+        self.generator.eval()
+        if self.encoder is not None:
+            self.encoder.eval()
+        if self.z_fuser is not None:
+            self.z_fuser.eval()
+        if self.gain_head is not None:
+            self.gain_head.eval()
+        self.pid_to_index = self._build_pid_to_test_index()
+
+    def _extract_train_cli(self, command_path: Path) -> list[str]:
+        tokens = shlex.split(command_path.read_text().strip())
+        idx = None
+        for i, tok in enumerate(tokens):
+            if tok.endswith("train_emission.py"):
+                idx = i
+                break
+        if idx is None:
+            raise RuntimeError(f"train_emission.py missing in {command_path}")
+        return tokens[idx + 1 :]
+
+    def _parse_train_args(self, cli_tokens: list[str]) -> argparse.Namespace:
+        old_argv = sys.argv[:]
+        try:
+            sys.argv = ["train_emission.py"] + cli_tokens
+            return self.train_mod.parse_args()
+        finally:
+            sys.argv = old_argv
+
+    def _load_train_config(self, config_path: str) -> dict:
+        with Path(config_path).open("r") as f:
+            cfg = yaml.safe_load(f)
+        data_cfg = cfg.setdefault("data", {})
+        radius_xyz = data_cfg.get("radius_xyz_cm")
+        if bool(data_cfg.get("auto_near_far_from_radius", True)) and radius_xyz is not None:
+            rz = float(radius_xyz[2])
+            data_cfg["near"] = 0.0
+            data_cfg["far"] = 2.0 * rz
+        return cfg
+
+    def _build_models_flexible(self, config: dict, device: torch.device):
+        from graf.generator import Generator
+        from graf.transforms import FlexGridRaySampler
+        from nerf.run_nerf_mod import create_nerf
+
+        cfg_nerf = argparse.Namespace(**config["nerf"])
+        cfg_nerf.chunk = min(config["training"]["chunk"], 1024 * config["training"]["batch_size"])
+        cfg_nerf.netchunk = config["training"]["netchunk"]
+        cfg_nerf.white_bkgd = config["data"]["white_bkgd"]
+        cfg_nerf.feat_dim = config["z_dist"]["dim"]
+        cfg_nerf.feat_dim_appearance = config["z_dist"]["dim_appearance"]
+        cfg_nerf.emission = True
+        if not hasattr(cfg_nerf, "use_attenuation"):
+            cfg_nerf.use_attenuation = False
+        if not hasattr(cfg_nerf, "attenuation_debug"):
+            cfg_nerf.attenuation_debug = False
+        if not hasattr(cfg_nerf, "atten_scale"):
+            cfg_nerf.atten_scale = 25.0
+
+        render_train, render_test, params, named_params = create_nerf(cfg_nerf)
+        render_train["emission"] = True
+        render_test["emission"] = True
+        render_train["use_attenuation"] = bool(getattr(cfg_nerf, "use_attenuation", False))
+        render_test["use_attenuation"] = bool(getattr(cfg_nerf, "use_attenuation", False))
+        render_train["attenuation_debug"] = bool(getattr(cfg_nerf, "attenuation_debug", False))
+        render_test["attenuation_debug"] = bool(getattr(cfg_nerf, "attenuation_debug", False))
+        atten_scale = float(getattr(cfg_nerf, "atten_scale", 25.0))
+        render_train["atten_scale"] = atten_scale
+        render_test["atten_scale"] = atten_scale
+        bds = {"near": config["data"]["near"], "far": config["data"]["far"]}
+        render_train.update(bds)
+        render_test.update(bds)
+
+        ray_sampler = FlexGridRaySampler(
+            N_samples=config["ray_sampler"]["N_samples"],
+            min_scale=config["ray_sampler"]["min_scale"],
+            max_scale=config["ray_sampler"]["max_scale"],
+            scale_anneal=config["ray_sampler"]["scale_anneal"],
+            orthographic=config["data"]["orthographic"],
+        )
+        H, W, f, r = config["data"]["hwfr"]
+        generator = Generator(
+            H,
+            W,
+            f,
+            r,
+            ray_sampler=ray_sampler,
+            render_kwargs_train=render_train,
+            render_kwargs_test=render_test,
+            parameters=params,
+            named_parameters=named_params,
+            chunk=cfg_nerf.chunk,
+            range_u=(float(config["data"]["umin"]), float(config["data"]["umax"])),
+            range_v=(float(config["data"]["vmin"]), float(config["data"]["vmax"])),
+            orthographic=config["data"]["orthographic"],
+            radius_xyz_cm=tuple(config["data"]["radius_xyz_cm"]) if config["data"].get("radius_xyz_cm") is not None else None,
+        )
+        return generator.to(device)
+
+    def _init_hybrid_modules(self) -> None:
+        if not bool(self.train_args.hybrid):
+            return
+        enc_in_ch = 2 + (1 if self.train_args.encoder_use_ct else 0)
+        self.encoder = self.train_mod.ProjectionEncoder(in_ch=enc_in_ch, z_dim=self.z_dim, base_ch=32).to(self.device)
+        self.z_fuser = nn.Sequential(nn.Linear(self.z_dim, self.z_dim), nn.LayerNorm(self.z_dim)).to(self.device)
+        if self.train_args.proj_target_source == "counts":
+            if self.train_args.proj_gain_source == "z_enc":
+                self.gain_head = nn.Linear(self.z_dim, 1).to(self.device)
+            elif self.train_args.proj_gain_source == "scalar":
+                self.gain_param = nn.Parameter(torch.zeros(1, device=self.device))
+
+    def _select_checkpoint(self) -> Path:
+        if self.args.checkpoint:
+            cp = Path(self.args.checkpoint)
+            return cp if cp.is_absolute() else (self.run_dir / cp)
+        candidates = sorted((self.run_dir / "checkpoints").glob("checkpoint_step*.pt"))
+        if candidates:
+            return max(candidates, key=lambda p: int("".join(ch for ch in p.stem if ch.isdigit()) or "0"))
+        fallback = self.run_dir / "checkpoints" / "checkpoint_step05000.pt"
+        if fallback.exists():
+            return fallback
+        raise FileNotFoundError("no checkpoint found")
+
+    def _load_checkpoint(self, ckpt_path: Path) -> None:
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        self.generator.render_kwargs_train["network_fn"].load_state_dict(ckpt["generator_coarse"])
+        if self.generator.render_kwargs_train["network_fine"] is not None and ckpt.get("generator_fine") is not None:
+            self.generator.render_kwargs_train["network_fine"].load_state_dict(ckpt["generator_fine"])
+        if self.encoder is not None and ckpt.get("encoder") is not None:
+            self.encoder.load_state_dict(ckpt["encoder"])
+        if self.z_fuser is not None and ckpt.get("z_fuser") is not None:
+            self.z_fuser.load_state_dict(ckpt["z_fuser"])
+        if self.gain_head is not None and ckpt.get("gain_head") is not None:
+            self.gain_head.load_state_dict(ckpt["gain_head"])
+        if self.gain_param is not None and ckpt.get("gain_param") is not None:
+            self.gain_param.data.copy_(ckpt["gain_param"].to(self.device))
+
+    def _build_pid_to_test_index(self) -> dict[str, int]:
+        data_cfg = self.config["data"]
+        _, _, test_subset, _ = self.train_mod.split_by_patient_id(
+            dataset=self.dataset,
+            seed=int(data_cfg.get("split_seed", 0)),
+            split_mode=str(data_cfg.get("split_mode", "ratios")).lower(),
+            train_ratio=float(data_cfg.get("split_train", 0.8)),
+            val_ratio=float(data_cfg.get("split_val", 0.1)),
+            test_ratio=float(data_cfg.get("split_test", 0.1)),
+            train_count=int(data_cfg.get("split_train_count", -1)),
+            val_count=int(data_cfg.get("split_val_count", -1)),
+            test_count=int(data_cfg.get("split_test_count", -1)),
+        )
+        test_indices = set(getattr(test_subset, "indices", []))
+        result: dict[str, int] = {}
+        for idx in range(len(self.dataset)):
+            pid = self.dataset.get_patient_id(idx)
+            if pid in self.manifest and idx in test_indices:
+                result[pid] = idx
+        return result
+
+    @staticmethod
+    def _stats_tensor(tensor: torch.Tensor) -> dict[str, float]:
+        flat = tensor.detach().reshape(-1).float().cpu().numpy()
+        return {
+            "min": float(flat.min()),
+            "max": float(flat.max()),
+            "mean": float(flat.mean()),
+            "std": float(flat.std()),
+        }
+
+    def _assert_nonconstant(self, stage_label: str, tensor: torch.Tensor) -> None:
+        stats = self._stats_tensor(tensor)
+        if stats["std"] < 1e-12 or stats["min"] == stats["max"]:
+            raise RuntimeError(stage_label)
+
+    def render_patient(self, phantom_id: str) -> tuple[np.ndarray, np.ndarray, dict]:
+        idx = self.pid_to_index.get(phantom_id)
+        if idx is None:
+            raise KeyError(f"{phantom_id} missing in training test subset")
+        sample = self.dataset[idx]
+        batch = {}
+        for k, v in sample.items():
+            batch[k] = v.unsqueeze(0) if torch.is_tensor(v) else v
+
+        ap = batch["ap"].to(self.device).float()
+        pa = batch["pa"].to(self.device).float()
+        ct_vol = batch.get("ct")
+        if ct_vol is not None and torch.is_tensor(ct_vol) and ct_vol.numel() > 0:
+            ct_vol = ct_vol.to(self.device).float()
+        else:
+            ct_vol = None
+        ap_counts = batch.get("ap_counts")
+        pa_counts = batch.get("pa_counts")
+        use_counts = (
+            ap_counts is not None and pa_counts is not None and torch.is_tensor(ap_counts)
+            and torch.is_tensor(pa_counts) and ap_counts.numel() > 0 and pa_counts.numel() > 0
+        )
+
+        z_enc = None
+        z_proj = None
+        if bool(self.train_args.hybrid) and self.encoder is not None:
+            z_final, z_enc, z_proj = self.train_mod.build_hybrid_latent_from_batch(
+                args=self.train_args,
+                batch=batch,
+                device=self.device,
+                z_latent_base=self.z_base,
+                encoder=self.encoder,
+                z_fuser=self.z_fuser,
+                z_enc_alpha=float(self.train_args.z_enc_alpha),
+            )
+        else:
+            z_final = self.z_base.detach()
+        ct_context = self.generator.build_ct_context(ct_vol, padding_mode=self.train_args.ct_padding_mode) if ct_vol is not None else None
+        prev_flag = self.generator.use_test_kwargs
+        self.generator.eval()
+        self.generator.use_test_kwargs = True
+        with torch.no_grad():
+            pred_ap_raw, _, _, _ = self.generator.render_from_pose(z_final, self.generator.pose_ap, ct_context=ct_context)
+            pred_pa_raw, _, _, _ = self.generator.render_from_pose(z_final, self.generator.pose_pa, ct_context=ct_context)
+        self.generator.use_test_kwargs = prev_flag
+        self._assert_nonconstant("renderer_raw/AP", pred_ap_raw)
+        self._assert_nonconstant("renderer_raw/PA", pred_pa_raw)
+
+        if str(self.train_args.proj_loss_type) == "poisson":
+            pred_ap = self.train_mod.compute_poisson_rate(pred_ap_raw, self.train_args.poisson_rate_mode, eps=1e-6)
+            pred_pa = self.train_mod.compute_poisson_rate(pred_pa_raw, self.train_args.poisson_rate_mode, eps=1e-6)
+        else:
+            pred_ap = pred_ap_raw
+            pred_pa = pred_pa_raw
+        self._assert_nonconstant("post_rate/AP", pred_ap)
+        self._assert_nonconstant("post_rate/PA", pred_pa)
+
+        gain_tensor = None
+        if use_counts and bool(self.train_args.use_gain):
+            if self.gain_head is not None and z_enc is not None:
+                gain_tensor = F.softplus(self.gain_head(z_enc))
+            elif self.gain_param is not None:
+                gain_tensor = F.softplus(self.gain_param)
+            if gain_tensor is not None:
+                g_min = float(self.train_args.gain_clamp_min) if self.train_args.gain_clamp_min is not None else None
+                g_max = self.train_args.gain_clamp_max
+                if g_min is not None or g_max is not None:
+                    gain_tensor = torch.clamp(
+                        gain_tensor,
+                        min=(g_min if g_min is not None else -float("inf")),
+                        max=(g_max if g_max is not None else float("inf")),
+                    )
+                pred_ap = pred_ap * gain_tensor
+                pred_pa = pred_pa * gain_tensor
+
+        if use_counts and str(self.train_args.proj_loss_type) == "poisson" and float(self.train_args.poisson_rate_floor) > 0.0:
+            pred_ap, _ = self.train_mod.apply_poisson_rate_floor(
+                pred_ap, float(self.train_args.poisson_rate_floor), self.train_args.poisson_rate_floor_mode
+            )
+            pred_pa, _ = self.train_mod.apply_poisson_rate_floor(
+                pred_pa, float(self.train_args.poisson_rate_floor), self.train_args.poisson_rate_floor_mode
+            )
+        self._assert_nonconstant("post_gain/AP", pred_ap)
+        self._assert_nonconstant("post_gain/PA", pred_pa)
+
+        H, W = int(self.generator.H), int(self.generator.W)
+        ap_np = pred_ap[0].reshape(H, W).detach().cpu().numpy().astype(np.float32)
+        pa_np = pred_pa[0].reshape(H, W).detach().cpu().numpy().astype(np.float32)
+        proj_scale = self.train_mod.compute_proj_scale(ap, pa, self.train_args.proj_scale_source, batch.get("meta"))
+        proj_scale = torch.clamp(proj_scale, min=1e-6)
+        meta = {
+            "checkpoint_path": str(self.ckpt_path),
+            "proj_forward_model": "train",
+            "proj_scale_source": str(self.train_args.proj_scale_source),
+            "proj_scale_value": [float(v) for v in proj_scale.detach().cpu().reshape(-1).tolist()],
+            "poisson_mode": str(self.train_args.poisson_rate_mode),
+            "gain_on": bool(gain_tensor is not None),
+            "H": H,
+            "W": W,
+            "hybrid": bool(self.train_args.hybrid),
+            "encoder_use_ct": bool(self.train_args.encoder_use_ct),
+            "encoder_proj_transform": str(self.train_args.encoder_proj_transform),
+            "z_enc_alpha": float(self.train_args.z_enc_alpha),
+            "proj_target_source": str(self.train_args.proj_target_source),
+            "pa_xflip_flag": bool(self.train_args.pa_xflip),
+            "z_enc_stats": self._stats_tensor(z_enc) if z_enc is not None else None,
+            "z_proj_stats": self._stats_tensor(z_proj) if z_proj is not None else None,
+            "z_final_stats": self._stats_tensor(z_final),
+            "raw_ap_stats": self._stats_tensor(pred_ap_raw),
+            "raw_pa_stats": self._stats_tensor(pred_pa_raw),
+            "post_rate_ap_stats": self._stats_tensor(pred_ap),
+            "post_rate_pa_stats": self._stats_tensor(pred_pa),
+        }
+        return ap_np, pa_np, meta
+
+
 def write_metrics_json(path: Path, data: dict):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2))
@@ -1188,6 +1566,24 @@ def run_postprocessing(args):
     config_path = str(Path(args.config).resolve())
     aggregated_path = out_dir / "metrics.csv"
     organ_name_map = read_organ_names(Path("data/organ_ids.txt"))
+    physics_projector_config_cls = None
+    physics_project_activity = None
+    if args.proj_forward_model == "physics":
+        physics_projector_config_cls, physics_project_activity = _get_physics_projector_imports()
+    elif args.calibrate_scale:
+        raise ValueError("--calibrate-scale is only supported with --proj-forward-model physics")
+    train_forward_projector = None
+    if args.proj_forward_model == "train":
+        train_forward_projector = TrainForwardProjector(
+            args=args,
+            run_dir=run_dir,
+            manifest=manifest,
+            device=torch.device(args.device),
+        )
+        _LOG.info(
+            "initialized train forward projector checkpoint=%s",
+            train_forward_projector.ckpt_path,
+        )
 
     counts_keys_ap = ["ap_counts_path", "ap_counts", "ap_counts_abs", "ap_counts_path_abs"]
     counts_keys_pa = ["pa_counts_path", "pa_counts", "pa_counts_abs", "pa_counts_path_abs"]
@@ -1225,7 +1621,15 @@ def run_postprocessing(args):
         ct_path = Path(entry["ct_path"]) if entry.get("ct_path") else None
         meta = _load_meta_simple(act_path)
         kernel_default = Path("Data_Processing/LEAP_Kernel.mat")
-        projector_config = _build_projector_config(meta, args, spacing_gt, kernel_default)
+        projector_config = None
+        if args.proj_forward_model == "physics":
+            projector_config = _build_projector_config(
+                meta,
+                args,
+                spacing_gt,
+                kernel_default,
+                physics_projector_config_cls,
+            )
         proj_domain_requested = args.proj_domain
         domain_loaded, gt_ap_counts, gt_pa_counts = _load_gt_projections(
             entry,
@@ -1257,7 +1661,7 @@ def run_postprocessing(args):
             if projector_config is None:
                 raise RuntimeError(f"--calibrate-scale requires valid projector configuration for {pid}")
             ct_vol_cal = load_array(ct_path).astype(np.float32)
-            pred_proj_for_cal = project_activity(pred_roi, ct_vol_cal, spacing_gt, projector_config)
+            pred_proj_for_cal = physics_project_activity(pred_roi, ct_vol_cal, spacing_gt, projector_config)
             pred_ap_cal = (
                 pred_proj_for_cal["ap_counts"] if proj_domain_loaded == "counts" else pred_proj_for_cal["ap_norm"]
             )
@@ -1430,24 +1834,17 @@ def run_postprocessing(args):
             proj_is_normalized = proj_domain == "normalized"
 
             should_render_projections = args.render_projections or args.calibrate_scale
-            if should_render_projections and ct_path and ct_path.exists() and projector_config is not None:
-                try:
-                    ct_vol = load_array(ct_path).astype(np.float32)
-                    pred_proj = project_activity(pred_roi, ct_vol, spacing_gt, projector_config)
-                except Exception as exc:
-                    _LOG.exception("failed to render projections for %s: %s", pid, exc)
-                    if args.calibrate_scale:
-                        raise RuntimeError(
-                            f"--calibrate-scale failed while rendering scaled projections for {pid}"
-                        ) from exc
-                    proj_status = "failed"
-                else:
-                    pred_save_ap = (
-                        pred_proj["ap_counts"] if proj_domain == "counts" else pred_proj["ap_norm"]
-                    )
-                    pred_save_pa = (
-                        pred_proj["pa_counts"] if proj_domain == "counts" else pred_proj["pa_norm"]
-                    )
+            if args.proj_forward_model == "train":
+                should_render_projections = True
+            if should_render_projections:
+                if args.proj_forward_model == "train":
+                    if train_forward_projector is None:
+                        raise RuntimeError("train forward projector not initialized")
+                    try:
+                        pred_save_ap, pred_save_pa, train_meta = train_forward_projector.render_patient(pid)
+                    except Exception as exc:
+                        _LOG.exception("failed to render train-path projections for %s: %s", pid, exc)
+                        raise
                     if gt_save_ap is not None and gt_save_pa is not None:
                         mae, dev = _compute_proj_metrics_from_arrays(
                             pred_save_ap, pred_save_pa, gt_save_ap, gt_save_pa, args.device
@@ -1455,11 +1852,47 @@ def run_postprocessing(args):
                         proj_metrics = {
                             "proj_mae_counts": mae,
                             "proj_poisson_dev_counts": dev,
-                            "proj_status": "rendered",
-                            "proj_domain": proj_domain,
+                            "proj_status": "rendered_train",
+                            "proj_domain": "counts",
                         }
-                        proj_status = "rendered"
-                        proj_norm_factor = pred_proj.get("norm_scale")
+                        proj_status = "rendered_train"
+                        proj_domain = "counts"
+                        proj_is_normalized = False
+                    train_proj_dir = patient_dir / "proj_train"
+                    train_proj_dir.mkdir(parents=True, exist_ok=True)
+                    np.save(train_proj_dir / "ap_pred.npy", pred_save_ap)
+                    np.save(train_proj_dir / "pa_pred.npy", pred_save_pa)
+                    (train_proj_dir / "meta.json").write_text(json.dumps(train_meta, indent=2))
+                elif ct_path and ct_path.exists() and projector_config is not None:
+                    try:
+                        ct_vol = load_array(ct_path).astype(np.float32)
+                        pred_proj = physics_project_activity(pred_roi, ct_vol, spacing_gt, projector_config)
+                    except Exception as exc:
+                        _LOG.exception("failed to render projections for %s: %s", pid, exc)
+                        if args.calibrate_scale:
+                            raise RuntimeError(
+                                f"--calibrate-scale failed while rendering scaled projections for {pid}"
+                            ) from exc
+                        proj_status = "failed"
+                    else:
+                        pred_save_ap = (
+                            pred_proj["ap_counts"] if proj_domain == "counts" else pred_proj["ap_norm"]
+                        )
+                        pred_save_pa = (
+                            pred_proj["pa_counts"] if proj_domain == "counts" else pred_proj["pa_norm"]
+                        )
+                        if gt_save_ap is not None and gt_save_pa is not None:
+                            mae, dev = _compute_proj_metrics_from_arrays(
+                                pred_save_ap, pred_save_pa, gt_save_ap, gt_save_pa, args.device
+                            )
+                            proj_metrics = {
+                                "proj_mae_counts": mae,
+                                "proj_poisson_dev_counts": dev,
+                                "proj_status": "rendered",
+                                "proj_domain": proj_domain,
+                            }
+                            proj_status = "rendered"
+                            proj_norm_factor = pred_proj.get("norm_scale")
 
             if proj_metrics is None:
                 if args.calibrate_scale:
