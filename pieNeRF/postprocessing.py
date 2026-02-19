@@ -215,6 +215,17 @@ def parse_args():
         action="store_true",
         help="apply per-phantom joint AP/PA least-squares scale before metrics",
     )
+    parser.add_argument(
+        "--ls-calibrate-global",
+        action="store_true",
+        help="apply one joint AP+PA least-squares scale alpha to train-forward projections",
+    )
+    parser.add_argument(
+        "--ls-calibrate-eps",
+        type=float,
+        default=1e-12,
+        help="epsilon added to LS denominator for global AP+PA calibration",
+    )
     parser.add_argument("--render-projections", action="store_true", help="render AP/PA projections from volumes")
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu", help="torch device")
     parser.add_argument(
@@ -806,6 +817,36 @@ def _compute_joint_projection_ls_scale(
     denom = float(np.nansum(pred_ap * pred_ap)) + float(np.nansum(pred_pa * pred_pa))
     numer = float(np.nansum(gt_ap * pred_ap)) + float(np.nansum(gt_pa * pred_pa))
     return numer / denom if denom > 0 else float("nan")
+
+
+def _ls_alpha_global(
+    pred_ap: np.ndarray,
+    pred_pa: np.ndarray,
+    gt_ap: np.ndarray,
+    gt_pa: np.ndarray,
+    eps: float = 1e-12,
+) -> tuple[float, float, float]:
+    if pred_ap.shape != gt_ap.shape:
+        raise RuntimeError(f"LS calibration shape mismatch AP: pred={pred_ap.shape} gt={gt_ap.shape}")
+    if pred_pa.shape != gt_pa.shape:
+        raise RuntimeError(f"LS calibration shape mismatch PA: pred={pred_pa.shape} gt={gt_pa.shape}")
+    p_ap = np.asarray(pred_ap, dtype=np.float64).ravel()
+    p_pa = np.asarray(pred_pa, dtype=np.float64).ravel()
+    g_ap = np.asarray(gt_ap, dtype=np.float64).ravel()
+    g_pa = np.asarray(gt_pa, dtype=np.float64).ravel()
+    num = float(np.dot(p_ap, g_ap) + np.dot(p_pa, g_pa))
+    den_no_eps = float(np.dot(p_ap, p_ap) + np.dot(p_pa, p_pa))
+    den = den_no_eps + float(eps)
+    if den_no_eps <= float(eps):
+        raise RuntimeError(
+            f"LS calibration denominator too small: den_no_eps={den_no_eps:.6e} eps={float(eps):.6e}"
+        )
+    alpha = num / den
+    if not np.isfinite(alpha):
+        raise RuntimeError(
+            f"LS calibration alpha not finite: alpha={alpha} num={num:.6e} den={den:.6e}"
+        )
+    return float(alpha), float(num), float(den)
 
 
 def _log_projection_stats(
@@ -1499,10 +1540,18 @@ def save_active_organ_plots(
         _LOG.warning("matplotlib unavailable; skipping active organ plots for %s", phantom_id)
         return
     plot_dir.mkdir(parents=True, exist_ok=True)
-    sorted_ids = np.sort(active_ids)
-    names = [ORGAN_LABEL_MAP.get(int(oid), str(int(oid))) for oid in sorted_ids]
-    gt_sums, pred_native_sums, pred_gt_sums = _compute_active_organ_sums(
-        sorted_ids,
+    sorted_ids = np.sort(np.asarray(active_ids, dtype=np.int32))
+    if np.any(sorted_ids == 1384):
+        sorted_ids = sorted_ids[sorted_ids != 1384]
+        _LOG.info("[organ-filter] removed unmapped organ id 1384 from active organ plots")
+    # Keep original ordering (sorted IDs), but only keep organs with valid label mapping.
+    organ_ids = np.array([int(oid) for oid in sorted_ids if int(oid) in ORGAN_LABEL_MAP], dtype=np.int32)
+    if organ_ids.size == 0:
+        return
+    assert 1384 not in organ_ids
+    names = [ORGAN_LABEL_MAP[int(oid)] for oid in organ_ids]
+    gt_sums, _, pred_gt_sums = _compute_active_organ_sums(
+        organ_ids,
         mask_gt,
         gt,
         mask_predgrid,
@@ -1513,10 +1562,9 @@ def save_active_organ_plots(
     )
     indices = np.arange(len(names))
     fig, ax = plt.subplots(figsize=(max(6, len(names) * 0.6), 4))
-    width = 0.25
-    ax.bar(indices - width, gt_sums, width, label="GT")
-    ax.bar(indices, pred_native_sums, width, label="Pred (native)")
-    ax.bar(indices + width, pred_gt_sums, width, label="Pred (GT)")
+    width = 0.35
+    ax.bar(indices - width / 2, gt_sums, width, label="GT")
+    ax.bar(indices + width / 2, pred_gt_sums, width, label="Pred")
     ax.set_xticks(indices)
     ax.set_xticklabels(names, rotation=45, ha="right", fontsize=8)
     ax.set_ylabel("sum activity")
@@ -1527,12 +1575,10 @@ def save_active_organ_plots(
     plt.close(fig)
 
     gt_total = sum(gt_sums)
-    pred_native_total = sum(pred_native_sums)
     pred_gt_total = sum(pred_gt_sums)
     fig, ax = plt.subplots(figsize=(max(6, len(names) * 0.6), 4))
-    ax.bar(indices - width, [_safe_divide(val, gt_total) for val in gt_sums], width, label="GT")
-    ax.bar(indices, [_safe_divide(val, pred_native_total) for val in pred_native_sums], width, label="Pred (native)")
-    ax.bar(indices + width, [_safe_divide(val, pred_gt_total) for val in pred_gt_sums], width, label="Pred (GT)")
+    ax.bar(indices - width / 2, [_safe_divide(val, gt_total) for val in gt_sums], width, label="GT")
+    ax.bar(indices + width / 2, [_safe_divide(val, pred_gt_total) for val in pred_gt_sums], width, label="Pred")
     ax.set_xticks(indices)
     ax.set_xticklabels(names, rotation=45, ha="right", fontsize=8)
     ax.set_ylabel("fraction of active total")
@@ -1572,6 +1618,8 @@ def run_postprocessing(args):
         physics_projector_config_cls, physics_project_activity = _get_physics_projector_imports()
     elif args.calibrate_scale:
         raise ValueError("--calibrate-scale is only supported with --proj-forward-model physics")
+    if args.ls_calibrate_global and args.proj_forward_model != "train":
+        raise ValueError("--ls-calibrate-global is only supported with --proj-forward-model train")
     train_forward_projector = None
     if args.proj_forward_model == "train":
         train_forward_projector = TrainForwardProjector(
@@ -1845,6 +1893,48 @@ def run_postprocessing(args):
                     except Exception as exc:
                         _LOG.exception("failed to render train-path projections for %s: %s", pid, exc)
                         raise
+                    pred_save_ap, pred_save_pa = pred_save_pa, pred_save_ap
+                    _LOG.info("[ap/pa-fix] swapped train-forward AP/PA outputs before metrics/saving for %s", pid)
+                    ls_alpha = None
+                    ls_num = None
+                    ls_den = None
+                    pred_sum_before = float(np.nansum(pred_save_ap) + np.nansum(pred_save_pa))
+                    gt_sum_ap_val = float(np.nansum(gt_save_ap)) if gt_save_ap is not None else float("nan")
+                    gt_sum_pa_val = float(np.nansum(gt_save_pa)) if gt_save_pa is not None else float("nan")
+                    if args.ls_calibrate_global:
+                        if proj_domain_loaded != "counts":
+                            raise RuntimeError(
+                                f"--ls-calibrate-global requires counts GT, but loaded domain={proj_domain_loaded} for {pid}"
+                            )
+                        if gt_save_ap is None or gt_save_pa is None:
+                            raise RuntimeError(
+                                f"--ls-calibrate-global requires gt counts for {pid}, but GT projections are missing"
+                            )
+                        ls_alpha, ls_num, ls_den = _ls_alpha_global(
+                            pred_save_ap,
+                            pred_save_pa,
+                            gt_save_ap,
+                            gt_save_pa,
+                            eps=float(args.ls_calibrate_eps),
+                        )
+                        pred_save_ap = (np.asarray(pred_save_ap, dtype=np.float32) * np.float32(ls_alpha)).astype(np.float32, copy=False)
+                        pred_save_pa = (np.asarray(pred_save_pa, dtype=np.float32) * np.float32(ls_alpha)).astype(np.float32, copy=False)
+                        _LOG.info(
+                            "[ls-cal][%s] alpha_global=%.6e num=%.6e den=%.6e",
+                            pid,
+                            ls_alpha,
+                            ls_num,
+                            ls_den,
+                        )
+                    pred_sum_after = float(np.nansum(pred_save_ap) + np.nansum(pred_save_pa))
+                    train_meta["ls_calibrate_global"] = bool(args.ls_calibrate_global)
+                    train_meta["alpha_global"] = float(ls_alpha) if ls_alpha is not None else None
+                    train_meta["alpha_num"] = float(ls_num) if ls_num is not None else None
+                    train_meta["alpha_den"] = float(ls_den) if ls_den is not None else None
+                    train_meta["pred_sum_before"] = pred_sum_before
+                    train_meta["pred_sum_after"] = pred_sum_after
+                    train_meta["gt_sum_ap"] = gt_sum_ap_val
+                    train_meta["gt_sum_pa"] = gt_sum_pa_val
                     if gt_save_ap is not None and gt_save_pa is not None:
                         mae, dev = _compute_proj_metrics_from_arrays(
                             pred_save_ap, pred_save_pa, gt_save_ap, gt_save_pa, args.device

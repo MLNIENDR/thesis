@@ -78,7 +78,7 @@ if [[ ! -d "${RUN_DIR}/${EFFECTIVE_SLICES_DIR}" ]]; then
 fi
 
 if [[ -z "${OUT_DIR}" ]]; then
-  OUT_DIR="${RUN_DIR}/postproc_baseline_calib_${EFFECTIVE_SLICES_DIR}"
+  OUT_DIR="${RUN_DIR}/postproc_baseline_${EFFECTIVE_SLICES_DIR}"
 fi
 
 PRED_ACT_PATTERN="${EFFECTIVE_SLICES_DIR}/${PRED_ACT_PATTERN_TEMPLATE}"
@@ -108,7 +108,8 @@ srun /usr/bin/time -v "${PYTHON_BIN}" -u postprocessing.py \
   --device "${DEVICE}" \
   --pred-act-per-phantom \
   --pred-act-pattern "${PRED_ACT_PATTERN}" \
-  --calibrate-scale \
+  --proj-forward-model train \
+  --checkpoint "${RUN_DIR}/checkpoints/checkpoint_step08000.pt" \
   --render-projections \
   --save-proj-npy \
   --save-proj-png \
