@@ -271,6 +271,40 @@ def parse_args():
         action="store_true",
         help="save bar plots for GT active organs (absolute and fractional)",
     )
+    parser.add_argument(
+        "--save-act-compare-5slices",
+        action="store_true",
+        help="save 5-slice GT-vs-pred activity comparison in postproc/<phantom>/plots",
+    )
+    parser.add_argument(
+        "--act-compare-axis",
+        type=int,
+        choices=[0, 1, 2],
+        default=2,
+        help="slice axis for 5-slice activity comparison",
+    )
+    parser.add_argument(
+        "--act-compare-stride",
+        type=int,
+        default=1,
+        help="only allow slice indices i where i %% stride == 0 for activity comparison",
+    )
+    parser.add_argument(
+        "--act-compare-outname",
+        type=str,
+        default="act_compare_5slices_axis{axis}.png",
+        help="output filename template (supports {axis}) for activity comparison",
+    )
+    parser.add_argument(
+        "--debug-orientation-search",
+        action="store_true",
+        help="log all orientation candidates and scores for pred->GT-grid alignment debug (train path)",
+    )
+    parser.add_argument(
+        "--save-orientation-debug-volumes",
+        action="store_true",
+        help="save gt_roi/pred_roi_gtgrid dumps (+meta) for orientation sanity checks",
+    )
     return parser.parse_args()
 
 
@@ -441,6 +475,143 @@ def resample_mask_to_pred(mask_GT: np.ndarray, pred_shape: tuple[int, int, int])
     with torch.no_grad():
         resampled = F.interpolate(tensor, size=pred_shape, mode="nearest")
     return resampled.squeeze(0).squeeze(0).cpu().numpy().astype(np.int32)
+
+
+def _ncc_global(a: np.ndarray, b: np.ndarray) -> float:
+    x = np.asarray(a, dtype=np.float64).ravel()
+    y = np.asarray(b, dtype=np.float64).ravel()
+    x = x - np.mean(x)
+    y = y - np.mean(y)
+    den = float(np.linalg.norm(x) * np.linalg.norm(y))
+    if den <= 1e-18:
+        return float("nan")
+    return float(np.dot(x, y) / den)
+
+
+def _center_of_mass_vox(arr: np.ndarray) -> np.ndarray:
+    w = np.clip(np.asarray(arr, dtype=np.float64), 0.0, None)
+    total = float(np.sum(w))
+    if total <= 1e-18:
+        return np.array([np.nan, np.nan, np.nan], dtype=np.float64)
+    coords = np.indices(w.shape, dtype=np.float64)
+    return np.array([float(np.sum(coords[i] * w) / total) for i in range(w.ndim)], dtype=np.float64)
+
+
+def _com_dist_vox(a: np.ndarray, b: np.ndarray) -> float:
+    com_a = _center_of_mass_vox(a)
+    com_b = _center_of_mass_vox(b)
+    if not np.all(np.isfinite(com_a)) or not np.all(np.isfinite(com_b)):
+        return float("inf")
+    return float(np.linalg.norm(com_a - com_b))
+
+
+def plane_axes_for_slice_axis(axis: int) -> tuple[int, int]:
+    if axis == 2:
+        return (0, 1)
+    if axis == 1:
+        return (0, 2)
+    if axis == 0:
+        return (1, 2)
+    raise ValueError(f"invalid axis={axis}; expected one of 0,1,2")
+
+
+def _apply_orientation_transform(
+    vol: np.ndarray,
+    k_rot90: int,
+    do_fliplr: bool,
+    do_flipud: bool,
+    plane_axes: tuple[int, int],
+) -> np.ndarray:
+    a, b = plane_axes
+    out = np.rot90(vol, k=int(k_rot90), axes=(a, b))
+    if do_flipud:
+        out = np.flip(out, axis=a)
+    if do_fliplr:
+        out = np.flip(out, axis=b)
+    return out
+
+
+def _orientation_transform_label(
+    k_rot90: int,
+    do_fliplr: bool,
+    do_flipud: bool,
+    plane_axes: tuple[int, int],
+) -> str:
+    a, b = plane_axes
+    parts = [f"rot90(k={int(k_rot90)}, axes=({a},{b}))"]
+    if do_fliplr:
+        parts.append(f"fliplr(axis={b})")
+    if do_flipud:
+        parts.append(f"flipud(axis={a})")
+    return " + ".join(parts)
+
+
+def _pick_best_pred_orientation(
+    gt_roi: np.ndarray,
+    pred_roi: np.ndarray,
+    phantom_id: str,
+    debug: bool,
+    plane_axes: tuple[int, int],
+) -> dict[str, Any]:
+    flip_modes = [
+        (False, False),
+        (True, False),
+        (False, True),
+        (True, True),
+    ]
+    results: list[dict[str, Any]] = []
+    for k in (0, 1, 2, 3):
+        for do_fliplr, do_flipud in flip_modes:
+            cand = _apply_orientation_transform(
+                pred_roi,
+                k_rot90=k,
+                do_fliplr=do_fliplr,
+                do_flipud=do_flipud,
+                plane_axes=plane_axes,
+            )
+            if cand.shape != gt_roi.shape:
+                continue
+            ncc = _ncc_global(gt_roi, cand)
+            com_dist = _com_dist_vox(gt_roi, cand)
+            item = {
+                "k_rot90": int(k),
+                "fliplr": bool(do_fliplr),
+                "flipud": bool(do_flipud),
+                "label": _orientation_transform_label(k, do_fliplr, do_flipud, plane_axes),
+                "ncc": float(ncc),
+                "com_dist_vox": float(com_dist),
+            }
+            results.append(item)
+            if debug:
+                _LOG.info(
+                    "[orient-debug][%s] candidate=%s ncc=%.6f com_dist_vox=%.6f",
+                    phantom_id,
+                    item["label"],
+                    item["ncc"],
+                    item["com_dist_vox"],
+                )
+    if not results:
+        raise RuntimeError(f"[orient-fix][{phantom_id}] no valid orientation candidates")
+
+    def _key(item: dict[str, Any]) -> tuple[float, float]:
+        ncc = item["ncc"]
+        com_dist = item["com_dist_vox"]
+        ncc_rank = ncc if np.isfinite(ncc) else -np.inf
+        com_rank = -com_dist if np.isfinite(com_dist) else -np.inf
+        return (ncc_rank, com_rank)
+
+    best = max(results, key=_key)
+    identity = next(
+        (item for item in results if item["k_rot90"] == 0 and not item["fliplr"] and not item["flipud"]),
+        None,
+    )
+    if identity is None:
+        raise RuntimeError(f"[orient-fix][{phantom_id}] identity candidate missing")
+    return {
+        "best": best,
+        "identity": identity,
+        "results": results,
+    }
 
 
 def _safe_divide(numer: float, denom: float) -> float:
@@ -958,6 +1129,158 @@ def _save_projection_pngs(
     _save_gray_image(plot_dir / "gt_pa.png", gt_pa, "GT PA", "counts")
     _save_view_logpct(plot_dir / "ap_gt_vs_pred_logpct.png", gt_ap, pred_ap, "AP")
     _save_view_logpct(plot_dir / "pa_gt_vs_pred_logpct.png", gt_pa, pred_pa, "PA")
+
+
+def _slice_mass(volume: np.ndarray, axis: int) -> np.ndarray:
+    sum_axes = tuple(i for i in range(volume.ndim) if i != axis)
+    return np.sum(volume, axis=sum_axes)
+
+
+def _extract_slice(volume: np.ndarray, axis: int, idx: int) -> np.ndarray:
+    return np.take(volume, idx, axis=axis)
+
+
+def _dedupe_keep_order(values: list[int]) -> list[int]:
+    seen = set()
+    out: list[int] = []
+    for val in values:
+        if val not in seen:
+            out.append(val)
+            seen.add(val)
+    return out
+
+
+def _cdf_crossing_index(candidate_indices: np.ndarray, mass_gt: np.ndarray, frac: float) -> int:
+    candidate_masses = np.asarray(mass_gt[candidate_indices], dtype=np.float64)
+    cumulative = np.cumsum(candidate_masses)
+    target = float(frac) * float(cumulative[-1])
+    local = int(np.searchsorted(cumulative, target, side="left"))
+    local = min(local, candidate_indices.size - 1)
+    return int(candidate_indices[local])
+
+
+def _select_act_compare_slices(
+    mass_gt: np.ndarray,
+    mass_pred: np.ndarray,
+    stride: int,
+    phantom_id: str,
+) -> list[int]:
+    if stride < 1:
+        raise RuntimeError(
+            f"[act-compare-5][{phantom_id}] invalid stride={stride}; --act-compare-stride must be >= 1"
+        )
+    n_slices = int(mass_gt.shape[0])
+    candidate_indices = np.arange(0, n_slices, stride, dtype=int)
+    if candidate_indices.size < 5:
+        raise RuntimeError(
+            f"[act-compare-5][{phantom_id}] only {candidate_indices.size} candidate slices for "
+            f"axis-length={n_slices} stride={stride}; need at least 5"
+        )
+
+    idx_max_gt = int(candidate_indices[np.argmax(mass_gt[candidate_indices])])
+    idx_max_pred = int(candidate_indices[np.argmax(mass_pred[candidate_indices])])
+    idx_q25 = _cdf_crossing_index(candidate_indices, mass_gt, 0.25)
+    idx_q50 = _cdf_crossing_index(candidate_indices, mass_gt, 0.50)
+    idx_q75 = _cdf_crossing_index(candidate_indices, mass_gt, 0.75)
+
+    selected = _dedupe_keep_order([idx_max_gt, idx_max_pred, idx_q25, idx_q50, idx_q75])
+    if len(selected) < 5:
+        ranked = candidate_indices[np.argsort(mass_gt[candidate_indices])[::-1]]
+        for idx in ranked:
+            ii = int(idx)
+            if ii not in selected:
+                selected.append(ii)
+            if len(selected) == 5:
+                break
+    if len(selected) != 5:
+        raise RuntimeError(f"[act-compare-5][{phantom_id}] failed to select 5 unique slices")
+    return selected
+
+
+def save_activity_compare_5slices(
+    plot_dir: Path,
+    phantom_id: str,
+    gt: np.ndarray,
+    pred_gtgrid: np.ndarray,
+    axis: int,
+    stride: int,
+    outname_template: str,
+) -> None:
+    if not _MATPLOTLIB_AVAILABLE:
+        _LOG.warning("[act-compare-5][%s] matplotlib unavailable; skipping", phantom_id)
+        return
+    if gt.shape != pred_gtgrid.shape:
+        raise RuntimeError(
+            f"[act-compare-5][{phantom_id}] shape mismatch gt={gt.shape} pred_gtgrid={pred_gtgrid.shape}"
+        )
+
+    mass_gt = _slice_mass(gt, axis=axis)
+    mass_pred = _slice_mass(pred_gtgrid, axis=axis)
+    total_gt_mass = float(np.sum(mass_gt))
+    if total_gt_mass == 0.0:
+        raise RuntimeError(f"[act-compare-5][{phantom_id}] total GT mass is 0")
+
+    selected = _select_act_compare_slices(mass_gt, mass_pred, stride, phantom_id)
+    _LOG.info(
+        "[act-compare-5][%s] selected_slices=%s axis=%d stride=%d",
+        phantom_id,
+        selected,
+        axis,
+        stride,
+    )
+    for idx in selected:
+        _LOG.info(
+            "[act-compare-5][%s] slice=%d mass_gt=%.6g mass_pred=%.6g",
+            phantom_id,
+            idx,
+            float(mass_gt[idx]),
+            float(mass_pred[idx]),
+        )
+
+    # Display-only clamp for robust color scaling.
+    gt_plot = np.clip(np.asarray(gt, dtype=np.float32), 0.0, None)
+    pred_plot = np.clip(np.asarray(pred_gtgrid, dtype=np.float32), 0.0, None)
+    vmax = 0.0
+    for idx in selected:
+        vmax = max(
+            vmax,
+            float(np.max(_extract_slice(gt_plot, axis, idx))),
+            float(np.max(_extract_slice(pred_plot, axis, idx))),
+        )
+    vmin = 0.0
+    _LOG.info("[act-compare-5][%s] color scale vmin=%.6g vmax=%.6g", phantom_id, vmin, vmax)
+
+    try:
+        outname = outname_template.format(axis=axis)
+    except Exception as exc:
+        raise RuntimeError(
+            f"[act-compare-5][{phantom_id}] invalid --act-compare-outname template: {outname_template!r}"
+        ) from exc
+    out_path = plot_dir / outname
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    fig, axes = plt.subplots(nrows=5, ncols=2, figsize=(8.5, 16), dpi=200)
+    im = None
+    for row, idx in enumerate(selected):
+        gt_slice = _extract_slice(gt_plot, axis, idx)
+        pred_slice = _extract_slice(pred_plot, axis, idx)
+        ax_l = axes[row, 0]
+        ax_r = axes[row, 1]
+        im = ax_l.imshow(gt_slice, cmap="viridis", vmin=vmin, vmax=vmax)
+        ax_r.imshow(pred_slice, cmap="viridis", vmin=vmin, vmax=vmax)
+        ax_l.set_title(f"GT | z = {idx}")
+        ax_r.set_title(f"Pred | z = {idx}")
+        ax_l.set_xticks([])
+        ax_l.set_yticks([])
+        ax_r.set_xticks([])
+        ax_r.set_yticks([])
+    fig.tight_layout(rect=[0.0, 0.0, 0.90, 1.0])
+    cax = fig.add_axes([0.92, 0.12, 0.02, 0.76])
+    cbar = fig.colorbar(im, cax=cax)
+    cbar.set_label("Activity")
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    _LOG.info("[act-compare-5][%s] saved %s", phantom_id, out_path)
 
 
 
@@ -1655,6 +1978,7 @@ def run_postprocessing(args):
         gt_shape = gt_act.shape
         spacing_gt = spacing_from_meta(act_path, voxel_mm)
         slices = (slice(None), slice(None), slice(None))
+        gt_roi = gt_act[slices]
         idx_ranges = {
             "axis0": {"min": 0, "max": gt_shape[0] - 1},
             "axis1": {"min": 0, "max": gt_shape[1] - 1},
@@ -1702,6 +2026,76 @@ def run_postprocessing(args):
                 fast_warning_logged = True
             pred_gt_full = resample_pred_to_gt(pred_act, gt_shape, args.device)
             pred_roi = pred_gt_full[slices]
+
+        orientation_fix_margin = 0.02
+        orientation_search_axis = int(args.act_compare_axis)
+        orientation_search_axes = plane_axes_for_slice_axis(orientation_search_axis)
+        orientation_fix_info = {
+            "applied": False,
+            "transform": "identity",
+            "ncc_identity": float("nan"),
+            "ncc_best": float("nan"),
+            "com_dist_identity_vox": float("nan"),
+            "com_dist_best_vox": float("nan"),
+            "search_axis": orientation_search_axis,
+            "search_axes": orientation_search_axes,
+            "apply_margin_ncc": float(orientation_fix_margin),
+        }
+        if args.proj_forward_model == "train":
+            _LOG.info(
+                "[orient-fix][%s] orientation_search_axes=%s (from slice axis=%d)",
+                pid,
+                orientation_search_axes,
+                orientation_search_axis,
+            )
+            orient_eval = _pick_best_pred_orientation(
+                gt_roi=gt_roi,
+                pred_roi=pred_roi,
+                phantom_id=pid,
+                debug=bool(args.debug_orientation_search),
+                plane_axes=orientation_search_axes,
+            )
+            best = orient_eval["best"]
+            identity = orient_eval["identity"]
+            should_apply = bool(
+                np.isfinite(best["ncc"])
+                and np.isfinite(identity["ncc"])
+                and float(best["ncc"]) > float(identity["ncc"]) + orientation_fix_margin
+            )
+            if should_apply:
+                pred_gt_full = _apply_orientation_transform(
+                    pred_gt_full,
+                    k_rot90=best["k_rot90"],
+                    do_fliplr=best["fliplr"],
+                    do_flipud=best["flipud"],
+                    plane_axes=orientation_search_axes,
+                ).astype(np.float32, copy=False)
+                pred_roi = pred_gt_full[slices]
+            orientation_fix_info = {
+                "applied": bool(should_apply),
+                "transform": str(best["label"]),
+                "ncc_identity": float(identity["ncc"]),
+                "ncc_best": float(best["ncc"]),
+                "com_dist_identity_vox": float(identity["com_dist_vox"]),
+                "com_dist_best_vox": float(best["com_dist_vox"]),
+                "search_axis": orientation_search_axis,
+                "search_axes": orientation_search_axes,
+                "apply_margin_ncc": float(orientation_fix_margin),
+            }
+            _LOG.info(
+                "[orient-fix][%s] best transform: %s | ncc_identity=%.6f ncc_best=%.6f "
+                "| com_identity=%.6f com_best=%.6f | apply_margin=%.3f | applied=%s | shapes gt=%s pred=%s",
+                pid,
+                best["label"],
+                float(identity["ncc"]),
+                float(best["ncc"]),
+                float(identity["com_dist_vox"]),
+                float(best["com_dist_vox"]),
+                orientation_fix_margin,
+                orientation_fix_info["applied"],
+                tuple(gt_roi.shape),
+                tuple(pred_roi.shape),
+            )
         calibration_scale = 1.0
         if args.calibrate_scale:
             if ct_path is None or not ct_path.exists():
@@ -1729,7 +2123,23 @@ def run_postprocessing(args):
             pred_gt_full = (pred_gt_full * scale32).astype(np.float32, copy=False)
             pred_roi = (pred_roi * scale32).astype(np.float32, copy=False)
             _LOG.info("[%s] calibration scale=%.5f", pid, calibration_scale)
-        gt_roi = gt_act[slices]
+
+        if args.save_orientation_debug_volumes:
+            orient_dir = patient_dir / "orientation_debug"
+            orient_dir.mkdir(parents=True, exist_ok=True)
+            np.save(orient_dir / "gt_roi.npy", np.asarray(gt_roi, dtype=np.float32))
+            np.save(orient_dir / "pred_roi_gtgrid.npy", np.asarray(pred_roi, dtype=np.float32))
+            (orient_dir / "meta.json").write_text(
+                json.dumps(
+                    {
+                        "phantom_id": pid,
+                        "orientation_fix": orientation_fix_info,
+                        "gt_shape": tuple(gt_roi.shape),
+                        "pred_shape": tuple(pred_roi.shape),
+                    },
+                    indent=2,
+                )
+            )
         V_gt = spacing_gt[0] * spacing_gt[1] * spacing_gt[2]
         A_gt_vol = float(gt_roi.sum()) * V_gt
         A_pred_vol = float(pred_roi.sum()) * V_gt
@@ -1868,6 +2278,27 @@ def run_postprocessing(args):
                     pred_gt_full,
                     V_gt,
                     V_pred,
+                )
+            if args.save_act_compare_5slices:
+                # Use the same GT-grid arrays as voxel metrics (gt_roi/pred_roi).
+                gt = gt_roi
+                pred_gtgrid = pred_roi
+                _LOG.info(
+                    "[act-compare-5][%s] plot-input-check gt.shape=%s pred_gtgrid.shape=%s gt.sum=%.6g pred_gtgrid.sum=%.6g",
+                    pid,
+                    tuple(gt.shape),
+                    tuple(pred_gtgrid.shape),
+                    float(np.sum(gt)),
+                    float(np.sum(pred_gtgrid)),
+                )
+                save_activity_compare_5slices(
+                    plot_dir=plot_dir,
+                    phantom_id=pid,
+                    gt=gt,
+                    pred_gtgrid=pred_gtgrid,
+                    axis=args.act_compare_axis,
+                    stride=args.act_compare_stride,
+                    outname_template=args.act_compare_outname,
                 )
 
         with timer.block("projections"):
@@ -2128,6 +2559,12 @@ def run_postprocessing(args):
                 "proj_norm_factor": proj_norm_factor,
                 "calibration_scale": calibration_scale,
                 "calibrate_scale_enabled": bool(args.calibrate_scale),
+                "orientation_fix_applied": bool(orientation_fix_info["applied"]),
+                "orientation_fix_transform": orientation_fix_info["transform"],
+                "orientation_fix_ncc_identity": orientation_fix_info["ncc_identity"],
+                "orientation_fix_ncc_best": orientation_fix_info["ncc_best"],
+                "orientation_fix_com_dist_identity_vox": orientation_fix_info["com_dist_identity_vox"],
+                "orientation_fix_com_dist_best_vox": orientation_fix_info["com_dist_best_vox"],
             },
             "assumptions": assumptions,
         }

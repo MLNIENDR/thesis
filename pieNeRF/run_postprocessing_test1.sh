@@ -20,7 +20,7 @@ MANIFEST="/home/mnguest12/projects/thesis/pieNeRF/data/manifest_abs.csv"
 
 MASK_PATTERN='/home/mnguest12/projects/thesis/Data_Processing/{phantom}/out/mask.npy'
 DEVICE="cuda"
-PRED_SLICES_DIR="${PRED_SLICES_DIR:-rest_slices}"
+PRED_SLICES_DIR="${PRED_SLICES_DIR:-test_slices}"
 PRED_ACT_PATTERN_TEMPLATE="${PRED_ACT_PATTERN_TEMPLATE:-}"
 OUT_DIR="${OUT_DIR:-}"
 
@@ -114,7 +114,10 @@ srun /usr/bin/time -v "${PYTHON_BIN}" -u postprocessing.py \
   --save-proj-npy \
   --save-proj-png \
   --timing \
+  --save-act-compare-5slices \
   --skip-plots \
+  --debug-orientation-search \
+  --save-orientation-debug-volumes \
   --save-active-organ-plots
 set +x
 

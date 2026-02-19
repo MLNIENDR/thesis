@@ -85,6 +85,86 @@ def _downsample_3d(arr: np.ndarray, stride: int = 4) -> np.ndarray:
     return arr[::stride, ::stride, ::stride]
 
 
+def _apply_yx_orientation_transform(vol: np.ndarray, k_rot90: int, do_fliplr: bool, do_flipud: bool) -> np.ndarray:
+    out = np.rot90(vol, k=int(k_rot90), axes=(-2, -1))
+    if do_flipud:
+        out = np.flip(out, axis=-2)
+    if do_fliplr:
+        out = np.flip(out, axis=-1)
+    return out
+
+
+def _orientation_transform_label(k_rot90: int, do_fliplr: bool, do_flipud: bool) -> str:
+    parts = [f"rot90(k={int(k_rot90)}, axes=(Y,X))"]
+    if do_fliplr:
+        parts.append("fliplr")
+    if do_flipud:
+        parts.append("flipud")
+    return " + ".join(parts)
+
+
+def _center_of_mass_vox(arr: np.ndarray) -> np.ndarray:
+    w = np.clip(np.asarray(arr, dtype=np.float64), 0.0, None)
+    total = float(np.sum(w))
+    if total <= 1e-18:
+        return np.array([np.nan, np.nan, np.nan], dtype=np.float64)
+    coords = np.indices(w.shape, dtype=np.float64)
+    return np.array([float(np.sum(coords[i] * w) / total) for i in range(w.ndim)], dtype=np.float64)
+
+
+def _com_dist_vox(a: np.ndarray, b: np.ndarray) -> float:
+    ca = _center_of_mass_vox(a)
+    cb = _center_of_mass_vox(b)
+    if not np.all(np.isfinite(ca)) or not np.all(np.isfinite(cb)):
+        return float("inf")
+    return float(np.linalg.norm(ca - cb))
+
+
+def _best_orientation_candidate(gt_roi: np.ndarray, pred_roi: np.ndarray) -> dict[str, Any]:
+    flip_modes = [
+        (False, False),
+        (True, False),
+        (False, True),
+        (True, True),
+    ]
+    results: list[dict[str, Any]] = []
+    for k in (0, 1, 2, 3):
+        for do_fliplr, do_flipud in flip_modes:
+            cand = _apply_yx_orientation_transform(pred_roi, k, do_fliplr, do_flipud)
+            if cand.shape != gt_roi.shape:
+                continue
+            ncc = _ncc(gt_roi, cand)
+            com_dist = _com_dist_vox(gt_roi, cand)
+            results.append(
+                {
+                    "k_rot90": int(k),
+                    "fliplr": bool(do_fliplr),
+                    "flipud": bool(do_flipud),
+                    "label": _orientation_transform_label(k, do_fliplr, do_flipud),
+                    "ncc": float(ncc),
+                    "com_dist_vox": float(com_dist),
+                }
+            )
+    if not results:
+        raise RuntimeError("no valid orientation candidates for 3D orientation check")
+
+    def _rank(item: dict[str, Any]) -> tuple[float, float]:
+        ncc = item["ncc"]
+        com_dist = item["com_dist_vox"]
+        ncc_rank = ncc if np.isfinite(ncc) else -np.inf
+        com_rank = -com_dist if np.isfinite(com_dist) else -np.inf
+        return (ncc_rank, com_rank)
+
+    best = max(results, key=_rank)
+    identity = next(
+        (item for item in results if item["k_rot90"] == 0 and not item["fliplr"] and not item["flipud"]),
+        None,
+    )
+    if identity is None:
+        raise RuntimeError("identity orientation candidate missing")
+    return {"best": best, "identity": identity}
+
+
 def _extract_cli_from_command(command_path: Path) -> tuple[list[str], dict[str, Any]]:
     raw = command_path.read_text().strip()
     toks = shlex.split(raw)
@@ -456,6 +536,55 @@ def main() -> int:
                     )
             else:
                 warnings.append(f"{pid} non-finite NCC score(s) for AP/PA swap check")
+
+            # Optional 3D GT-grid orientation sanity check (if postprocessing dumps exist).
+            patient_dir = ap_path.parents[1]
+            metrics_path = patient_dir / "metrics.json"
+            orient_applied = None
+            orient_transform = "unknown"
+            if metrics_path.exists():
+                try:
+                    metrics_payload = _load_json(metrics_path)
+                    metrics_block = metrics_payload.get("metrics", {})
+                    orient_applied = metrics_block.get("orientation_fix_applied")
+                    orient_transform = str(metrics_block.get("orientation_fix_transform", "unknown"))
+                except Exception as e:
+                    warnings.append(f"{pid} failed to parse orientation metadata from {metrics_path}: {e}")
+            if orient_applied is True:
+                print(f"{pid}: orientation_fix=INFO applied transform={orient_transform}")
+
+            orient_dir = patient_dir / "orientation_debug"
+            gt_roi_path = orient_dir / "gt_roi.npy"
+            pred_roi_path = orient_dir / "pred_roi_gtgrid.npy"
+            if gt_roi_path.exists() and pred_roi_path.exists():
+                try:
+                    gt_roi = np.load(gt_roi_path).astype(np.float32)
+                    pred_roi = np.load(pred_roi_path).astype(np.float32)
+                    if gt_roi.shape != pred_roi.shape:
+                        warnings.append(
+                            f"{pid} orientation_debug shape mismatch gt_roi={gt_roi.shape} pred_roi={pred_roi.shape}"
+                        )
+                    else:
+                        orient_eval = _best_orientation_candidate(gt_roi, pred_roi)
+                        best = orient_eval["best"]
+                        identity = orient_eval["identity"]
+                        print(
+                            f"{pid}: 3D-orient NCC(identity/best)={identity['ncc']:.4f}/{best['ncc']:.4f} "
+                            f"CoMdist(identity/best)={identity['com_dist_vox']:.4f}/{best['com_dist_vox']:.4f} "
+                            f"best={best['label']}"
+                        )
+                        if orient_applied is not True:
+                            if math.isfinite(best["ncc"]) and math.isfinite(identity["ncc"]) and best["ncc"] > identity["ncc"] + 0.05:
+                                warnings.append(
+                                    f"{pid} orientation not applied, but transformed NCC is much better: "
+                                    f"best={best['ncc']:.4f} identity={identity['ncc']:.4f} transform={best['label']}"
+                                )
+                except Exception as e:
+                    warnings.append(f"{pid} orientation_debug evaluation failed: {e}")
+            else:
+                warnings.append(
+                    f"{pid} no orientation_debug volumes found at {orient_dir} (run postprocessing with --save-orientation-debug-volumes)"
+                )
             if ncc_ap > 0.2 and ncc_pa > 0.2:
                 at_least_one_ncc_pass = True
         if not at_least_one_ncc_pass:
