@@ -48,6 +48,8 @@ def compute_run_stats(metrics_path):
 def resolve_metrics_path(tag_dir: Path) -> Path | None:
     # Preferred current layout from run_postprocessing.sh
     candidates = [
+        # Current train-forward test-slices layout
+        tag_dir / "postproc_trainfwd_test_slices" / "metrics.csv",
         tag_dir / "results_spect" / "postproc_baseline_calib" / "metrics.csv",
         # Backward-compatible layouts
         tag_dir / "results_spect" / "postproc" / "metrics.csv",
@@ -78,7 +80,6 @@ def main():
             d for d in sweep_root.iterdir()
             if d.is_dir()
             and d.name.startswith(args.tag_prefix)
-            and (d / "results_spect").exists()
         ]
     )
 

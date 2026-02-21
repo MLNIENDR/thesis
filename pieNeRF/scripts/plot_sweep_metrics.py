@@ -24,6 +24,23 @@ PROJECTION_LEAK_METRICS = [
     "pred_outside_mask_frac",
 ]
 ALL_METRICS = VOLUME_ORGAN_METRICS + PROJECTION_LEAK_METRICS
+PLOT_GROUP_PRIMARY = [
+    "vol_mae_vol",
+    "proj_poisson_dev_counts",
+]
+PLOT_GROUP_SECONDARY = [
+    "activity_rel_abs_error_vol",
+    "organ_rel_error_total_activity_active_mean",
+    "pred_outside_mask_frac",
+]
+
+METRIC_COLORS = {
+    "proj_poisson_dev_counts": "red",
+    "pred_outside_mask_frac": "pink",
+    "vol_mae_vol": "purple",
+    "activity_rel_abs_error_vol": "lightgreen",
+    "organ_rel_error_total_activity_active_mean": "cornflowerblue",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -97,6 +114,7 @@ def parse_sweep_param(tag: str) -> tuple[str, Optional[float]]:
 
 def resolve_metrics_path(tag_dir: Path) -> Optional[Path]:
     candidates = [
+        tag_dir / "postproc_trainfwd_test_slices" / "metrics.csv",
         tag_dir / "results_spect" / "postproc_baseline_calib" / "metrics.csv",
         tag_dir / "results_spect" / "postproc" / "metrics.csv",
         tag_dir / "postproc" / "metrics.csv",
@@ -145,7 +163,11 @@ def collect_sweep_summary(
     sweep_root: Path, tag_prefix: str, tag_regex: str
 ) -> pd.DataFrame:
     rows = []
-    tag_dirs = [d for d in sorted(sweep_root.iterdir()) if d.is_dir() and (d / "results_spect").exists()]
+    tag_dirs = [
+        d
+        for d in sorted(sweep_root.iterdir())
+        if d.is_dir() and not d.name.endswith("_sweep")
+    ]
     if tag_regex:
         matcher = re.compile(tag_regex)
         tag_dirs = [d for d in tag_dirs if matcher.search(d.name)]
@@ -180,7 +202,7 @@ def collect_sweep_summary(
 def plot_metrics(
     df: pd.DataFrame,
     metrics: Iterable[str],
-    title: str,
+    title: Optional[str],
     filepath: Path,
     x_label: str = "Sweep Parameter",
 ) -> None:
@@ -210,9 +232,11 @@ def plot_metrics(
             marker="o",
             capsize=3,
             label=metric,
+            color=METRIC_COLORS.get(metric),
         )
 
-    ax.set_title(title)
+    if title:
+        ax.set_title(title)
     ax.set_ylabel("Metric value")
     ax.grid(True, which="major", linestyle="--", alpha=0.4)
     ax.legend()
@@ -241,14 +265,14 @@ def main() -> None:
 
     plot_metrics(
         summary_df,
-        VOLUME_ORGAN_METRICS,
-        "Volume- and Organ-Based Metrics vs Sweep Parameter",
+        PLOT_GROUP_PRIMARY,
+        None,
         output_dir / args.plot_vol,
     )
     plot_metrics(
         summary_df,
-        PROJECTION_LEAK_METRICS,
-        "Projection and Leakage Metrics vs Sweep Parameter",
+        PLOT_GROUP_SECONDARY,
+        None,
         output_dir / args.plot_proj,
     )
 
