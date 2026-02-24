@@ -203,6 +203,11 @@ def parse_args():
         default="physics",
         help="projection forward model: physics projector or training renderer path",
     )
+    parser.add_argument(
+        "--force-use-attenuation",
+        action="store_true",
+        help="force use_attenuation=True for train-forward renderer, regardless of training config",
+    )
     parser.add_argument("--pred-ap-path", help="explicit pred AP projection (.npy)")
     parser.add_argument("--pred-pa-path", help="explicit pred PA projection (.npy)")
     parser.add_argument(
@@ -1623,6 +1628,8 @@ class TrainForwardProjector:
             cfg_nerf.attenuation_debug = False
         if not hasattr(cfg_nerf, "atten_scale"):
             cfg_nerf.atten_scale = 25.0
+        if bool(getattr(self.args, "force_use_attenuation", False)):
+            cfg_nerf.use_attenuation = True
 
         render_train, render_test, params, named_params = create_nerf(cfg_nerf)
         render_train["emission"] = True

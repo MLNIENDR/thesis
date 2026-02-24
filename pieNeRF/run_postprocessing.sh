@@ -25,6 +25,7 @@ DRY_RUN="${DRY_RUN:-0}"
 
 MANIFEST="${MANIFEST:-${ROOT}/data/manifest_abs.csv}"
 DEVICE="${DEVICE:-cuda}"
+FORCE_USE_ATTENUATION="${FORCE_USE_ATTENUATION:-1}"
 
 # Robust mask path pattern: keep exactly one placeholder {phantom}
 MASK_PATTERN="/home/mnguest12/projects/thesis/Data_Processing/{phantom}/out/mask.npy"
@@ -56,6 +57,7 @@ echo "SWEEP_ROOT=${SWEEP_ROOT}"
 echo "MANIFEST=${MANIFEST}"
 echo "BASELINE_CKPT=${BASELINE_CKPT}"
 echo "PROJ_METRICS_TARGET=${PROJ_METRICS_TARGET}"
+echo "FORCE_USE_ATTENUATION=${FORCE_USE_ATTENUATION}"
 echo "DRY_RUN=${DRY_RUN}"
 
 source "${CONDA_ACTIVATE}"
@@ -231,6 +233,9 @@ for tag_dir in "${TAG_DIRS[@]}"; do
     --save-act-compare-5slices
     --skip-plots
   )
+  if is_truthy "${FORCE_USE_ATTENUATION}"; then
+    cmd+=(--force-use-attenuation)
+  fi
 
   if is_truthy "${DRY_RUN}"; then
     echo "[DRY-RUN] Would execute:"

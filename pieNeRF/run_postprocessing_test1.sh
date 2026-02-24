@@ -20,6 +20,7 @@ MANIFEST="/home/mnguest12/projects/thesis/pieNeRF/data/manifest_abs.csv"
 
 MASK_PATTERN='/home/mnguest12/projects/thesis/Data_Processing/{phantom}/out/mask.npy'
 DEVICE="cuda"
+FORCE_USE_ATTENUATION="${FORCE_USE_ATTENUATION:-1}"
 PRED_SLICES_DIR="${PRED_SLICES_DIR:-test_slices}"
 PRED_ACT_PATTERN_TEMPLATE="${PRED_ACT_PATTERN_TEMPLATE:-}"
 OUT_DIR="${OUT_DIR:-}"
@@ -91,6 +92,7 @@ echo "split_json=${SPLIT_JSON}"
 echo "config=${CONFIG}"
 echo "out_dir=${OUT_DIR}"
 echo "pred_act_pattern=${PRED_ACT_PATTERN}"
+echo "force_use_attenuation=${FORCE_USE_ATTENUATION}"
 echo "============================================================"
 
 mkdir -p "${OUT_DIR}"
@@ -98,27 +100,33 @@ echo "[DBG] Listing ${RUN_DIR}/${EFFECTIVE_SLICES_DIR}:"
 ls -lah "${RUN_DIR}/${EFFECTIVE_SLICES_DIR}" || true
 
 set -x
-srun /usr/bin/time -v "${PYTHON_BIN}" -u postprocessing.py \
-  --run-dir "${RUN_DIR}" \
-  --split-json "${SPLIT_JSON}" \
-  --manifest "${MANIFEST}" \
-  --config "${CONFIG}" \
-  --out-dir "${OUT_DIR}" \
-  --mask-path-pattern "${MASK_PATTERN}" \
-  --device "${DEVICE}" \
-  --pred-act-per-phantom \
-  --pred-act-pattern "${PRED_ACT_PATTERN}" \
-  --proj-forward-model train \
-  --checkpoint "${RUN_DIR}/checkpoints/checkpoint_step08000.pt" \
-  --render-projections \
-  --save-proj-npy \
-  --save-proj-png \
-  --timing \
-  --save-act-compare-5slices \
-  --skip-plots \
-  --debug-orientation-search \
-  --save-orientation-debug-volumes \
+cmd=(
+  srun /usr/bin/time -v "${PYTHON_BIN}" -u postprocessing.py
+  --run-dir "${RUN_DIR}"
+  --split-json "${SPLIT_JSON}"
+  --manifest "${MANIFEST}"
+  --config "${CONFIG}"
+  --out-dir "${OUT_DIR}"
+  --mask-path-pattern "${MASK_PATTERN}"
+  --device "${DEVICE}"
+  --pred-act-per-phantom
+  --pred-act-pattern "${PRED_ACT_PATTERN}"
+  --proj-forward-model train
+  --checkpoint "${RUN_DIR}/checkpoints/checkpoint_step08000.pt"
+  --render-projections
+  --save-proj-npy
+  --save-proj-png
+  --timing
+  --save-act-compare-5slices
+  --skip-plots
+  --debug-orientation-search
+  --save-orientation-debug-volumes
   --save-active-organ-plots
+)
+if [[ "${FORCE_USE_ATTENUATION,,}" =~ ^(1|true|yes|on)$ ]]; then
+  cmd+=(--force-use-attenuation)
+fi
+"${cmd[@]}"
 set +x
 
 echo "✅ Postprocessing finished at: $(date)"
