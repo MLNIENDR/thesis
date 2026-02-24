@@ -30,7 +30,7 @@ for run in runs:
     for col in [
         "proj_mae_counts",
         "proj_poisson_dev_counts",
-        "organ_fraction_mae",
+        "active_organ_fraction_mae",
         "inactive_organs_pred_frac_of_pred",
         "pred_outside_mask_frac",
     ]:
@@ -58,7 +58,11 @@ def plot_metric(ycol, ylabel, fname):
     plt.close()
     print("[OK] wrote", fname)
 
-plot_metric("organ_fraction_mae_mean", "organ_fraction_mae (mean over test phantoms)", "metric_vs_actw_organ_fraction_mae.png")
+plot_metric(
+    "active_organ_fraction_mae_mean",
+    "Active Organ Fraction MAE (mean over test phantoms)",
+    "metric_vs_actw_active_organ_fraction_mae.png",
+)
 plot_metric("inactive_organs_pred_frac_of_pred_mean", "inactive_organs_pred_frac_of_pred (mean)", "metric_vs_actw_inactive_frac.png")
 plot_metric("pred_outside_mask_frac_mean", "pred_outside_mask_frac (mean)", "metric_vs_actw_outside_body_frac.png")
 plot_metric("proj_mae_counts_mean", "proj_mae_counts (mean)", "metric_vs_actw_proj_mae.png")

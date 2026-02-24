@@ -510,6 +510,25 @@ def parse_args():
         help="If >0 stores checkpoints every N steps in addition to the final checkpoint.",
     )
     parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="",
+        help="Optionaler Checkpoint-Pfad zum Laden (z. B. .../checkpoints/checkpoint_step08000.pt).",
+    )
+    parser.add_argument(
+        "--checkpoint-load-optimizer",
+        action="store_true",
+        help="Lade bei --checkpoint auch Optimizer/Scaler-State (Resume-Training).",
+    )
+    parser.add_argument(
+        "--checkpoint-strict",
+        type=str2bool,
+        default=True,
+        nargs="?",
+        const=True,
+        help="Strictes Laden der State-Dicts bei --checkpoint.",
+    )
+    parser.add_argument(
         "--normalize-targets",
         action="store_true",
         help="(Deprecated) Apply per-projection min/max normalisation to both targets and predictions.",
@@ -828,6 +847,25 @@ def parse_args():
         help="Optional: CT als zusaetzlicher Encoder-Input (Mean-Projektion).",
     )
     parser.add_argument(
+        "--test-noise-mode",
+        type=str,
+        default="none",
+        choices=["none", "poisson_counts"],
+        help="Test/Inference-only Noise fuer AP/PA vor dem Encoder: none oder poisson_counts.",
+    )
+    parser.add_argument(
+        "--test-noise-kappa",
+        type=float,
+        default=1.0,
+        help="Skalierung fuer Test-Poisson-Noise: noisy = Poisson(kappa*counts)/kappa.",
+    )
+    parser.add_argument(
+        "--test-noise-seed",
+        type=int,
+        default=0,
+        help="Basis-Seed fuer Test-Poisson-Noise (pro Phantom deterministisch abgeleitet).",
+    )
+    parser.add_argument(
         "--z-enc-alpha",
         type=float,
         default=0.1,
@@ -1096,6 +1134,11 @@ def _slugify_patient_id(patient_id: Optional[str]) -> str:
         return "unknown"
     slug = re.sub(r"[^\w.-]+", "_", patient_id.strip())
     return slug or "unknown"
+
+
+def _stable_patient_seed(base_seed: int, patient_id: str) -> int:
+    digest = hashlib.sha1(str(patient_id).encode("utf-8")).hexdigest()
+    return int(base_seed) + int(digest[:8], 16)
 
 
 def print_dataset_summary(dataset, max_print: int = 20):
@@ -1428,6 +1471,18 @@ def save_test_volume_slices(
             z_enc_alpha=z_enc_alpha,
         )
 
+    def _first_sample_2d(t: torch.Tensor) -> np.ndarray:
+        if t is None:
+            return np.empty((0, 0), dtype=np.float32)
+        td = t.detach().float().cpu()
+        if td.dim() == 4:
+            td = td[0, 0]
+        elif td.dim() == 3:
+            td = td[0]
+        elif td.dim() > 2:
+            td = td.reshape(td.shape[-2], td.shape[-1])
+        return np.asarray(td.numpy(), dtype=np.float32)
+
     def _vec_stats(t: Optional[torch.Tensor]) -> Optional[dict]:
         if t is None or not isinstance(t, torch.Tensor) or t.numel() == 0:
             return None
@@ -1476,8 +1531,53 @@ def save_test_volume_slices(
                 f"ct_stats={ct_stats} sig={ct_sig[:8] if ct_sig else None}",
                 flush=True,
             )
+            batch_for_latent = batch
+            test_noise_mode = str(getattr(args, "test_noise_mode", "none") or "none").lower()
+            if test_noise_mode == "poisson_counts":
+                kappa = float(getattr(args, "test_noise_kappa", 1.0))
+                if not (kappa > 0.0):
+                    raise ValueError(f"--test-noise-kappa must be > 0 for poisson_counts, got {kappa}")
+                if ap_counts is None or pa_counts is None or ap_counts.numel() == 0 or pa_counts.numel() == 0:
+                    raise RuntimeError(
+                        "test-noise-mode=poisson_counts requires ap_counts/pa_counts in the batch. "
+                        "Please ensure manifest contains *_counts.npy."
+                    )
+                ap_counts_t = ap_counts.to(device, non_blocking=True).float().clamp_min(0.0)
+                pa_counts_t = pa_counts.to(device, non_blocking=True).float().clamp_min(0.0)
+                patient_seed = _stable_patient_seed(int(getattr(args, "test_noise_seed", 0)), patient_id)
+                noise_gen = torch.Generator(device="cpu")
+                noise_gen.manual_seed(int(patient_seed))
+                noisy_ap = torch.poisson(kappa * ap_counts_t.cpu(), generator=noise_gen).to(ap_counts_t.device) / kappa
+                noisy_pa = torch.poisson(kappa * pa_counts_t.cpu(), generator=noise_gen).to(pa_counts_t.device) / kappa
+                noisy_ap = noisy_ap.clamp_min(0.0)
+                noisy_pa = noisy_pa.clamp_min(0.0)
+                batch_for_latent = dict(batch)
+                batch_for_latent["proj_input_ap"] = noisy_ap
+                batch_for_latent["proj_input_pa"] = noisy_pa
+                counts_cat = torch.cat([ap_counts_t.reshape(-1), pa_counts_t.reshape(-1)], dim=0)
+                noisy_cat = torch.cat([noisy_ap.reshape(-1), noisy_pa.reshape(-1)], dim=0)
+                counts_sum = float(counts_cat.sum().item())
+                noisy_sum = float(noisy_cat.sum().item())
+                counts_mean = float(counts_cat.mean().item())
+                noisy_mean = float(noisy_cat.mean().item())
+                counts_p99 = float(torch.quantile(counts_cat, 0.99).item())
+                noisy_p99 = float(torch.quantile(noisy_cat, 0.99).item())
+                print(
+                    f"[test][noise] patient={patient_id} mode=poisson_counts kappa={kappa:.6g} seed={patient_seed} "
+                    f"sum_counts={counts_sum:.6e} sum_noisy={noisy_sum:.6e} "
+                    f"mean_counts={counts_mean:.6e} mean_noisy={noisy_mean:.6e} "
+                    f"p99_counts={counts_p99:.6e} p99_noisy={noisy_p99:.6e}",
+                    flush=True,
+                )
+                np.save(patient_dir / "noisy_ap_counts.npy", _first_sample_2d(noisy_ap))
+                np.save(patient_dir / "noisy_pa_counts.npy", _first_sample_2d(noisy_pa))
+                print(
+                    f"[test][noise] patient={patient_id} exported noisy projections to "
+                    f"{patient_dir / 'noisy_ap_counts.npy'} and {patient_dir / 'noisy_pa_counts.npy'}",
+                    flush=True,
+                )
             if hybrid_enabled and encoder is not None:
-                z_latent_batch, z_enc_batch, z_enc_proj_batch = _build_test_latent(batch)
+                z_latent_batch, z_enc_batch, z_enc_proj_batch = _build_test_latent(batch_for_latent)
             else:
                 z_latent_batch = z_latent_base.detach()
                 z_enc_batch = None
@@ -3091,6 +3191,61 @@ def save_checkpoint(step, generator, optimizer, scaler, ckpt_dir: Path, encoder=
     ckpt_path = ckpt_dir / f"checkpoint_step{step:05d}.pt"
     torch.save(state, ckpt_path)
     print(f"💾 Checkpoint gespeichert: {ckpt_path}", flush=True)
+
+
+def load_checkpoint(
+    ckpt_path: Path,
+    *,
+    device: torch.device,
+    generator,
+    optimizer=None,
+    scaler=None,
+    encoder: Optional[nn.Module] = None,
+    z_fuser: Optional[nn.Module] = None,
+    gain_head: Optional[nn.Module] = None,
+    gain_param: Optional[nn.Parameter] = None,
+    strict: bool = True,
+    load_optimizer: bool = False,
+) -> int:
+    if ckpt_path is None:
+        return 0
+    ckpt_file = Path(ckpt_path).expanduser().resolve()
+    if not ckpt_file.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_file}")
+    state = torch.load(ckpt_file, map_location=device)
+    step = int(state.get("step", 0))
+
+    coarse = state.get("generator_coarse")
+    if coarse is None:
+        raise KeyError(f"Checkpoint missing key 'generator_coarse': {ckpt_file}")
+    generator.render_kwargs_train["network_fn"].load_state_dict(coarse, strict=bool(strict))
+
+    fine_net = generator.render_kwargs_train.get("network_fine")
+    fine_state = state.get("generator_fine")
+    if fine_net is not None and fine_state is not None:
+        fine_net.load_state_dict(fine_state, strict=bool(strict))
+
+    if encoder is not None and "encoder" in state:
+        encoder.load_state_dict(state["encoder"], strict=bool(strict))
+    if z_fuser is not None and "z_fuser" in state:
+        z_fuser.load_state_dict(state["z_fuser"], strict=bool(strict))
+    if gain_head is not None and "gain_head" in state:
+        gain_head.load_state_dict(state["gain_head"], strict=bool(strict))
+    if gain_param is not None and "gain_param" in state:
+        with torch.no_grad():
+            gain_param.copy_(state["gain_param"].to(device=device, dtype=gain_param.dtype))
+
+    if load_optimizer:
+        if optimizer is not None and "optimizer" in state:
+            optimizer.load_state_dict(state["optimizer"])
+        if scaler is not None and "scaler" in state:
+            scaler.load_state_dict(state["scaler"])
+
+    print(
+        f"[ckpt] loaded {ckpt_file} | step={step} | strict={bool(strict)} | load_optimizer={bool(load_optimizer)}",
+        flush=True,
+    )
+    return step
 
 
 def compute_projection_metrics(pred: torch.Tensor, target: torch.Tensor, *, eps: float = 1e-8) -> dict:
@@ -5748,6 +5903,21 @@ def train():
 
     amp_enabled = bool(config["training"].get("use_amp", False))
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    loaded_step = 0
+    if str(getattr(args, "checkpoint", "") or "").strip():
+        loaded_step = load_checkpoint(
+            Path(args.checkpoint),
+            device=device,
+            generator=generator,
+            optimizer=optimizer,
+            scaler=scaler,
+            encoder=encoder,
+            z_fuser=z_fuser,
+            gain_head=gain_head,
+            gain_param=gain_param,
+            strict=bool(args.checkpoint_strict),
+            load_optimizer=bool(args.checkpoint_load_optimizer),
+        )
     _self_test_proj_weight_schedule()
 
     proj_weight_min_sched, proj_weight_max_sched, proj_bounds_swapped = sanitize_proj_weight_bounds(
@@ -6111,7 +6281,7 @@ def train():
     signal.signal(signal.SIGINT, _signal_handler)
     print(
         f"🚀 Starting emission-NeRF training | steps={max_steps} | rays/proj={rays_per_proj} "
-        f"| image={generator.H}x{generator.W} | chunk={generator.chunk}"
+        f"| image={generator.H}x{generator.W} | chunk={generator.chunk} | ckpt_step={loaded_step}"
     )
     scale_ap_used = 1.0
     scale_pa_used = 1.0
@@ -6121,6 +6291,18 @@ def train():
     act_norm_global = None
     last_act_tv_value = 0.0
     last_z_latent = z_latent_base
+    # Default values for inference-only runs (e.g. --max-steps 0), where the train loop is skipped.
+    proj_loss_active = (not bool(args.act_only)) and (not (bool(args.hybrid) and float(args.proj_loss_weight) <= 0.0))
+    ap = None
+    pa = None
+    ap_counts = None
+    pa_counts = None
+    ct_vol = None
+    act_vol = None
+    ct_context = None
+    ap_enc_input = None
+    pa_enc_input = None
+    meta = None
     debug_z_sample = None
     last_gain_val = None
     gain_prior_ema = None

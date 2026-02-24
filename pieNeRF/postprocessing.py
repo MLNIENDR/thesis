@@ -67,8 +67,15 @@ METRICS_CSV_HEADER = [
     "fg_tau",
     "proj_mae_counts",
     "proj_poisson_dev_counts",
+    "proj_mae_counts_clean",
+    "proj_poisson_dev_counts_clean",
+    "proj_mae_counts_noisy",
+    "proj_poisson_dev_counts_noisy",
+    "proj_metrics_target_mode_used",
     "organ_rel_error_total_activity_active_mean",
-    "organ_fraction_mae",
+    "active_organ_fraction_mae",
+    "label_averaged_organ_fraction_mae",
+    "active_organ_fraction_n",
     "organ_active_n",
     "organ_inactive_n",
     "inactive_organs_pred_sum",
@@ -233,6 +240,16 @@ def parse_args():
         choices=["counts", "normalized"],
         default="counts",
         help="Choose counts or normalized projection domain",
+    )
+    parser.add_argument(
+        "--proj-metrics-target",
+        choices=["clean_counts", "noisy_counts"],
+        default="clean_counts",
+        help=(
+            "Target for legacy projection metrics keys (proj_mae_counts/proj_poisson_dev_counts). "
+            "clean_counts uses manifest counts; noisy_counts uses "
+            "test_slices/<phantom>/noisy_{ap,pa}_counts.npy from test-noise export."
+        ),
     )
     parser.add_argument(
         "--psf-sigma",
@@ -940,6 +957,42 @@ def _load_gt_projections(
     raise FileNotFoundError(f"missing projection paths for {phantom_id}")
 
 
+def _load_noisy_projection_targets(
+    run_dir: Path,
+    phantom_id: str,
+    *,
+    expected_shape: tuple[int, int] | None,
+    strict: bool,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    ap_path = run_dir / "test_slices" / phantom_id / "noisy_ap_counts.npy"
+    pa_path = run_dir / "test_slices" / phantom_id / "noisy_pa_counts.npy"
+    if not ap_path.exists() or not pa_path.exists():
+        if strict:
+            missing = []
+            if not ap_path.exists():
+                missing.append(str(ap_path))
+            if not pa_path.exists():
+                missing.append(str(pa_path))
+            raise FileNotFoundError(
+                f"phantom={phantom_id}: --proj-metrics-target noisy_counts requires noisy projection files; "
+                f"missing={missing}"
+            )
+        return None, None
+    ap = load_array(ap_path)
+    pa = load_array(pa_path)
+    if ap.ndim != 2 or pa.ndim != 2:
+        raise ValueError(
+            f"phantom={phantom_id}: noisy targets must be 2D, got ap.shape={ap.shape}, pa.shape={pa.shape}"
+        )
+    if expected_shape is not None:
+        if tuple(ap.shape) != tuple(expected_shape) or tuple(pa.shape) != tuple(expected_shape):
+            raise ValueError(
+                f"phantom={phantom_id}: noisy target shape mismatch, expected={expected_shape}, "
+                f"ap.shape={ap.shape}, pa.shape={pa.shape}"
+            )
+    return np.asarray(ap, dtype=np.float32), np.asarray(pa, dtype=np.float32)
+
+
 def _array_stats(arr: np.ndarray) -> dict[str, float]:
     flat = np.asarray(arr, dtype=np.float64).ravel()
     finite = flat[np.isfinite(flat)]
@@ -1287,6 +1340,9 @@ def save_activity_compare_5slices(
 def _default_organ_aggregate_metrics() -> dict[str, Union[float, int]]:
     return {
         "organ_rel_error_total_activity_active_mean": float("nan"),
+        "active_organ_fraction_mae": float("nan"),
+        "label_averaged_organ_fraction_mae": float("nan"),
+        "active_organ_fraction_n": 0,
         "organ_active_n": 0,
         "organ_inactive_n": 0,
         "inactive_organs_pred_sum": 0.0,
@@ -1371,8 +1427,17 @@ def compute_organ_statistics(
         "inactive_organs_pred_frac_of_pred": inactive_pred_frac_of_pred,
         "inactive_organs_pred_frac_of_gt": inactive_pred_frac_of_gt,
     }
-    fraction_mae = compute_organ_fraction_error(stats)
-    return stats, aggregate_metrics, fraction_mae
+    label_averaged_fraction_mae = compute_organ_fraction_error(stats)
+    active_fraction_mae, active_fraction_n = compute_active_organ_fraction_mae(
+        mask_roi=mask_roi,
+        gt_roi=gt_roi,
+        pred_roi=pred_roi,
+        voxel_volume=vol_voxel,
+    )
+    aggregate_metrics["label_averaged_organ_fraction_mae"] = label_averaged_fraction_mae
+    aggregate_metrics["active_organ_fraction_mae"] = active_fraction_mae
+    aggregate_metrics["active_organ_fraction_n"] = active_fraction_n
+    return stats, aggregate_metrics, active_fraction_mae
 
 
 def compute_outside_mask_leakage(
@@ -1429,6 +1494,40 @@ def compute_organ_fraction_error(stats: dict[int, dict]) -> float:
     gt_frac = gt_sums / total_gt
     pred_frac = pred_sums / total_pred
     return float(np.mean(np.abs(gt_frac - pred_frac)))
+
+
+def compute_active_organ_fraction_mae(
+    mask_roi: np.ndarray,
+    gt_roi: np.ndarray,
+    pred_roi: np.ndarray,
+    voxel_volume: float,
+) -> tuple[float, int]:
+    """MAE of organ fractions using the same active-organ selection as save_active_organ_plots."""
+    active_ids = extract_active_organ_ids(mask_roi, gt_roi)
+    if active_ids.size == 0:
+        return float("nan"), 0
+    sorted_ids = np.sort(np.asarray(active_ids, dtype=np.int32))
+    if np.any(sorted_ids == 1384):
+        sorted_ids = sorted_ids[sorted_ids != 1384]
+    organ_ids = np.array([int(oid) for oid in sorted_ids if int(oid) in ORGAN_LABEL_MAP], dtype=np.int32)
+    if organ_ids.size == 0:
+        return float("nan"), 0
+    gt_sums = []
+    pred_sums = []
+    for organ_id in organ_ids:
+        organ_mask = mask_roi == organ_id
+        gt_sums.append(float(np.nansum(gt_roi[organ_mask])) * voxel_volume)
+        pred_sums.append(float(np.nansum(pred_roi[organ_mask])) * voxel_volume)
+    gt_arr = np.asarray(gt_sums, dtype=np.float64)
+    pred_arr = np.asarray(pred_sums, dtype=np.float64)
+    total_gt = float(np.sum(gt_arr))
+    total_pred = float(np.sum(pred_arr))
+    if total_gt <= 1e-12 or total_pred <= 1e-12:
+        return float("nan"), int(organ_ids.size)
+    gt_frac = gt_arr / total_gt
+    pred_frac = pred_arr / total_pred
+    mae = float(np.mean(np.abs(gt_frac - pred_frac)))
+    return mae, int(organ_ids.size)
 
 def render_projections_stub():
     # Projections currently not rendered (no checkpoint or latent).
@@ -1962,6 +2061,8 @@ def run_postprocessing(args):
     norm_keys_pa = ["pa_path", "pa", "pa_abs", "pa_path_abs"]
 
     block_totals: dict[str, list[float]] = defaultdict(list)
+    proj_metrics_target_rows: list[dict[str, Union[str, float]]] = []
+    run_proj_metrics_records: list[dict[str, Union[str, float]]] = []
     fast_warning_logged = False
     start_total = time.perf_counter()
     for pid in test_ids:
@@ -2013,6 +2114,32 @@ def run_postprocessing(args):
             proj_domain_requested,
         )
         proj_domain_loaded = domain_loaded
+        gt_shape_2d = tuple(gt_ap_counts.shape) if gt_ap_counts is not None else None
+        noisy_strict = args.proj_metrics_target == "noisy_counts"
+        noisy_ap_counts, noisy_pa_counts = _load_noisy_projection_targets(
+            run_dir,
+            pid,
+            expected_shape=gt_shape_2d,
+            strict=noisy_strict,
+        )
+        clean_ap_path = resolve_manifest_path(entry, counts_keys_ap)
+        clean_pa_path = resolve_manifest_path(entry, counts_keys_pa)
+        _LOG.info(
+            "[proj-metrics-target] phantom=%s mode=%s clean_paths=(%s,%s) noisy_paths=(%s,%s)",
+            pid,
+            args.proj_metrics_target,
+            clean_ap_path,
+            clean_pa_path,
+            (run_dir / "test_slices" / pid / "noisy_ap_counts.npy"),
+            (run_dir / "test_slices" / pid / "noisy_pa_counts.npy"),
+        )
+        if noisy_ap_counts is not None and noisy_pa_counts is not None:
+            _LOG.info(
+                "[proj-metrics-target][noisy-sum] phantom=%s sum(target_ap)=%.6e sum(target_pa)=%.6e",
+                pid,
+                float(np.nansum(noisy_ap_counts)),
+                float(np.nansum(noisy_pa_counts)),
+            )
 
         with timer.block("load_pred"):
             pred_path = pred_paths.get(pid)
@@ -2157,7 +2284,7 @@ def run_postprocessing(args):
             voxel_mae_fg, voxel_rmse_fg, voxel_n_fg = masked_voxel_metrics(gt_roi, pred_roi, fg_mask)
 
         organ_stats = {}
-        organ_fraction_mae = float("nan")
+        active_organ_fraction_mae = float("nan")
         organ_aggregate_metrics = _default_organ_aggregate_metrics()
         mask = None
         mask_roi = None
@@ -2169,12 +2296,20 @@ def run_postprocessing(args):
                 mask_roi = mask[slices]
             active_ids = extract_active_organ_ids(mask, gt_act)
             if not args.skip_organ_metrics and mask_roi is not None:
-                organ_stats, organ_aggregate_metrics, organ_fraction_mae = compute_organ_statistics(
+                organ_stats, organ_aggregate_metrics, active_organ_fraction_mae = compute_organ_statistics(
                     mask_roi,
                     gt_roi,
                     pred_roi,
                     spacing_gt,
                     organ_name_map,
+                )
+                _LOG.info(
+                    "[organ-fraction][%s] active_organ_fraction_mae=%.6g (plot-aligned, fraction of active mapped organs) "
+                    "label_averaged_organ_fraction_mae=%.6g K_active=%d",
+                    pid,
+                    active_organ_fraction_mae,
+                    organ_aggregate_metrics["label_averaged_organ_fraction_mae"],
+                    int(organ_aggregate_metrics["active_organ_fraction_n"]),
                 )
             else:
                 organ_stats = {}
@@ -2366,19 +2501,9 @@ def run_postprocessing(args):
                     train_meta["pred_sum_after"] = pred_sum_after
                     train_meta["gt_sum_ap"] = gt_sum_ap_val
                     train_meta["gt_sum_pa"] = gt_sum_pa_val
-                    if gt_save_ap is not None and gt_save_pa is not None:
-                        mae, dev = _compute_proj_metrics_from_arrays(
-                            pred_save_ap, pred_save_pa, gt_save_ap, gt_save_pa, args.device
-                        )
-                        proj_metrics = {
-                            "proj_mae_counts": mae,
-                            "proj_poisson_dev_counts": dev,
-                            "proj_status": "rendered_train",
-                            "proj_domain": "counts",
-                        }
-                        proj_status = "rendered_train"
-                        proj_domain = "counts"
-                        proj_is_normalized = False
+                    proj_status = "rendered_train"
+                    proj_domain = "counts"
+                    proj_is_normalized = False
                     train_proj_dir = patient_dir / "proj_train"
                     train_proj_dir.mkdir(parents=True, exist_ok=True)
                     np.save(train_proj_dir / "ap_pred.npy", pred_save_ap)
@@ -2402,18 +2527,8 @@ def run_postprocessing(args):
                         pred_save_pa = (
                             pred_proj["pa_counts"] if proj_domain == "counts" else pred_proj["pa_norm"]
                         )
-                        if gt_save_ap is not None and gt_save_pa is not None:
-                            mae, dev = _compute_proj_metrics_from_arrays(
-                                pred_save_ap, pred_save_pa, gt_save_ap, gt_save_pa, args.device
-                            )
-                            proj_metrics = {
-                                "proj_mae_counts": mae,
-                                "proj_poisson_dev_counts": dev,
-                                "proj_status": "rendered",
-                                "proj_domain": proj_domain,
-                            }
-                            proj_status = "rendered"
-                            proj_norm_factor = pred_proj.get("norm_scale")
+                        proj_status = "rendered"
+                        proj_norm_factor = pred_proj.get("norm_scale")
 
             if proj_metrics is None:
                 if args.calibrate_scale:
@@ -2429,8 +2544,14 @@ def run_postprocessing(args):
                     gt_save_pa,
                     proj_domain,
                 )
-                pred_save_ap = pred_save_ap or fallback_result.pop("pred_ap", None)
-                pred_save_pa = pred_save_pa or fallback_result.pop("pred_pa", None)
+                if pred_save_ap is None:
+                    pred_save_ap = fallback_result.pop("pred_ap", None)
+                else:
+                    fallback_result.pop("pred_ap", None)
+                if pred_save_pa is None:
+                    pred_save_pa = fallback_result.pop("pred_pa", None)
+                else:
+                    fallback_result.pop("pred_pa", None)
                 proj_status = fallback_result.get("proj_status", proj_status)
                 proj_metrics = fallback_result
                 proj_domain = proj_metrics.get("proj_domain", proj_domain)
@@ -2441,6 +2562,51 @@ def run_postprocessing(args):
                         if isinstance(meta.get("proj_scale_joint_p99"), (int, float))
                         else None
                     )
+
+            # Always compute projection metrics against clean/noisy targets (if available) on the
+            # exact same prediction arrays. Legacy keys are selected by --proj-metrics-target.
+            proj_metrics_clean = {
+                "proj_mae_counts": float("nan"),
+                "proj_poisson_dev_counts": float("nan"),
+            }
+            proj_metrics_noisy = {
+                "proj_mae_counts": float("nan"),
+                "proj_poisson_dev_counts": float("nan"),
+            }
+            if pred_save_ap is not None and pred_save_pa is not None:
+                if gt_save_ap is not None and gt_save_pa is not None:
+                    mae_c, dev_c = _compute_proj_metrics_from_arrays(
+                        pred_save_ap, pred_save_pa, gt_save_ap, gt_save_pa, args.device
+                    )
+                    proj_metrics_clean["proj_mae_counts"] = mae_c
+                    proj_metrics_clean["proj_poisson_dev_counts"] = dev_c
+                if noisy_ap_counts is not None and noisy_pa_counts is not None:
+                    mae_n, dev_n = _compute_proj_metrics_from_arrays(
+                        pred_save_ap, pred_save_pa, noisy_ap_counts, noisy_pa_counts, args.device
+                    )
+                    proj_metrics_noisy["proj_mae_counts"] = mae_n
+                    proj_metrics_noisy["proj_poisson_dev_counts"] = dev_n
+            elif args.proj_metrics_target == "noisy_counts":
+                raise RuntimeError(
+                    f"phantom={pid}: --proj-metrics-target noisy_counts requested, but prediction projections are unavailable"
+                )
+
+            if args.proj_metrics_target == "clean_counts":
+                proj_metrics = {
+                    "proj_mae_counts": proj_metrics_clean["proj_mae_counts"],
+                    "proj_poisson_dev_counts": proj_metrics_clean["proj_poisson_dev_counts"],
+                    "proj_status": proj_status,
+                    "proj_domain": proj_domain,
+                }
+            elif args.proj_metrics_target == "noisy_counts":
+                proj_metrics = {
+                    "proj_mae_counts": proj_metrics_noisy["proj_mae_counts"],
+                    "proj_poisson_dev_counts": proj_metrics_noisy["proj_poisson_dev_counts"],
+                    "proj_status": proj_status,
+                    "proj_domain": proj_domain,
+                }
+            else:
+                raise ValueError(f"Unknown proj-metrics-target: {args.proj_metrics_target}")
 
         if (
             pred_save_ap is not None
@@ -2476,6 +2642,11 @@ def run_postprocessing(args):
 
         proj_mae_counts = proj_metrics["proj_mae_counts"]
         proj_poisson_dev_counts = proj_metrics["proj_poisson_dev_counts"]
+        proj_mae_counts_clean = proj_metrics_clean["proj_mae_counts"]
+        proj_poisson_dev_counts_clean = proj_metrics_clean["proj_poisson_dev_counts"]
+        proj_mae_counts_noisy = proj_metrics_noisy["proj_mae_counts"]
+        proj_poisson_dev_counts_noisy = proj_metrics_noisy["proj_poisson_dev_counts"]
+        proj_metrics_target_mode_used = str(args.proj_metrics_target)
         proj_status = proj_metrics["proj_status"]
         proj_domain = proj_metrics["proj_domain"]
         proj_is_normalized = proj_domain == "normalized"
@@ -2522,8 +2693,15 @@ def run_postprocessing(args):
                 "fg_tau": FG_THRESHOLD,
                 "proj_mae_counts": proj_mae_counts,
                 "proj_poisson_dev_counts": proj_poisson_dev_counts,
+                "proj_mae_counts_clean": proj_mae_counts_clean,
+                "proj_poisson_dev_counts_clean": proj_poisson_dev_counts_clean,
+                "proj_mae_counts_noisy": proj_mae_counts_noisy,
+                "proj_poisson_dev_counts_noisy": proj_poisson_dev_counts_noisy,
+                "proj_metrics_target_mode_used": proj_metrics_target_mode_used,
                 "organ_rel_error_total_activity_active_mean": organ_rel_error_active_mean,
-                "organ_fraction_mae": organ_fraction_mae,
+                "active_organ_fraction_mae": active_organ_fraction_mae,
+                "label_averaged_organ_fraction_mae": organ_aggregate_metrics["label_averaged_organ_fraction_mae"],
+                "active_organ_fraction_n": int(organ_aggregate_metrics["active_organ_fraction_n"]),
                 "organ_active_n": organ_aggregate_metrics["organ_active_n"],
                 "organ_inactive_n": organ_aggregate_metrics["organ_inactive_n"],
                 "inactive_organs_pred_sum": organ_aggregate_metrics["inactive_organs_pred_sum"],
@@ -2583,8 +2761,15 @@ def run_postprocessing(args):
                 "fg_tau": FG_THRESHOLD,
                 "proj_mae_counts": proj_mae_counts,
                 "proj_poisson_dev_counts": proj_poisson_dev_counts,
+                "proj_mae_counts_clean": proj_mae_counts_clean,
+                "proj_poisson_dev_counts_clean": proj_poisson_dev_counts_clean,
+                "proj_mae_counts_noisy": proj_mae_counts_noisy,
+                "proj_poisson_dev_counts_noisy": proj_poisson_dev_counts_noisy,
+                "proj_metrics_target_mode_used": proj_metrics_target_mode_used,
                 "organ_rel_error_total_activity_active_mean": organ_rel_error_active_mean,
-                "organ_fraction_mae": organ_fraction_mae,
+                "active_organ_fraction_mae": active_organ_fraction_mae,
+                "label_averaged_organ_fraction_mae": organ_aggregate_metrics["label_averaged_organ_fraction_mae"],
+                "active_organ_fraction_n": int(organ_aggregate_metrics["active_organ_fraction_n"]),
                 "organ_active_n": organ_aggregate_metrics["organ_active_n"],
                 "organ_inactive_n": organ_aggregate_metrics["organ_inactive_n"],
                 "inactive_organs_pred_sum": organ_aggregate_metrics["inactive_organs_pred_sum"],
@@ -2624,6 +2809,35 @@ def run_postprocessing(args):
                 "calibrate_scale_enabled": bool(args.calibrate_scale),
             },
         )
+        proj_metrics_target_rows.append(
+            {
+                "phantom": pid,
+                "target_mode": "clean_counts",
+                "proj_mae_counts": float(proj_mae_counts_clean),
+                "proj_poisson_dev_counts": float(proj_poisson_dev_counts_clean),
+                "proj_status": str(proj_status),
+                "proj_domain": str(proj_domain),
+            }
+        )
+        proj_metrics_target_rows.append(
+            {
+                "phantom": pid,
+                "target_mode": "noisy_counts",
+                "proj_mae_counts": float(proj_mae_counts_noisy),
+                "proj_poisson_dev_counts": float(proj_poisson_dev_counts_noisy),
+                "proj_status": str(proj_status),
+                "proj_domain": str(proj_domain),
+            }
+        )
+        run_proj_metrics_records.append(
+            {
+                "phantom_id": pid,
+                "proj_mae_counts_clean": float(proj_mae_counts_clean),
+                "proj_poisson_dev_counts_clean": float(proj_poisson_dev_counts_clean),
+                "proj_mae_counts_noisy": float(proj_mae_counts_noisy),
+                "proj_poisson_dev_counts_noisy": float(proj_poisson_dev_counts_noisy),
+            }
+        )
         _LOG.info(
             "processed phantom %s (metrics -> %s; projections status=%s domain=%s)",
             pid,
@@ -2639,6 +2853,51 @@ def run_postprocessing(args):
             print(f"[timing][phantom={pid}] {block_report}", flush=True)
             for name, duration in timer.blocks.items():
                 block_totals[name].append(duration)
+
+    proj_targets_csv = out_dir / "proj_metrics_targets.csv"
+    with proj_targets_csv.open("w", newline="") as f:
+        fieldnames = ["phantom", "target_mode", "proj_mae_counts", "proj_poisson_dev_counts", "proj_status", "proj_domain"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in proj_metrics_target_rows:
+            writer.writerow(row)
+
+    def _mean_std(values: list[float]) -> dict[str, float]:
+        vals = [float(v) for v in values if np.isfinite(v)]
+        if not vals:
+            return {"mean": float("nan"), "std": float("nan"), "n": 0}
+        arr = np.asarray(vals, dtype=np.float64)
+        return {
+            "mean": float(np.mean(arr)),
+            "std": float(np.std(arr, ddof=0)),
+            "n": int(arr.size),
+        }
+
+    clean_mae_vals = [float(r["proj_mae_counts_clean"]) for r in run_proj_metrics_records]
+    clean_dev_vals = [float(r["proj_poisson_dev_counts_clean"]) for r in run_proj_metrics_records]
+    noisy_mae_vals = [float(r["proj_mae_counts_noisy"]) for r in run_proj_metrics_records]
+    noisy_dev_vals = [float(r["proj_poisson_dev_counts_noisy"]) for r in run_proj_metrics_records]
+
+    test_metrics_payload = {
+        "run": {
+            "run_dir": str(run_dir),
+            "out_dir": str(out_dir),
+            "proj_metrics_target_mode": str(args.proj_metrics_target),
+            "n_phantoms": int(len(run_proj_metrics_records)),
+        },
+        "per_phantom_projection_metrics": run_proj_metrics_records,
+        "projection_metrics_aggregate": {
+            "clean_counts": {
+                "proj_mae_counts": _mean_std(clean_mae_vals),
+                "proj_poisson_dev_counts": _mean_std(clean_dev_vals),
+            },
+            "noisy_counts": {
+                "proj_mae_counts": _mean_std(noisy_mae_vals),
+                "proj_poisson_dev_counts": _mean_std(noisy_dev_vals),
+            },
+        },
+    }
+    write_metrics_json(out_dir / "test_metrics.json", test_metrics_payload)
 
     total_runtime = time.perf_counter() - start_total
     log_summary(total_runtime, block_totals, args)

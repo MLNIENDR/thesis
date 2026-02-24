@@ -17,11 +17,17 @@ PYTHON_BIN=${PYTHON_BIN:-python3}
 DATA_ROOT=${DATA_ROOT:-${PROJECT_ROOT}/Data_Processing}
 PHANTOM_ROOT=${PHANTOM_ROOT:-${PROJECT_ROOT}/PhantomGenerator}
 KERNEL_MAT=${KERNEL_MAT:-${PHANTOM_ROOT}/LEAP_Kernel.mat}
+MASK_ROBUSTNESS_SUITE=${MASK_ROBUSTNESS_SUITE:-1}
+PHANTOM_LIST=${PHANTOM_LIST:-"16 24 30"}
+MASK_ROBUSTNESS_VARIANT=${MASK_ROBUSTNESS_VARIANT:-baseline+dilation2d_r1_xy+shift_x1cm+shift_x2cm}
 
 echo "🚀 Starting QPlanar evaluations on $(hostname)"
 echo "📅 Job started at: $(date)"
 echo "PYTHON_BIN=${PYTHON_BIN}"
 echo "Using kernel: ${KERNEL_MAT}"
+echo "MASK_ROBUSTNESS_SUITE=${MASK_ROBUSTNESS_SUITE}"
+echo "MASK_ROBUSTNESS_VARIANT=${MASK_ROBUSTNESS_VARIANT}"
+echo "PHANTOM_LIST=${PHANTOM_LIST}"
 
 source /home/mnguest12/mambaforge/bin/activate totalseg
 
@@ -32,7 +38,7 @@ if [[ ! -f "${KERNEL_MAT}" ]]; then
   exit 1
 fi
 
-for NUM in {15..34}; do
+for NUM in ${PHANTOM_LIST}; do
   PHANTOM_NAME="phantom_${NUM}"
   BASE_DIR="${DATA_ROOT}/${PHANTOM_NAME}"
   SRC_DIR="${BASE_DIR}/src"
@@ -66,6 +72,14 @@ for NUM in {15..34}; do
   echo "Using mask bin: ${MASK_BIN}"
   echo "Writing results to: ${OUT_DIR}"
 
+  EXTRA_ARGS=()
+  if [[ "${MASK_ROBUSTNESS_SUITE}" == "1" ]]; then
+    echo "[INFO] Robustness suite enabled (${MASK_ROBUSTNESS_VARIANT})"
+    EXTRA_ARGS+=(--mask-robustness-suite)
+  else
+    echo "[INFO] Robustness suite disabled (baseline only)"
+  fi
+
   srun "${PYTHON_BIN}" -u qplanar.py \
     --base "${BASE_DIR}" \
     --spect_bin "${SPECT_BIN}" \
@@ -76,8 +90,8 @@ for NUM in {15..34}; do
     --pixel_size_mm 1.5 \
     --poisson \
     --counts_per_pixel 30 \
-    --save_pngs \
-    --out_dir "${OUT_DIR}"
+    --out_dir "${OUT_DIR}" \
+    "${EXTRA_ARGS[@]}"
 
   echo "✅ Finished ${PHANTOM_NAME} at $(date)"
 done

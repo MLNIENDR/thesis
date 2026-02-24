@@ -38,7 +38,7 @@ from typing import Dict, Tuple, Any, List
 
 import numpy as np
 import scipy.io as sio
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, binary_dilation
 from scipy.signal import fftconvolve
 from scipy.optimize import nnls
 
@@ -224,6 +224,61 @@ def save_png(arr: np.ndarray, path: Path, title: str = None) -> None:
 
 
 # ------------------------------------------------------------------------------
+# Mask perturbations
+# ------------------------------------------------------------------------------
+
+def dilate_labels_radius1_xy(mask_ids: np.ndarray, label_ids: List[int]) -> np.ndarray:
+    """
+    Cheap 2D dilation (radius 1 voxel, 3x3 neighborhood) per organ label and z-slice.
+    No cross-slice growth in z-direction.
+    Background stays 0.
+    Overlap resolution is deterministic: higher label ID wins.
+    """
+    out = np.zeros_like(mask_ids, dtype=np.int64)
+    structure_xy = np.ones((3, 3), dtype=bool)
+
+    # Higher organ ID wins in overlaps: process ascending and let later writes overwrite.
+    for lid in sorted(label_ids):
+        organ_mask = (mask_ids == lid)
+        if not np.any(organ_mask):
+            continue
+        for z in range(mask_ids.shape[2]):
+            if not np.any(organ_mask[:, :, z]):
+                continue
+            dil_xy = binary_dilation(organ_mask[:, :, z], structure=structure_xy, iterations=1)
+            out[:, :, z][dil_xy] = lid
+    return out
+
+
+def shift_mask_zero_pad(mask_ids: np.ndarray, shift_xyz: Tuple[int, int, int]) -> np.ndarray:
+    """
+    Shift complete label volume by integer voxels (dx,dy,dz) with zero-padding.
+    No wrap-around.
+    """
+    dx, dy, dz = shift_xyz
+    out = np.zeros_like(mask_ids, dtype=np.int64)
+
+    def _src_dst(n: int, d: int) -> Tuple[slice, slice]:
+        if d >= 0:
+            src = slice(0, n - d)
+            dst = slice(d, n)
+        else:
+            src = slice(-d, n)
+            dst = slice(0, n + d)
+        return src, dst
+
+    sx, dxs = _src_dst(mask_ids.shape[0], dx)
+    sy, dys = _src_dst(mask_ids.shape[1], dy)
+    sz, dzs = _src_dst(mask_ids.shape[2], dz)
+
+    if (sx.stop - sx.start) <= 0 or (sy.stop - sy.start) <= 0 or (sz.stop - sz.start) <= 0:
+        return out
+
+    out[dxs, dys, dzs] = mask_ids[sx, sy, sz]
+    return out
+
+
+# ------------------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------------------
 
@@ -248,6 +303,17 @@ def main() -> None:
 
     parser.add_argument("--save_pngs", action="store_true", help="Save projections as PNG")
     parser.add_argument("--out_dir", type=str, default="qplanar_results", help="Output directory")
+    parser.add_argument(
+        "--exclude_organs",
+        type=str,
+        default="small_intest",
+        help="Comma-separated organ names to exclude completely from modeling/evaluation (default: small_intest)",
+    )
+    parser.add_argument(
+        "--mask-robustness-suite",
+        action="store_true",
+        help="Run baseline + 2D-slice dilation(r=1) + shifts (x=1cm and x=2cm) sequentially",
+    )
 
     # optional debug checks
     parser.add_argument("--debug_consistency", action="store_true", help="Print ||b - A@x_gt|| / ||b||")
@@ -294,6 +360,19 @@ def main() -> None:
     # mask IDs should be integer-like
     mask_ids = np.rint(mask_vol).astype(np.int64)
 
+    # Optional organ exclusion applied globally (system matrix, b, reporting, perturbations).
+    excluded_organs = {s.strip() for s in args.exclude_organs.split(",") if s.strip()}
+    excluded_label_ids: List[int] = []
+    for name in sorted(excluded_organs):
+        if name in organ_info:
+            excluded_label_ids.append(int(organ_info[name]["organ_id"]))
+    if excluded_label_ids:
+        for oid in excluded_label_ids:
+            mask_ids[mask_ids == oid] = 0
+        print(f"[INFO] Excluding organs: {sorted(excluded_organs)}")
+    else:
+        print("[INFO] Excluding organs: []")
+
     # 3) Load and normalize kernel (sum=1 per depth)
     kernel_raw = load_kernel_mat(kern_path, key=args.kernel_key)
     kernel_mat = normalize_kernel_slices(kernel_raw)
@@ -305,8 +384,11 @@ def main() -> None:
     step_len_cm = vox_cm
 
     # 5) Organ list
-    organ_names: List[str] = sorted(organ_info.keys())
+    organ_names: List[str] = sorted([k for k in organ_info.keys() if k not in excluded_organs])
     n_org = len(organ_names)
+    if n_org == 0:
+        raise ValueError("No organs left for quantification after exclusion.")
+    all_nonzero_label_ids = np.unique(mask_ids[mask_ids != 0]).astype(np.int64).tolist()
     print(f"[INFO] #Organs in meta: {n_org}")
 
     # 6) Determine projection size via dummy run
@@ -316,99 +398,157 @@ def main() -> None:
     n_pix = H * W
     print(f"[INFO] Projection size: {H} x {W}  (n_pix={n_pix})")
 
-    # 7) Build A and x_gt (unit concentration per organ)
-    A = np.zeros((2 * n_pix, n_org), dtype=np.float64)
-    x_gt = np.zeros((n_org,), dtype=np.float64)
+    def run_quantification(
+        run_name: str,
+        run_mask_ids: np.ndarray,
+        run_out_dir: Path,
+        measurement_mask_ids: np.ndarray = None,
+    ) -> Dict[str, Any]:
+        run_out_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n[RUN] {run_name}")
+        if measurement_mask_ids is None:
+            measurement_mask_ids = run_mask_ids
 
-    # Each column corresponds to 1.0 kBq/mL concentration in that organ,
-    # converted to MBq/voxel: 1.0 kBq/mL * 1e-3 (MBq/kBq) * voxel_ml (mL/voxel)
-    unit_mbq_per_voxel = 1.0 * 1e-3 * voxel_ml
+        # 7) Build A and x_gt (unit concentration per organ)
+        A = np.zeros((2 * n_pix, n_org), dtype=np.float64)
+        x_gt = np.zeros((n_org,), dtype=np.float64)
 
-    print("[INFO] Building system matrix A (unit organ projections)...")
-    for i, organ in enumerate(organ_names):
-        oid = int(organ_info[organ]["organ_id"])
-        gt_conc = float(organ_info[organ]["assigned_value_kBq_per_ml"])  # kBq/mL
-        x_gt[i] = gt_conc
+        # Each column corresponds to 1.0 kBq/mL concentration in that organ,
+        # converted to MBq/voxel: 1.0 kBq/mL * 1e-3 (MBq/kBq) * voxel_ml (mL/voxel)
+        unit_mbq_per_voxel = 1.0 * 1e-3 * voxel_ml
 
-        act_unit = np.zeros_like(mu_vol, dtype=np.float32)
-        act_unit[mask_ids == oid] = unit_mbq_per_voxel
+        print("[INFO] Building system matrix A (unit organ projections)...")
+        for i, organ in enumerate(organ_names):
+            oid = int(organ_info[organ]["organ_id"])
+            gt_conc = float(organ_info[organ]["assigned_value_kBq_per_ml"])  # kBq/mL
+            x_gt[i] = gt_conc
 
-        ap, pa = gamma_camera_core(act_unit, mu_vol, kernel_mat, args.psf_sigma, args.z0_slices, step_len_cm)
+            act_unit = np.zeros_like(mu_vol, dtype=np.float32)
+            act_unit[run_mask_ids == oid] = unit_mbq_per_voxel
 
-        A[:n_pix, i] = ap.ravel()
-        A[n_pix:, i] = pa.ravel()
+            ap, pa = gamma_camera_core(act_unit, mu_vol, kernel_mat, args.psf_sigma, args.z0_slices, step_len_cm)
 
-    # 8) Build b via Full-Forward projection of full GT activity volume
-    print("[INFO] Building measurement b via Full-Forward projection of GT activity volume...")
-    act_full = np.zeros_like(mu_vol, dtype=np.float32)
-    for i, organ in enumerate(organ_names):
-        oid = int(organ_info[organ]["organ_id"])
-        gt_conc = x_gt[i]  # kBq/mL
-        act_full[mask_ids == oid] = (gt_conc * 1e-3 * voxel_ml)  # MBq/voxel
+            A[:n_pix, i] = ap.ravel()
+            A[n_pix:, i] = pa.ravel()
 
-    b_ap_img, b_pa_img = gamma_camera_core(act_full, mu_vol, kernel_mat, args.psf_sigma, args.z0_slices, step_len_cm)
-    b = np.concatenate([b_ap_img.ravel(), b_pa_img.ravel()]).astype(np.float64)
+        # 8) Build b via Full-Forward projection of full GT activity volume
+        print("[INFO] Building measurement b via Full-Forward projection of GT activity volume...")
+        act_full = np.zeros_like(mu_vol, dtype=np.float32)
+        for i, organ in enumerate(organ_names):
+            oid = int(organ_info[organ]["organ_id"])
+            gt_conc = x_gt[i]  # kBq/mL
+            act_full[measurement_mask_ids == oid] = (gt_conc * 1e-3 * voxel_ml)  # MBq/voxel
 
-    # Optional debug: check linear consistency
-    if args.debug_consistency:
-        rel = np.linalg.norm(b - (A @ x_gt)) / (np.linalg.norm(b) + 1e-12)
-        print(f"[DEBUG] Consistency ||b - A@x_gt|| / ||b|| = {rel:.6e}")
+        b_ap_img, b_pa_img = gamma_camera_core(act_full, mu_vol, kernel_mat, args.psf_sigma, args.z0_slices, step_len_cm)
+        b = np.concatenate([b_ap_img.ravel(), b_pa_img.ravel()]).astype(np.float64)
 
-    # 9) Optional Poisson noise on b
-    if args.poisson:
-        # Interpret b as "activity-equivalent" and map to a count regime.
-        # Simple and stable: scale so that a reference level corresponds to counts_per_pixel.
-        # Here we use max(b) as reference; you can switch to percentile if desired.
-        b_max = float(np.max(b))
-        if b_max <= 0:
-            print("[WARN] b.max() <= 0, skipping Poisson.")
-        else:
-            scale = float(args.counts_per_pixel) / (b_max + 1e-12)
-            b_counts = np.clip(b * scale, 0, None)
-            b_noisy = np.random.poisson(b_counts).astype(np.float64) / scale
-            b = b_noisy
-            print(f"[INFO] Poisson noise applied (counts_per_pixel≈{args.counts_per_pixel:.0f})")
+        # Optional debug: check linear consistency
+        if args.debug_consistency:
+            rel = np.linalg.norm(b - (A @ x_gt)) / (np.linalg.norm(b) + 1e-12)
+            print(f"[DEBUG] Consistency ||b - A@x_gt|| / ||b|| = {rel:.6e}")
 
-    # 10) Solve NNLS
-    scaling_factor = 1e5
-    print(f"[INFO] Solving NNLS: min ||A x - b|| s.t. x>=0 (scaling={scaling_factor:.0e})")
-    x_rec, resid = nnls(A * scaling_factor, b * scaling_factor)
+        # 9) Optional Poisson noise on b
+        if args.poisson:
+            # Interpret b as "activity-equivalent" and map to a count regime.
+            # Simple and stable: scale so that a reference level corresponds to counts_per_pixel.
+            # Here we use max(b) as reference; you can switch to percentile if desired.
+            b_max = float(np.max(b))
+            if b_max <= 0:
+                print("[WARN] b.max() <= 0, skipping Poisson.")
+            else:
+                scale = float(args.counts_per_pixel) / (b_max + 1e-12)
+                b_counts = np.clip(b * scale, 0, None)
+                b_noisy = np.random.poisson(b_counts).astype(np.float64) / scale
+                b = b_noisy
+                print(f"[INFO] Poisson noise applied (counts_per_pixel≈{args.counts_per_pixel:.0f})")
 
-    # 11) Reprojection for output visuals
-    b_rec = A @ x_rec
-    b_rec_ap = b_rec[:n_pix].reshape(H, W)
-    b_rec_pa = b_rec[n_pix:].reshape(H, W)
+        # 10) Solve NNLS
+        scaling_factor = 1e5
+        print(f"[INFO] Solving NNLS: min ||A x - b|| s.t. x>=0 (scaling={scaling_factor:.0e})")
+        x_rec, resid = nnls(A * scaling_factor, b * scaling_factor)
 
-    # 12) Print results
-    print("\n=== ERGEBNISSE ===")
-    print(f"{'Organ':<15} | {'GT (kBq/mL)':<15} | {'Rec (kBq/mL)':<15} | {'Rel. Error (%)':<15}")
-    print("-" * 75)
-    results = {}
-    for i, organ in enumerate(organ_names):
-        gt = float(x_gt[i])
-        rc = float(x_rec[i])
-        rel_err = abs(rc - gt) / (abs(gt) + 1e-12) * 100.0 if gt != 0 else abs(rc) * 100.0
-        print(f"{organ:<15} | {gt:<15.4f} | {rc:<15.4f} | {rel_err:<15.4f}")
-        results[organ] = {
-            "organ_id": int(organ_info[organ]["organ_id"]),
-            "gt_kBq_per_ml": gt,
-            "rec_kBq_per_ml": rc,
-            "rel_error_percent": rel_err,
-        }
+        # 11) Reprojection for output visuals
+        b_rec = A @ x_rec
+        b_rec_ap = b_rec[:n_pix].reshape(H, W)
+        b_rec_pa = b_rec[n_pix:].reshape(H, W)
 
-    # 13) Save JSON summary
-    res_json = out_dir / "quantification_results.json"
-    with open(res_json, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2)
-    print(f"\n[OUT] Saved results JSON: {res_json}")
+        # 12) Print results
+        print("\n=== ERGEBNISSE ===")
+        print(f"{'Organ':<15} | {'GT (kBq/mL)':<15} | {'Rec (kBq/mL)':<15} | {'Rel. Error (%)':<15}")
+        print("-" * 75)
+        results = {}
+        for i, organ in enumerate(organ_names):
+            gt = float(x_gt[i])
+            rc = float(x_rec[i])
+            rel_err = abs(rc - gt) / (abs(gt) + 1e-12) * 100.0 if gt != 0 else abs(rc) * 100.0
+            print(f"{organ:<15} | {gt:<15.4f} | {rc:<15.4f} | {rel_err:<15.4f}")
+            results[organ] = {
+                "organ_id": int(organ_info[organ]["organ_id"]),
+                "gt_kBq_per_ml": gt,
+                "rec_kBq_per_ml": rc,
+                "rel_error_percent": rel_err,
+            }
 
-    # 14) Optional PNGs
-    if args.save_pngs:
-        print("[INFO] Saving PNGs...")
-        save_png(b_ap_img, out_dir / "proj_GT_AP.png", "GT Projection AP (Full-Forward)")
-        save_png(b_pa_img, out_dir / "proj_GT_PA.png", "GT Projection PA (Full-Forward)")
-        save_png(b_rec_ap, out_dir / "proj_Rec_AP.png", "Reconstructed Projection AP (A@x_rec)")
-        save_png(b_rec_pa, out_dir / "proj_Rec_PA.png", "Reconstructed Projection PA (A@x_rec)")
+        # 13) Save JSON summary
+        res_json = run_out_dir / "quantification_results.json"
+        with open(res_json, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2)
+        print(f"\n[OUT] Saved results JSON: {res_json}")
+
+        # 14) Optional PNGs
+        if args.save_pngs:
+            print("[INFO] Saving PNGs...")
+            save_png(b_ap_img, run_out_dir / "proj_GT_AP.png", f"{run_name}: GT Projection AP (Full-Forward)")
+            save_png(b_pa_img, run_out_dir / "proj_GT_PA.png", f"{run_name}: GT Projection PA (Full-Forward)")
+            save_png(b_rec_ap, run_out_dir / "proj_Rec_AP.png", f"{run_name}: Reconstructed Projection AP (A@x_rec)")
+            save_png(b_rec_pa, run_out_dir / "proj_Rec_PA.png", f"{run_name}: Reconstructed Projection PA (A@x_rec)")
+
+        return results
+
+    if args.mask_robustness_suite:
+        print("[INFO] Running mask robustness suite: baseline + 2D-dilation + shift(x=1cm,2cm)")
+        print("[INFO] 2D-dilation overlap policy: higher label ID wins")
+        print("[INFO] Robustness convention: b from baseline mask, A from perturbed mask")
+        suite_summary: Dict[str, Any] = {}
+        baseline_mask_ids = mask_ids
+
+        suite_summary["baseline"] = run_quantification(
+            "baseline",
+            baseline_mask_ids,
+            out_dir / "baseline",
+            measurement_mask_ids=baseline_mask_ids,
+        )
+
+        mask_dil_xy = dilate_labels_radius1_xy(baseline_mask_ids, all_nonzero_label_ids)
+        suite_summary["dilation2d_r1_xy"] = run_quantification(
+            "dilation2d_r1_xy",
+            mask_dil_xy,
+            out_dir / "dilation2d_r1_xy",
+            measurement_mask_ids=baseline_mask_ids,
+        )
+
+        for shift_cm in (1.0, 2.0):
+            shift_vox = max(1, int(round((shift_cm * 10.0) / args.pixel_size_mm)))
+            achieved_cm = (shift_vox * args.pixel_size_mm) / 10.0
+            print(
+                f"[INFO] Shift target x={shift_cm:.1f} cm -> dx={shift_vox} vox "
+                f"(achieved ~{achieved_cm:.3f} cm at {args.pixel_size_mm:.3f} mm/voxel)"
+            )
+            run_name = f"shift_x{int(shift_cm)}cm_dx{shift_vox}"
+            mask_shift = shift_mask_zero_pad(baseline_mask_ids, shift_xyz=(shift_vox, 0, 0))
+            suite_summary[run_name] = run_quantification(
+                run_name,
+                mask_shift,
+                out_dir / run_name,
+                measurement_mask_ids=baseline_mask_ids,
+            )
+
+        suite_json = out_dir / "mask_robustness_suite_summary.json"
+        with open(suite_json, "w", encoding="utf-8") as f:
+            json.dump(suite_summary, f, indent=2)
+        print(f"[OUT] Saved suite summary JSON: {suite_json}")
+    else:
+        run_quantification("baseline", mask_ids, out_dir)
 
     print("[DONE]")
 
