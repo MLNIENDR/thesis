@@ -2537,7 +2537,7 @@ def run_postprocessing(args):
                         proj_status = "rendered"
                         proj_norm_factor = pred_proj.get("norm_scale")
 
-            if proj_metrics is None:
+            if proj_metrics is None and (pred_save_ap is None or pred_save_pa is None):
                 if args.calibrate_scale:
                     raise RuntimeError(
                         f"--calibrate-scale requires rendered scaled projections for metrics, but rendering was unavailable for {pid}"
